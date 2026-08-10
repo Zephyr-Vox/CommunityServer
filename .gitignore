@@ -1,0 +1,36 @@
+# Binaries and build output
+/bin/
+/server
+/cmd/**/server
+*.exe
+*.test
+*.out
+
+# Local configuration and secrets
+.env
+*.env
+*.local.yaml
+
+# SQLite databases and journals
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+/data/
+
+# Logs
+*.log
+
+# Test and profiling artifacts
+coverage.out
+coverage.html
+*.prof
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
