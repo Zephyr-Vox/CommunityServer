@@ -35,7 +35,8 @@ var (
 	ErrTimestampOverflow = errors.New("snowflake: timestamp overflow")
 )
 
-var defaultEpoch = time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+// DefaultEpoch is the default timestamp base used by New: 2026-08-10T00:00:00Z.
+var DefaultEpoch = time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
 
 // IDGenerator produces unique, strictly increasing IDs without locking.
 // A single 64-bit state word packs the last timestamp (43 bits) and the
@@ -71,7 +72,7 @@ func WithSleep(sleep func(time.Duration)) Option {
 // New returns an IDGenerator with the given options applied.
 func New(opts ...Option) (*IDGenerator, error) {
 	g := &IDGenerator{
-		epoch: defaultEpoch.UnixMilli(),
+		epoch: DefaultEpoch.UnixMilli(),
 		now:   func() int64 { return time.Now().UnixMilli() },
 		sleep: time.Sleep,
 	}

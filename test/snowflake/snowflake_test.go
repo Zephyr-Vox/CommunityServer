@@ -1,13 +1,15 @@
-package snowflake
+package snowflake_test
 
 import (
 	"sync"
 	"testing"
 	"time"
+
+	"zephyr.vox/server/ce/internal/snowflake"
 )
 
 func TestSingleThreadedStability(t *testing.T) {
-	g, err := New()
+	g, err := snowflake.New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,10 +35,11 @@ func TestSingleThreadedStability(t *testing.T) {
 		seen[id] = struct{}{}
 		prev = id
 	}
+
 	// Every ID must carry a timestamp no later than the time of the last call.
-	maxNow := time.Now().UnixMilli() - g.epoch
+	maxNow := time.Now().UnixMilli() - snowflake.DefaultEpoch.UnixMilli()
 	for id := range seen {
-		if ts := TimestampMS(id); ts < 0 || ts > maxNow {
+		if ts := snowflake.TimestampMS(id); ts < 0 || ts > maxNow {
 			t.Fatalf("id %d has invalid timestamp %d (max now %d)", id, ts, maxNow)
 		}
 	}
@@ -46,7 +49,7 @@ func TestSingleThreadedStability(t *testing.T) {
 }
 
 func TestConcurrentStability(t *testing.T) {
-	g, err := New()
+	g, err := snowflake.New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,37 +103,39 @@ func TestConcurrentStability(t *testing.T) {
 }
 
 func TestClockBeforeEpoch(t *testing.T) {
-	g, err := New(WithClock(func() int64 { return defaultEpoch.UnixMilli() - 1 }))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := g.Next(); err == nil {
-		t.Fatal("expected ErrClockBeforeEpoch, got nil")
-	}
-}
-
-func TestTimestampOverflow(t *testing.T) {
-	g, err := New(WithClock(func() int64 {
-		return defaultEpoch.UnixMilli() + int64(1)<<timestampBits
+	g, err := snowflake.New(snowflake.WithClock(func() int64 {
+		return snowflake.DefaultEpoch.UnixMilli() - 1
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := g.Next(); err == nil {
-		t.Fatal("expected ErrTimestampOverflow, got nil")
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestTimestampOverflow(t *testing.T) {
+	g, err := snowflake.New(snowflake.WithClock(func() int64 {
+		return snowflake.DefaultEpoch.UnixMilli() + int64(1)<<43
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Next(); err == nil {
+		t.Fatal("expected error, got nil")
 	}
 }
 
 func TestClockBackwardWaitsForCatchUp(t *testing.T) {
 	var mu sync.Mutex
 	now := time.Now().UnixMilli()
-	g, err := New(
-		WithClock(func() int64 {
+	g, err := snowflake.New(
+		snowflake.WithClock(func() int64 {
 			mu.Lock()
 			defer mu.Unlock()
 			return now
 		}),
-		WithSleep(func(time.Duration) {}), // never actually sleep in tests
+		snowflake.WithSleep(func(time.Duration) {}), // never actually sleep in tests
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +184,7 @@ func TestClockBackwardWaitsForCatchUp(t *testing.T) {
 }
 
 func BenchmarkNext(b *testing.B) {
-	g, err := New()
+	g, err := snowflake.New()
 	if err != nil {
 		b.Fatal(err)
 	}
