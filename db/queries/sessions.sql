@@ -16,8 +16,8 @@ SELECT * FROM sessions WHERE id = ?;
 
 -- name: RotateSession :one
 UPDATE sessions
-SET token_hash = ?, prev_token_hash = token_hash, last_used_at = ?, expires_at = ?
-WHERE id = ?
+SET token_hash = sqlc.arg(new_token_hash), prev_token_hash = token_hash, last_used_at = sqlc.arg(last_used_at), expires_at = sqlc.arg(expires_at)
+WHERE token_hash = sqlc.arg(old_token_hash)
 RETURNING *;
 
 -- name: DeleteSession :exec
@@ -25,6 +25,9 @@ DELETE FROM sessions WHERE id = ?;
 
 -- name: DeleteSessionByTokenHash :exec
 DELETE FROM sessions WHERE token_hash = ?;
+
+-- name: DeleteSessionByPrevTokenHash :execrows
+DELETE FROM sessions WHERE prev_token_hash = ?;
 
 -- name: ListSessionsByUser :many
 SELECT * FROM sessions
@@ -34,5 +37,5 @@ ORDER BY last_used_at DESC;
 -- name: DeleteUserSessions :exec
 DELETE FROM sessions WHERE user_id = ?;
 
--- name: DeleteExpiredSessions :exec
+-- name: DeleteExpiredSessions :execrows
 DELETE FROM sessions WHERE expires_at < ?;

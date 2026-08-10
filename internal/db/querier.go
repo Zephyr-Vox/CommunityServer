@@ -6,6 +6,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 )
 
 type Querier interface {
@@ -13,9 +14,10 @@ type Querier interface {
 	ConsumeInvite(ctx context.Context, id int64) (Invite, error)
 	CreateInvite(ctx context.Context, arg CreateInviteParams) (Invite, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
-	DeleteExpiredSessions(ctx context.Context, expiresAt int64) error
+	DeleteExpiredSessions(ctx context.Context, expiresAt int64) (int64, error)
 	DeleteInvite(ctx context.Context, id int64) error
 	DeleteSession(ctx context.Context, id int64) error
+	DeleteSessionByPrevTokenHash(ctx context.Context, prevTokenHash sql.NullString) (int64, error)
 	DeleteSessionByTokenHash(ctx context.Context, tokenHash string) error
 	DeleteUserRoles(ctx context.Context, userID int64) error
 	DeleteUserSessions(ctx context.Context, userID int64) error

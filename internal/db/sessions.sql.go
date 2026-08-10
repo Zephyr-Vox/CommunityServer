@@ -10,13 +10,16 @@ import (
 	"database/sql"
 )
 
-const deleteExpiredSessions = `-- name: DeleteExpiredSessions :exec
+const deleteExpiredSessions = `-- name: DeleteExpiredSessions :execrows
 DELETE FROM sessions WHERE expires_at < ?
 `
 
-func (q *Queries) DeleteExpiredSessions(ctx context.Context, expiresAt int64) error {
-	_, err := q.db.ExecContext(ctx, deleteExpiredSessions, expiresAt)
-	return err
+func (q *Queries) DeleteExpiredSessions(ctx context.Context, expiresAt int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteExpiredSessions, expiresAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const deleteSession = `-- name: DeleteSession :exec
@@ -26,6 +29,18 @@ DELETE FROM sessions WHERE id = ?
 func (q *Queries) DeleteSession(ctx context.Context, id int64) error {
 	_, err := q.db.ExecContext(ctx, deleteSession, id)
 	return err
+}
+
+const deleteSessionByPrevTokenHash = `-- name: DeleteSessionByPrevTokenHash :execrows
+DELETE FROM sessions WHERE prev_token_hash = ?
+`
+
+func (q *Queries) DeleteSessionByPrevTokenHash(ctx context.Context, prevTokenHash sql.NullString) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteSessionByPrevTokenHash, prevTokenHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const deleteSessionByTokenHash = `-- name: DeleteSessionByTokenHash :exec
@@ -126,24 +141,24 @@ func (q *Queries) ListSessionsByUser(ctx context.Context, userID int64) ([]Sessi
 
 const rotateSession = `-- name: RotateSession :one
 UPDATE sessions
-SET token_hash = ?, prev_token_hash = token_hash, last_used_at = ?, expires_at = ?
-WHERE id = ?
+SET token_hash = ?1, prev_token_hash = token_hash, last_used_at = ?2, expires_at = ?3
+WHERE token_hash = ?4
 RETURNING id, user_id, device_id, token_hash, prev_token_hash, expires_at, last_used_at, created_at
 `
 
 type RotateSessionParams struct {
-	TokenHash  string `json:"token_hash"`
-	LastUsedAt int64  `json:"last_used_at"`
-	ExpiresAt  int64  `json:"expires_at"`
-	ID         int64  `json:"id"`
+	NewTokenHash string `json:"new_token_hash"`
+	LastUsedAt   int64  `json:"last_used_at"`
+	ExpiresAt    int64  `json:"expires_at"`
+	OldTokenHash string `json:"old_token_hash"`
 }
 
 func (q *Queries) RotateSession(ctx context.Context, arg RotateSessionParams) (Session, error) {
 	row := q.db.QueryRowContext(ctx, rotateSession,
-		arg.TokenHash,
+		arg.NewTokenHash,
 		arg.LastUsedAt,
 		arg.ExpiresAt,
-		arg.ID,
+		arg.OldTokenHash,
 	)
 	var i Session
 	err := row.Scan(
