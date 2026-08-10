@@ -108,12 +108,10 @@ func TestRotateConcurrent(t *testing.T) {
 	results := make(chan error, 2)
 	var wg sync.WaitGroup
 	for i := range 2 {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			_, err := s.Sessions.Rotate(ctx, "hash-1", fmt.Sprintf("hash-new-%d", i), base+2000)
 			results <- err
-		}(i)
+		})
 	}
 	wg.Wait()
 	close(results)

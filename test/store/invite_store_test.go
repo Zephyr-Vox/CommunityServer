@@ -85,12 +85,10 @@ func TestConsumeInviteConcurrent(t *testing.T) {
 	results := make(chan error, 2)
 	var wg sync.WaitGroup
 	for range 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, err := s.Invites.Consume(ctx, inv.ID)
 			results <- err
-		}()
+		})
 	}
 	wg.Wait()
 	close(results)
