@@ -10,6 +10,7 @@
 .env
 *.env
 *.local.yaml
+/config/roles.yaml
 
 # SQLite databases and journals
 *.db
