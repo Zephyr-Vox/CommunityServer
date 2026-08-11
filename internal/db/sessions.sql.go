@@ -142,7 +142,7 @@ func (q *Queries) ListSessionsByUser(ctx context.Context, userID int64) ([]Sessi
 const rotateSession = `-- name: RotateSession :one
 UPDATE sessions
 SET token_hash = ?1, prev_token_hash = token_hash, last_used_at = ?2, expires_at = ?3
-WHERE token_hash = ?4
+WHERE token_hash = ?4 AND expires_at > ?5
 RETURNING id, user_id, device_id, token_hash, prev_token_hash, expires_at, last_used_at, created_at
 `
 
@@ -151,6 +151,7 @@ type RotateSessionParams struct {
 	LastUsedAt   int64  `json:"last_used_at"`
 	ExpiresAt    int64  `json:"expires_at"`
 	OldTokenHash string `json:"old_token_hash"`
+	Now          int64  `json:"now"`
 }
 
 func (q *Queries) RotateSession(ctx context.Context, arg RotateSessionParams) (Session, error) {
@@ -159,6 +160,7 @@ func (q *Queries) RotateSession(ctx context.Context, arg RotateSessionParams) (S
 		arg.LastUsedAt,
 		arg.ExpiresAt,
 		arg.OldTokenHash,
+		arg.Now,
 	)
 	var i Session
 	err := row.Scan(

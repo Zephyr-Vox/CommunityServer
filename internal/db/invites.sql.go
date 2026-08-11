@@ -13,12 +13,17 @@ import (
 const consumeInvite = `-- name: ConsumeInvite :one
 UPDATE invites
 SET uses_left = uses_left - 1
-WHERE id = ? AND uses_left > 0
+WHERE id = ? AND uses_left > 0 AND (expires_at IS NULL OR expires_at > CAST(?2 AS INTEGER))
 RETURNING id, code_hash, role, uses_left, expires_at, created_by, created_at
 `
 
-func (q *Queries) ConsumeInvite(ctx context.Context, id int64) (Invite, error) {
-	row := q.db.QueryRowContext(ctx, consumeInvite, id)
+type ConsumeInviteParams struct {
+	ID  int64 `json:"id"`
+	Now int64 `json:"now"`
+}
+
+func (q *Queries) ConsumeInvite(ctx context.Context, arg ConsumeInviteParams) (Invite, error) {
+	row := q.db.QueryRowContext(ctx, consumeInvite, arg.ID, arg.Now)
 	var i Invite
 	err := row.Scan(
 		&i.ID,
@@ -81,11 +86,16 @@ func (q *Queries) DeleteInvite(ctx context.Context, id int64) error {
 }
 
 const getInviteByCodeHash = `-- name: GetInviteByCodeHash :one
-SELECT id, code_hash, role, uses_left, expires_at, created_by, created_at FROM invites WHERE code_hash = ?
+SELECT id, code_hash, role, uses_left, expires_at, created_by, created_at FROM invites WHERE code_hash = ? AND (expires_at IS NULL OR expires_at > CAST(?2 AS INTEGER))
 `
 
-func (q *Queries) GetInviteByCodeHash(ctx context.Context, codeHash string) (Invite, error) {
-	row := q.db.QueryRowContext(ctx, getInviteByCodeHash, codeHash)
+type GetInviteByCodeHashParams struct {
+	CodeHash string `json:"code_hash"`
+	Now      int64  `json:"now"`
+}
+
+func (q *Queries) GetInviteByCodeHash(ctx context.Context, arg GetInviteByCodeHashParams) (Invite, error) {
+	row := q.db.QueryRowContext(ctx, getInviteByCodeHash, arg.CodeHash, arg.Now)
 	var i Invite
 	err := row.Scan(
 		&i.ID,

@@ -95,6 +95,21 @@ func TestRotateAndReuseDetection(t *testing.T) {
 	}
 }
 
+func TestRotateExpiredSessionRejected(t *testing.T) {
+	s, clock := newTestEnv(t)
+	ctx := context.Background()
+	u := mustCreateUser(t, s, "alice")
+	base := clock.get()
+
+	if _, err := s.Sessions.Upsert(ctx, u.ID, "dev-1", "hash-1", base+100); err != nil {
+		t.Fatal(err)
+	}
+	clock.set(base + 200)
+	if _, err := s.Sessions.Rotate(ctx, "hash-1", "hash-2", base+300); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("want ErrNotFound for expired session, got %v", err)
+	}
+}
+
 func TestRotateConcurrent(t *testing.T) {
 	s, clock := newTestEnv(t)
 	ctx := context.Background()

@@ -37,8 +37,7 @@ func mapError(err error) error {
 }
 
 func isUniqueConstraint(err error) bool {
-	var sqliteErr *sqlite.Error
-	if errors.As(err, &sqliteErr) {
+	if sqliteErr, ok := errors.AsType[*sqlite.Error](err); ok {
 		if sqliteErr.Code() == sqliteConstraintUnique {
 			return true
 		}

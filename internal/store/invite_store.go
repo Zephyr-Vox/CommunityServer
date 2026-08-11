@@ -37,7 +37,10 @@ func (s *InviteStore) Create(ctx context.Context, codeHash, role string, usesLef
 
 // GetByCodeHash returns the invite for a code hash, or ErrNotFound.
 func (s *InviteStore) GetByCodeHash(ctx context.Context, codeHash string) (*db.Invite, error) {
-	inv, err := s.q.GetInviteByCodeHash(ctx, codeHash)
+	inv, err := s.q.GetInviteByCodeHash(ctx, db.GetInviteByCodeHashParams{
+		CodeHash: codeHash,
+		Now:      s.now(),
+	})
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -47,7 +50,10 @@ func (s *InviteStore) GetByCodeHash(ctx context.Context, codeHash string) (*db.I
 // Consume atomically decrements uses_left. An exhausted or missing invite is
 // reported as ErrNotFound.
 func (s *InviteStore) Consume(ctx context.Context, id int64) (*db.Invite, error) {
-	inv, err := s.q.ConsumeInvite(ctx, id)
+	inv, err := s.q.ConsumeInvite(ctx, db.ConsumeInviteParams{
+		ID:  id,
+		Now: s.now(),
+	})
 	if err != nil {
 		return nil, mapError(err)
 	}

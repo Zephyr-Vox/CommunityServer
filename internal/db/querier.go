@@ -11,7 +11,7 @@ import (
 
 type Querier interface {
 	BumpUserAuthVersion(ctx context.Context, arg BumpUserAuthVersionParams) error
-	ConsumeInvite(ctx context.Context, id int64) (Invite, error)
+	ConsumeInvite(ctx context.Context, arg ConsumeInviteParams) (Invite, error)
 	CreateInvite(ctx context.Context, arg CreateInviteParams) (Invite, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	DeleteExpiredSessions(ctx context.Context, expiresAt int64) (int64, error)
@@ -22,7 +22,7 @@ type Querier interface {
 	DeleteUserRoles(ctx context.Context, userID int64) error
 	DeleteUserSessions(ctx context.Context, userID int64) error
 	ExistsAdminRole(ctx context.Context) (bool, error)
-	GetInviteByCodeHash(ctx context.Context, codeHash string) (Invite, error)
+	GetInviteByCodeHash(ctx context.Context, arg GetInviteByCodeHashParams) (Invite, error)
 	GetRolesForUser(ctx context.Context, userID int64) ([]string, error)
 	GetSessionByID(ctx context.Context, id int64) (Session, error)
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)

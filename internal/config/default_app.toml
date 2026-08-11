@@ -1,0 +1,8 @@
+# ZephyrVox server configuration, generated on first startup.
+# The jwt_secret is filled with a fresh random value when this file is created.
+jwt_secret = ""
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10

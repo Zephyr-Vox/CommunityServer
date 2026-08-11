@@ -4,12 +4,12 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
 RETURNING *;
 
 -- name: GetInviteByCodeHash :one
-SELECT * FROM invites WHERE code_hash = ?;
+SELECT * FROM invites WHERE code_hash = ? AND (expires_at IS NULL OR expires_at > CAST(sqlc.arg(now) AS INTEGER));
 
 -- name: ConsumeInvite :one
 UPDATE invites
 SET uses_left = uses_left - 1
-WHERE id = ? AND uses_left > 0
+WHERE id = ? AND uses_left > 0 AND (expires_at IS NULL OR expires_at > CAST(sqlc.arg(now) AS INTEGER))
 RETURNING *;
 
 -- name: DeleteInvite :exec

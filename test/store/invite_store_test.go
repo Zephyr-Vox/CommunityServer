@@ -73,6 +73,26 @@ func TestConsumeInvite(t *testing.T) {
 	}
 }
 
+func TestExpiredInviteRejected(t *testing.T) {
+	s, clock := newTestEnv(t)
+	ctx := context.Background()
+	base := clock.get()
+
+	expires := base + 1000
+	inv, err := s.Invites.Create(ctx, "codehash", "member", 3, &expires, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.set(base + 2000)
+
+	if _, err := s.Invites.GetByCodeHash(ctx, "codehash"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expired invite lookup must miss, got %v", err)
+	}
+	if _, err := s.Invites.Consume(ctx, inv.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expired invite consume must fail, got %v", err)
+	}
+}
+
 func TestConsumeInviteConcurrent(t *testing.T) {
 	s, _ := newTestEnv(t)
 	ctx := context.Background()

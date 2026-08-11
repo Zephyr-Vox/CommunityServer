@@ -71,6 +71,7 @@ func (s *SessionStore) Rotate(ctx context.Context, oldTokenHash, newTokenHash st
 		LastUsedAt:   s.now(),
 		ExpiresAt:    expiresAt,
 		OldTokenHash: oldTokenHash,
+		Now:          s.now(),
 	})
 	if err == nil {
 		return &rotated, nil

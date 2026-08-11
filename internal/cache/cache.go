@@ -293,6 +293,12 @@ func (c *Cache[K, V]) load(ctx context.Context, key K) (V, bool, error) {
 			return zero, false, ctx.Err()
 		}
 	}
+	// A loader may have completed between the initial miss and this point;
+	// the cache is authoritative, so re-check before registering a new load.
+	if value, ok := c.get(key); ok {
+		c.inflightMu.Unlock()
+		return value, true, nil
+	}
 
 	call := &inflight[V]{ready: make(chan struct{})}
 	c.inflight[key] = call
@@ -303,13 +309,13 @@ func (c *Cache[K, V]) load(ctx context.Context, key K) (V, bool, error) {
 		c.Set(key, value)
 	}
 
-	c.inflightMu.Lock()
-	delete(c.inflight, key)
-	c.inflightMu.Unlock()
-
 	call.value = value
 	call.err = err
 	close(call.ready) // publishes value/err to waiters
+
+	c.inflightMu.Lock()
+	delete(c.inflight, key)
+	c.inflightMu.Unlock()
 
 	if err != nil {
 		var zero V

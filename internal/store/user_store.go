@@ -71,8 +71,9 @@ func (s *UserStore) UpdateProfile(ctx context.Context, id int64, nickname string
 	return &user, nil
 }
 
-// SetPasswordHash replaces the password hash and bumps auth_version,
-// invalidating all previously issued tokens.
+// SetPasswordHash replaces the password hash and bumps auth_version, which
+// invalidates previously issued access tokens. Full revocation (also deleting
+// sessions and invalidating the principal cache) is the auth service's job.
 func (s *UserStore) SetPasswordHash(ctx context.Context, id int64, passwordHash string) error {
 	return mapError(s.q.SetUserPasswordHash(ctx, db.SetUserPasswordHashParams{
 		PasswordHash: passwordHash,
@@ -111,7 +112,8 @@ func (s *UserStore) Unban(ctx context.Context, id int64) error {
 	}))
 }
 
-// BumpAuthVersion invalidates all previously issued tokens for the user.
+// BumpAuthVersion invalidates previously issued access tokens for the user.
+// Callers that also need refresh tokens dead must revoke the user's sessions.
 func (s *UserStore) BumpAuthVersion(ctx context.Context, id int64) error {
 	return mapError(s.q.BumpUserAuthVersion(ctx, db.BumpUserAuthVersionParams{
 		UpdatedAt: s.now(),
@@ -138,8 +140,22 @@ func (s *UserStore) GetRoles(ctx context.Context, userID int64) ([]string, error
 	return roles, nil
 }
 
-// SetRoles replaces a user's roles atomically: delete all, then insert each.
+// SetRoles replaces a user's roles: delete all, then insert each. On a root
+// store it runs in its own transaction; on a transaction-bound store it runs
+// directly on the caller's transaction.
 func (s *UserStore) SetRoles(ctx context.Context, userID int64, roles []string) error {
+	if s.conn == nil {
+		if err := s.q.DeleteUserRoles(ctx, userID); err != nil {
+			return mapError(err)
+		}
+		for _, role := range roles {
+			if err := s.q.InsertUserRole(ctx, db.InsertUserRoleParams{UserID: userID, Role: role}); err != nil {
+				return mapError(err)
+			}
+		}
+		return nil
+	}
+
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err

@@ -21,6 +21,9 @@ func AuthN(resolve PrincipalResolver) echo.MiddlewareFunc {
 		return func(c *echo.Context) error {
 			p, err := resolve(c)
 			if err != nil {
+				if httpErr, ok := errors.AsType[*echo.HTTPError](err); ok {
+					return httpErr
+				}
 				return echo.ErrUnauthorized
 			}
 			c.Set(principalKey, p)

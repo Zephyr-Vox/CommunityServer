@@ -217,6 +217,35 @@ func TestSetRolesRollsBackOnFailure(t *testing.T) {
 	}
 }
 
+func TestSetRolesWithinCallerTransaction(t *testing.T) {
+	s, _ := newTestEnv(t)
+	ctx := context.Background()
+	u := mustCreateUser(t, s, "alice")
+	if err := s.Users.SetRoles(ctx, u.ID, []string{"admin"}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txStores := s.WithTx(tx)
+	if err := txStores.Users.SetRoles(ctx, u.ID, []string{"member"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	roles, err := s.Users.GetRoles(ctx, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roles) != 1 || roles[0] != "admin" {
+		t.Fatalf("tx-bound SetRoles must roll back, got %v", roles)
+	}
+}
+
 func TestHasAdminFalseInitially(t *testing.T) {
 	s, _ := newTestEnv(t)
 	ok, err := s.Users.HasAdmin(context.Background())

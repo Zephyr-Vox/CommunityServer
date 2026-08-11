@@ -17,7 +17,7 @@ SELECT * FROM sessions WHERE id = ?;
 -- name: RotateSession :one
 UPDATE sessions
 SET token_hash = sqlc.arg(new_token_hash), prev_token_hash = token_hash, last_used_at = sqlc.arg(last_used_at), expires_at = sqlc.arg(expires_at)
-WHERE token_hash = sqlc.arg(old_token_hash)
+WHERE token_hash = sqlc.arg(old_token_hash) AND expires_at > sqlc.arg(now)
 RETURNING *;
 
 -- name: DeleteSession :exec
