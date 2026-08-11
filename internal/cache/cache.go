@@ -1,0 +1,319 @@
+// Package cache provides a zero-dependency, generic, in-process TTL cache
+// designed for small, read-heavy workloads in a single process.
+//
+// It is safe for concurrent use by any number of goroutines.
+//
+// Features:
+//
+//   - Optional per-entry TTL with lazy expiration: expired entries are removed
+//     the next time they are accessed, so there is no background sweeper and no
+//     Stop method to manage. DeleteExpired exists for proactive reclamation.
+//   - Optional loader-backed population: a miss can be filled from a function,
+//     and concurrent misses for the same key are coalesced so the loader runs
+//     once (singleflight). Loader errors are returned to the waiting callers
+//     but are never cached, so the next Get retries.
+//   - Optional FIFO capacity limit: when the limit is reached, the oldest
+//     inserted entry is evicted.
+//   - Hit/miss counters for cheap observability.
+//
+// The zero TTL (the default) means entries never expire; callers that want a
+// bounded lifetime should pass WithTTL.
+package cache
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// entry is a single cached value together with its expiry deadline.
+type entry[V any] struct {
+	value V
+	// expiresAt is the instant after which the entry is stale. The zero
+	// time means the entry never expires.
+	expiresAt time.Time
+}
+
+// inflight represents an in-flight loader call for one key. Waiters block on
+// ready; value and err are published before ready is closed.
+type inflight[V any] struct {
+	ready chan struct{}
+	value V
+	err   error
+}
+
+// config carries the option values applied in New.
+type config[K comparable, V any] struct {
+	ttl     time.Duration
+	loader  func(context.Context, K) (V, error)
+	maxSize int
+	now     func() time.Time
+}
+
+// Option configures a Cache. Options are applied in order in New.
+type Option[K comparable, V any] func(*config[K, V])
+
+// WithTTL sets the lifetime of every entry. The deadline is computed when an
+// entry is stored or refreshed, so every Set starts a fresh TTL window. A TTL
+// of zero or less disables expiration entirely. Tests should pair this with
+// WithClock to exercise expiry deterministically.
+func WithTTL[K comparable, V any](ttl time.Duration) Option[K, V] {
+	return func(c *config[K, V]) { c.ttl = ttl }
+}
+
+// WithLoader sets the function used to populate a missing entry. The loader
+// receives the context of the first caller that caused the miss.
+//
+// Concurrent misses for the same key are coalesced: the loader runs exactly
+// once and every waiting caller receives the same result, either the loaded
+// value or the loader's error. An error is never stored, so the next Get
+// retries the loader instead of serving a stale failure.
+func WithLoader[K comparable, V any](fn func(context.Context, K) (V, error)) Option[K, V] {
+	return func(c *config[K, V]) { c.loader = fn }
+}
+
+// WithMaxSize caps the number of entries. When the cap is reached, inserting
+// a new key evicts the oldest entry by insertion time (FIFO). Overwriting an
+// existing key refreshes its value but keeps its original insertion position.
+// A value of zero or less disables the limit.
+func WithMaxSize[K comparable, V any](n int) Option[K, V] {
+	return func(c *config[K, V]) { c.maxSize = n }
+}
+
+// WithClock overrides the time source used for TTL checks and deadlines. It
+// exists for deterministic tests; production code should not use it.
+func WithClock[K comparable, V any](now func() time.Time) Option[K, V] {
+	return func(c *config[K, V]) { c.now = now }
+}
+
+// Cache is a concurrency-safe in-memory TTL cache.
+//
+// All methods are safe for concurrent use. The cache owns no goroutines and
+// therefore has no lifecycle to shut down; it is garbage collected once no
+// references remain.
+type Cache[K comparable, V any] struct {
+	mu      sync.RWMutex
+	entries map[K]entry[V]
+	// order is the FIFO insertion order used by max-size eviction. A key is
+	// appended when first inserted and keeps its position across overwrites.
+	order []K
+
+	inflightMu sync.Mutex
+	// inflight holds active loader calls keyed by cache key; it implements
+	// singleflight so concurrent misses share one loader execution.
+	inflight map[K]*inflight[V]
+
+	ttl     time.Duration                       // entry lifetime; <= 0 means never expire
+	loader  func(context.Context, K) (V, error) // nil means misses are not populated
+	maxSize int                                 // capacity limit; <= 0 means unlimited
+	now     func() time.Time                    // clock used for deadlines and expiry checks
+
+	hits   atomic.Uint64
+	misses atomic.Uint64
+}
+
+// New returns an empty Cache with the given options applied. Defaults are:
+// no expiration, no loader, no size limit, and the system clock.
+func New[K comparable, V any](opts ...Option[K, V]) *Cache[K, V] {
+	cfg := config[K, V]{now: time.Now}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return &Cache[K, V]{
+		entries:  make(map[K]entry[V]),
+		inflight: make(map[K]*inflight[V]),
+		ttl:      cfg.ttl,
+		loader:   cfg.loader,
+		maxSize:  cfg.maxSize,
+		now:      cfg.now,
+	}
+}
+
+// Get returns the value cached for key.
+//
+// Outcome:
+//
+//   - Hit: (value, true, nil).
+//   - Miss without a loader: (zero, false, nil).
+//   - Miss with a loader: the caller runs the loader or joins an in-flight
+//     load for the same key; on success the value is cached and
+//     (value, true, nil) is returned, on failure (zero, false, err) is
+//     returned and the error is not cached.
+//
+// A caller waiting on an in-flight load whose context is cancelled returns
+// the context error without affecting the other waiters.
+func (c *Cache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
+	if value, ok := c.get(key); ok {
+		c.hits.Add(1)
+		return value, true, nil
+	}
+	c.misses.Add(1)
+
+	if c.loader == nil {
+		var zero V
+		return zero, false, nil
+	}
+	return c.load(ctx, key)
+}
+
+// Set stores value for key and, with a positive TTL, restarts the expiry
+// deadline from now. If the key is new and the cache is at its size limit,
+// the oldest inserted key is evicted first. Overwriting an existing key does
+// not change its FIFO position.
+func (c *Cache[K, V]) Set(key K, value V) {
+	var expiresAt time.Time
+	if c.ttl > 0 {
+		expiresAt = c.now().Add(c.ttl)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.entries[key]; !exists {
+		c.order = append(c.order, key)
+		if c.maxSize > 0 && len(c.order) > c.maxSize {
+			oldest := c.order[0]
+			c.order = c.order[1:]
+			delete(c.entries, oldest)
+		}
+	}
+	c.entries[key] = entry[V]{value: value, expiresAt: expiresAt}
+}
+
+// Delete removes key immediately, invalidating it for all subsequent Gets.
+// It is the event-driven invalidation hook used by write paths (for example,
+// clearing a cached principal after a password change).
+func (c *Cache[K, V]) Delete(key K) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.entries[key]; !ok {
+		return
+	}
+	delete(c.entries, key)
+	for i, k := range c.order {
+		if k == key {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
+	}
+}
+
+// Clear removes all entries and resets the FIFO order. In-flight loader
+// operations are unaffected: they may still populate the cache afterwards.
+func (c *Cache[K, V]) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[K]entry[V])
+	c.order = nil
+}
+
+// DeleteExpired scans all entries, removes those past their deadline, and
+// returns how many were removed. It is optional: Gets already purge expired
+// entries lazily. Call it when memory needs proactive reclamation, for
+// example from a periodic ticker.
+func (c *Cache[K, V]) DeleteExpired() int {
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	n := 0
+	for key, e := range c.entries {
+		if !e.expiresAt.IsZero() && !now.Before(e.expiresAt) {
+			delete(c.entries, key)
+			n++
+		}
+	}
+	if n > 0 {
+		// Rebuild the FIFO order in place, keeping only surviving keys.
+		filtered := c.order[:0]
+		for _, key := range c.order {
+			if _, ok := c.entries[key]; ok {
+				filtered = append(filtered, key)
+			}
+		}
+		c.order = filtered
+	}
+	return n
+}
+
+// Len returns the number of cached entries, including not-yet-purged expired
+// ones. It is mainly useful in tests and diagnostics.
+func (c *Cache[K, V]) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries)
+}
+
+// Stats returns the cumulative hit and miss counters since the cache was
+// created. A miss is counted once per Get, before any loader runs.
+func (c *Cache[K, V]) Stats() (hits, misses uint64) {
+	return c.hits.Load(), c.misses.Load()
+}
+
+// get returns the stored value if it is present and not expired. Expired
+// entries are deleted as a side effect (lazy expiration).
+func (c *Cache[K, V]) get(key K) (V, bool) {
+	c.mu.RLock()
+	e, ok := c.entries[key]
+	c.mu.RUnlock()
+	if !ok {
+		var zero V
+		return zero, false
+	}
+	if !e.expiresAt.IsZero() && !c.now().Before(e.expiresAt) {
+		c.Delete(key)
+		var zero V
+		return zero, false
+	}
+	return e.value, true
+}
+
+// load runs the loader for key, coalescing concurrent misses (singleflight).
+//
+// The first caller to miss registers an inflight entry and runs the loader;
+// later callers wait on its ready channel. On success the value is stored
+// before the inflight entry is removed, so callers arriving after completion
+// hit the cache instead of re-running the loader. call.value and call.err are
+// written before ready is closed, establishing the happens-before edge that
+// makes them visible to waiters.
+func (c *Cache[K, V]) load(ctx context.Context, key K) (V, bool, error) {
+	c.inflightMu.Lock()
+	if call, ok := c.inflight[key]; ok {
+		c.inflightMu.Unlock()
+		select {
+		case <-call.ready:
+			if call.err != nil {
+				var zero V
+				return zero, false, call.err
+			}
+			return call.value, true, nil
+		case <-ctx.Done():
+			var zero V
+			return zero, false, ctx.Err()
+		}
+	}
+
+	call := &inflight[V]{ready: make(chan struct{})}
+	c.inflight[key] = call
+	c.inflightMu.Unlock()
+
+	value, err := c.loader(ctx, key)
+	if err == nil {
+		c.Set(key, value)
+	}
+
+	c.inflightMu.Lock()
+	delete(c.inflight, key)
+	c.inflightMu.Unlock()
+
+	call.value = value
+	call.err = err
+	close(call.ready) // publishes value/err to waiters
+
+	if err != nil {
+		var zero V
+		return zero, false, err
+	}
+	return value, true, nil
+}
