@@ -48,6 +48,9 @@ func NewInviteService(stores *store.Stores, roles RoleProvider, now func() int64
 // Defaults: role = default_role, uses = 1, expires in DefaultInviteTTL. An
 // explicit expiresAt must be in the future.
 func (s *InviteService) Create(ctx context.Context, createdBy int64, role string, uses int64, expiresAt *int64) (string, *db.Invite, error) {
+	// Resolve and validate every field before generating anything: an invalid
+	// request must not consume randomness or touch the database. Defaults are
+	// applied here so the handler stays a thin DTO pass-through.
 	if role == "" {
 		role = s.roles.DefaultRole()
 	}
@@ -64,6 +67,9 @@ func (s *InviteService) Create(ctx context.Context, createdBy int64, role string
 		return "", nil, ErrInvalidExpiry
 	}
 
+	// The plaintext code is the only secret here: it is returned to the caller
+	// exactly once and never persisted — only its SHA-256 digest is stored, so
+	// a database leak cannot be replayed as redeemable invites.
 	code, err := generateInviteCode()
 	if err != nil {
 		return "", nil, err

@@ -56,6 +56,10 @@ func NewRegisterService(stores *store.Stores, roles RoleProvider, mode Registrat
 // Register validates the invite (invite mode), creates the user with the
 // granted role, and consumes the invite in a single transaction.
 func (s *RegisterService) Register(ctx context.Context, username, password, nickname, inviteCode string) (*db.User, error) {
+	// 1) Resolve the granted role before touching the database. Invite mode
+	//    requires a live invite and adopts its role; open mode falls back to
+	//    the configured default role. The existence check also guards against
+	//    roles.yaml changing between invite creation and redemption.
 	var invite *db.Invite
 	role := s.roles.DefaultRole()
 	if s.mode == RegistrationInvite {
@@ -80,14 +84,19 @@ func (s *RegisterService) Register(ctx context.Context, username, password, nick
 		role = got.Role
 	}
 
-	if nickname == "" {
-		nickname = username
-	}
-	hash, err := HashPassword(password)
+	// 2) Derive the derived account fields. Argon2id is deliberately slow, so
+	//    hashing must happen before the transaction begins: a hashing run must
+	//    never hold the SQLite write lock.
+	hash, nickname, err := prepareAccount(username, password, nickname)
 	if err != nil {
 		return nil, err
 	}
 
+	// 3) Create the user, assign the role and consume the invite in one
+	//    transaction: either all three persist or none do. The invite is
+	//    consumed last so a failed user or role write never eats a code, and
+	//    Consume's atomic "uses_left > 0" update makes the last-code race
+	//    exactly one winner.
 	tx, err := s.stores.BeginTx(ctx)
 	if err != nil {
 		return nil, err
@@ -116,6 +125,21 @@ func (s *RegisterService) Register(ctx context.Context, username, password, nick
 		return nil, err
 	}
 	return user, nil
+}
+
+// prepareAccount derives the two fields that need the full request context:
+// the password hash and the display nickname. Both account-entry paths
+// (Register and Activate) apply the same rules; keeping them in one place
+// prevents the fallback rule from drifting.
+func prepareAccount(username, password, nickname string) (passwordHash, resolvedNickname string, err error) {
+	hash, err := HashPassword(password)
+	if err != nil {
+		return "", "", err
+	}
+	if nickname == "" {
+		nickname = username
+	}
+	return hash, nickname, nil
 }
 
 // normalizeCode trims surrounding whitespace and uppercases a code so

@@ -74,10 +74,14 @@ func (m *ActivationManager) EnsureCode(ctx context.Context) (code string, ok boo
 // check-and-create, and the code is cleared immediately after commit. A wrong
 // code leaves the pending code intact for retries.
 func (m *ActivationManager) Activate(ctx context.Context, code, username, password, nickname string) (*db.User, error) {
+	// Hand-typed codes are case-insensitive: normalize before hashing so the
+	// comparison below sees the same digest that EnsureCode stored.
 	code = normalizeCode(code)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// The code is one-shot: anything but an exact digest match fails without
+	// side effects, so a typo keeps the pending code available for retries.
 	if m.codeHash == "" {
 		return nil, ErrInvalidActivationCode
 	}
@@ -85,6 +89,9 @@ func (m *ActivationManager) Activate(ctx context.Context, code, username, passwo
 		return nil, ErrInvalidActivationCode
 	}
 
+	// Defensive re-check: an admin can only exist if activation already
+	// happened, but a race between EnsureCode and an out-of-band write should
+	// not create a second one. Revoke the pending code either way.
 	hasAdmin, err := m.stores.Users.HasAdmin(ctx)
 	if err != nil {
 		return nil, err
@@ -94,14 +101,17 @@ func (m *ActivationManager) Activate(ctx context.Context, code, username, passwo
 		return nil, ErrAdminAlreadyExists
 	}
 
-	hash, err := HashPassword(password)
+	// Same account-field rules as Register; see prepareAccount. Hashing stays
+	// outside the transaction so the expensive argon2id run does not hold the
+	// SQLite write lock.
+	hash, nickname, err := prepareAccount(username, password, nickname)
 	if err != nil {
 		return nil, err
 	}
-	if nickname == "" {
-		nickname = username
-	}
 
+	// Create the user and grant the admin role in one transaction. The code is
+	// cleared only after commit, so a failed write keeps the admin able to
+	// retry with the same code.
 	tx, err := m.stores.BeginTx(ctx)
 	if err != nil {
 		return nil, err
