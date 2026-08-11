@@ -1,0 +1,149 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/labstack/echo/v5"
+
+	"zephyr.vox/server/ce/internal/db"
+	"zephyr.vox/server/ce/internal/store"
+	"zephyr.vox/server/ce/internal/validation"
+)
+
+var (
+	// ErrInvalidInvite is returned when an invite code is missing, unknown,
+	// expired, exhausted, or loses the concurrent redemption race.
+	ErrInvalidInvite = errors.New("auth: invalid invite code")
+	// ErrUsernameTaken is returned when the username already exists.
+	ErrUsernameTaken = errors.New("auth: username already taken")
+)
+
+// RegistrationMode selects how new accounts may register.
+type RegistrationMode string
+
+const (
+	// RegistrationOpen lets anyone register without an invite.
+	RegistrationOpen RegistrationMode = "open"
+	// RegistrationInvite requires a valid invite code to register.
+	RegistrationInvite RegistrationMode = "invite"
+)
+
+// RoleProvider supplies the role definitions used by the account services.
+// config.Roles satisfies it; keeping an interface here avoids coupling the
+// auth domain to the config package.
+type RoleProvider interface {
+	DefaultRole() string
+	HasRole(role string) bool
+}
+
+// RegisterService creates accounts and redeems invites atomically: user,
+// roles and invite consumption either all commit or all roll back.
+type RegisterService struct {
+	stores *store.Stores
+	roles  RoleProvider
+	mode   RegistrationMode
+}
+
+// NewRegisterService returns a RegisterService.
+func NewRegisterService(stores *store.Stores, roles RoleProvider, mode RegistrationMode) *RegisterService {
+	return &RegisterService{stores: stores, roles: roles, mode: mode}
+}
+
+// Register validates the invite (invite mode), creates the user with the
+// granted role, and consumes the invite in a single transaction.
+func (s *RegisterService) Register(ctx context.Context, username, password, nickname, inviteCode string) (*db.User, error) {
+	var invite *db.Invite
+	role := s.roles.DefaultRole()
+	if s.mode == RegistrationInvite {
+		code := normalizeCode(inviteCode)
+		if code == "" {
+			return nil, ErrInvalidInvite
+		}
+		got, err := s.stores.Invites.GetByCodeHash(ctx, sha256Hex(code))
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, ErrInvalidInvite
+		}
+		if err != nil {
+			return nil, err
+		}
+		if got.UsesLeft <= 0 {
+			return nil, ErrInvalidInvite
+		}
+		if !s.roles.HasRole(got.Role) {
+			return nil, fmt.Errorf("auth: invite role %q no longer exists", got.Role)
+		}
+		invite = got
+		role = got.Role
+	}
+
+	if nickname == "" {
+		nickname = username
+	}
+	hash, err := HashPassword(password)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := s.stores.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	txStores := s.stores.WithTx(tx)
+
+	user, err := txStores.Users.CreateUser(ctx, username, hash, nickname, nil)
+	if errors.Is(err, store.ErrConflict) {
+		return nil, ErrUsernameTaken
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := txStores.Users.SetRoles(ctx, user.ID, []string{role}); err != nil {
+		return nil, err
+	}
+	if invite != nil {
+		if _, err := txStores.Invites.Consume(ctx, invite.ID); errors.Is(err, store.ErrNotFound) {
+			return nil, ErrInvalidInvite
+		} else if err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// normalizeCode trims surrounding whitespace and uppercases a code so
+// hand-typed lowercase input still redeems.
+func normalizeCode(code string) string {
+	return strings.ToUpper(strings.TrimSpace(code))
+}
+
+// RegisterHandler handles POST /api/v0/auth/register. It never issues tokens:
+// the client signs in afterwards with the same credentials.
+func RegisterHandler(svc *RegisterService) echo.HandlerFunc {
+	return func(c *echo.Context) error {
+		var req registerRequest
+		if err := validation.Bind(c, &req); err != nil {
+			return err
+		}
+
+		user, err := svc.Register(c.Request().Context(), req.Username, req.Password, req.Nickname, req.Invite)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrInvalidInvite):
+				return echo.ErrBadRequest
+			case errors.Is(err, ErrUsernameTaken):
+				return echo.NewHTTPError(http.StatusConflict, "username already taken")
+			default:
+				return err
+			}
+		}
+		return c.JSON(http.StatusCreated, userEnvelope{User: newUserResponse(user)})
+	}
+}

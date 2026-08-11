@@ -19,18 +19,20 @@ var defaultAppTOML []byte
 
 // App is the validated server configuration loaded from zephyr.toml.
 type App struct {
-	JWTSecret       string
-	AccessTokenTTL  time.Duration
-	RefreshTokenTTL time.Duration
-	LoginRateLimit  float64 // requests per minute
+	JWTSecret        string
+	AccessTokenTTL   time.Duration
+	RefreshTokenTTL  time.Duration
+	LoginRateLimit   float64 // requests per minute
+	RegistrationMode string  // "open" or "invite"
 }
 
 type appConfig struct {
 	JWTSecret string `mapstructure:"jwt_secret"`
 	Auth      struct {
-		AccessTokenTTL  string  `mapstructure:"access_token_ttl"`
-		RefreshTokenTTL string  `mapstructure:"refresh_token_ttl"`
-		LoginRateLimit  float64 `mapstructure:"login_rate_limit"`
+		AccessTokenTTL   string  `mapstructure:"access_token_ttl"`
+		RefreshTokenTTL  string  `mapstructure:"refresh_token_ttl"`
+		LoginRateLimit   float64 `mapstructure:"login_rate_limit"`
+		RegistrationMode string  `mapstructure:"registration_mode"`
 	} `mapstructure:"auth"`
 }
 
@@ -70,11 +72,19 @@ func newApp(cfg appConfig) (*App, error) {
 	if cfg.Auth.LoginRateLimit <= 0 {
 		return nil, errors.New("config: login_rate_limit must be positive")
 	}
+	mode := cfg.Auth.RegistrationMode
+	if mode == "" {
+		mode = "invite"
+	}
+	if mode != "open" && mode != "invite" {
+		return nil, errors.New(`config: registration_mode must be "open" or "invite"`)
+	}
 	return &App{
-		JWTSecret:       cfg.JWTSecret,
-		AccessTokenTTL:  accessTTL,
-		RefreshTokenTTL: refreshTTL,
-		LoginRateLimit:  cfg.Auth.LoginRateLimit,
+		JWTSecret:        cfg.JWTSecret,
+		AccessTokenTTL:   accessTTL,
+		RefreshTokenTTL:  refreshTTL,
+		LoginRateLimit:   cfg.Auth.LoginRateLimit,
+		RegistrationMode: mode,
 	}, nil
 }
 

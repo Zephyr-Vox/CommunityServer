@@ -11,13 +11,15 @@ import (
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/auth"
+	"zephyr.vox/server/ce/internal/validation"
 )
 
 func newAuthEcho(e *env) *echo.Echo {
 	app := echo.New()
-	app.POST("/api/v1/auth/login", auth.LoginHandler(e.svc), auth.LoginRateLimit(1))
-	app.POST("/api/v1/auth/refresh", auth.RefreshHandler(e.svc))
-	app.POST("/api/v1/auth/logout", auth.LogoutHandler(e.svc))
+	app.Validator = validation.New()
+	app.POST("/api/v0/auth/login", auth.LoginHandler(e.svc), auth.LoginRateLimit(1))
+	app.POST("/api/v0/auth/refresh", auth.RefreshHandler(e.svc))
+	app.POST("/api/v0/auth/logout", auth.LogoutHandler(e.svc))
 	return app
 }
 
@@ -39,7 +41,7 @@ func TestLoginHandler(t *testing.T) {
 	app := newAuthEcho(e)
 	e.createUser(t, "alice", "secret123", "member")
 
-	rec := postJSON(t, app, "/api/v1/auth/login", loginBody("alice", "secret123", "dev-1"))
+	rec := postJSON(t, app, "/api/v0/auth/login", loginBody("alice", "secret123", "dev-1"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
@@ -61,7 +63,7 @@ func TestLoginHandlerMissingDeviceID(t *testing.T) {
 	app := newAuthEcho(e)
 	e.createUser(t, "alice", "secret123", "member")
 
-	rec := postJSON(t, app, "/api/v1/auth/login", `{"username":"alice","password":"secret123"}`)
+	rec := postJSON(t, app, "/api/v0/auth/login", `{"username":"alice","password":"secret123"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
@@ -72,7 +74,7 @@ func TestLoginHandlerWrongPassword(t *testing.T) {
 	app := newAuthEcho(e)
 	e.createUser(t, "alice", "secret123", "member")
 
-	rec := postJSON(t, app, "/api/v1/auth/login", loginBody("alice", "wrong", "dev-1"))
+	rec := postJSON(t, app, "/api/v0/auth/login", loginBody("alice", "wrong", "dev-1"))
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
 	}
@@ -86,7 +88,7 @@ func TestLoginHandlerBanned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec := postJSON(t, app, "/api/v1/auth/login", loginBody("alice", "secret123", "dev-1"))
+	rec := postJSON(t, app, "/api/v0/auth/login", loginBody("alice", "secret123", "dev-1"))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
 	}
@@ -97,11 +99,11 @@ func TestLoginHandlerRateLimit(t *testing.T) {
 	app := newAuthEcho(e)
 	e.createUser(t, "alice", "secret123", "member")
 
-	first := postJSON(t, app, "/api/v1/auth/login", loginBody("alice", "wrong", "dev-1"))
+	first := postJSON(t, app, "/api/v0/auth/login", loginBody("alice", "wrong", "dev-1"))
 	if first.Code != http.StatusUnauthorized {
 		t.Fatalf("first status = %d, want 401", first.Code)
 	}
-	second := postJSON(t, app, "/api/v1/auth/login", loginBody("alice", "wrong", "dev-1"))
+	second := postJSON(t, app, "/api/v0/auth/login", loginBody("alice", "wrong", "dev-1"))
 	if second.Code != http.StatusTooManyRequests {
 		t.Fatalf("second status = %d, want 429", second.Code)
 	}
@@ -112,20 +114,20 @@ func TestRefreshHandler(t *testing.T) {
 	app := newAuthEcho(e)
 	e.createUser(t, "alice", "secret123", "member")
 
-	login := postJSON(t, app, "/api/v1/auth/login", loginBody("alice", "secret123", "dev-1"))
+	login := postJSON(t, app, "/api/v0/auth/login", loginBody("alice", "secret123", "dev-1"))
 	var loginResp map[string]any
 	if err := json.Unmarshal(login.Body.Bytes(), &loginResp); err != nil {
 		t.Fatal(err)
 	}
 	refreshToken, _ := loginResp["refresh_token"].(string)
 
-	rec := postJSON(t, app, "/api/v1/auth/refresh", `{"refresh_token":"`+refreshToken+`"}`)
+	rec := postJSON(t, app, "/api/v0/auth/refresh", `{"refresh_token":"`+refreshToken+`"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 
 	// The old token is rotated away.
-	again := postJSON(t, app, "/api/v1/auth/refresh", `{"refresh_token":"`+refreshToken+`"}`)
+	again := postJSON(t, app, "/api/v0/auth/refresh", `{"refresh_token":"`+refreshToken+`"}`)
 	if again.Code != http.StatusUnauthorized {
 		t.Fatalf("reused refresh status = %d, want 401", again.Code)
 	}
@@ -136,14 +138,14 @@ func TestLogoutHandler(t *testing.T) {
 	app := newAuthEcho(e)
 	e.createUser(t, "alice", "secret123", "member")
 
-	login := postJSON(t, app, "/api/v1/auth/login", loginBody("alice", "secret123", "dev-1"))
+	login := postJSON(t, app, "/api/v0/auth/login", loginBody("alice", "secret123", "dev-1"))
 	var loginResp map[string]any
 	if err := json.Unmarshal(login.Body.Bytes(), &loginResp); err != nil {
 		t.Fatal(err)
 	}
 	refreshToken, _ := loginResp["refresh_token"].(string)
 
-	rec := postJSON(t, app, "/api/v1/auth/logout", `{"refresh_token":"`+refreshToken+`"}`)
+	rec := postJSON(t, app, "/api/v0/auth/logout", `{"refresh_token":"`+refreshToken+`"}`)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", rec.Code)
 	}

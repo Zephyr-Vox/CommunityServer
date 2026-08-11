@@ -5,17 +5,16 @@ import (
 	"net/http"
 
 	"github.com/labstack/echo/v5"
+
+	"zephyr.vox/server/ce/internal/validation"
 )
 
-// LoginHandler handles POST /api/v1/auth/login.
+// LoginHandler handles POST /api/v0/auth/login.
 func LoginHandler(svc *AuthService) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var req loginRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.ErrBadRequest
-		}
-		if req.Username == "" || req.Password == "" || req.DeviceID == "" {
-			return echo.ErrBadRequest
+		if err := validation.Bind(c, &req); err != nil {
+			return err
 		}
 
 		result, err := svc.Login(c.Request().Context(), req.Username, req.Password, req.DeviceID)
@@ -30,32 +29,23 @@ func LoginHandler(svc *AuthService) echo.HandlerFunc {
 			}
 		}
 
-		avatar := ""
-		if result.User.Avatar.Valid {
-			avatar = result.User.Avatar.String
-		}
 		return c.JSON(http.StatusOK, loginResponse{
 			tokenResponse: tokenResponse{
 				AccessToken:  result.AccessToken,
 				RefreshToken: result.RefreshToken,
 				ExpiresIn:    result.ExpiresIn,
 			},
-			User: userResponse{
-				ID:       result.User.ID,
-				Username: result.User.Username,
-				Nickname: result.User.Nickname,
-				Avatar:   avatar,
-			},
+			User: newUserResponse(result.User),
 		})
 	}
 }
 
-// RefreshHandler handles POST /api/v1/auth/refresh.
+// RefreshHandler handles POST /api/v0/auth/refresh.
 func RefreshHandler(svc *AuthService) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var req refreshRequest
-		if err := c.Bind(&req); err != nil || req.RefreshToken == "" {
-			return echo.ErrBadRequest
+		if err := validation.Bind(c, &req); err != nil {
+			return err
 		}
 
 		pair, err := svc.Refresh(c.Request().Context(), req.RefreshToken)
@@ -73,12 +63,12 @@ func RefreshHandler(svc *AuthService) echo.HandlerFunc {
 	}
 }
 
-// LogoutHandler handles POST /api/v1/auth/logout.
+// LogoutHandler handles POST /api/v0/auth/logout.
 func LogoutHandler(svc *AuthService) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var req logoutRequest
-		if err := c.Bind(&req); err != nil || req.RefreshToken == "" {
-			return echo.ErrBadRequest
+		if err := validation.Bind(c, &req); err != nil {
+			return err
 		}
 		if err := svc.Logout(c.Request().Context(), req.RefreshToken); err != nil {
 			return err

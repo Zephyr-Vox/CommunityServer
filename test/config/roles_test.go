@@ -158,3 +158,18 @@ roles:
 		t.Fatalf("want unknown role, got ok=%v err=%v", ok, err)
 	}
 }
+
+func TestRolesHasRole(t *testing.T) {
+	roles, err := config.LoadRoles(filepath.Join(t.TempDir(), "roles.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"admin", "member"} {
+		if !roles.HasRole(role) {
+			t.Fatalf("HasRole(%q) = false, want true", role)
+		}
+	}
+	if roles.HasRole("moderator") {
+		t.Fatal("HasRole(moderator) = true, want false")
+	}
+}

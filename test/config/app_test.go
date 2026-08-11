@@ -39,6 +39,9 @@ func TestLoadAppGeneratesDefault(t *testing.T) {
 	if app.LoginRateLimit != 10 {
 		t.Fatalf("login_rate_limit = %v, want 10", app.LoginRateLimit)
 	}
+	if app.RegistrationMode != "invite" {
+		t.Fatalf("registration_mode = %q, want invite", app.RegistrationMode)
+	}
 
 	info, err := os.Stat(path)
 	if err != nil {
@@ -118,5 +121,40 @@ login_rate_limit = 0
 	_, err := config.LoadApp(path)
 	if err == nil || !strings.Contains(err.Error(), "login_rate_limit") {
 		t.Fatalf("want login_rate_limit error, got %v", err)
+	}
+}
+
+func TestLoadAppCustomRegistrationMode(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+registration_mode = "open"
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.RegistrationMode != "open" {
+		t.Fatalf("registration_mode = %q, want open", app.RegistrationMode)
+	}
+}
+
+func TestLoadAppRejectsBadRegistrationMode(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+registration_mode = "closed"
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "registration_mode") {
+		t.Fatalf("want registration_mode error, got %v", err)
 	}
 }

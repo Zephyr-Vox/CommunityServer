@@ -61,6 +61,12 @@ func (r *Roles) DefaultRole() string {
 	return r.defaultRole
 }
 
+// HasRole reports whether the role is defined in the configuration.
+func (r *Roles) HasRole(role string) bool {
+	_, ok := r.permissions[role]
+	return ok
+}
+
 // PermissionsForRole implements rbac.PermissionStore.
 func (r *Roles) PermissionsForRole(_ context.Context, role string) ([]rbac.Permission, bool, error) {
 	perms, ok := r.permissions[role]
