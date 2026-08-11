@@ -39,6 +39,11 @@ type meResponse struct {
 	Permissions []string `json:"permissions"`
 }
 
+type statusResponse struct {
+	RegistrationMode   string `json:"registration_mode"`
+	ActivationRequired bool   `json:"activation_required"`
+}
+
 func newUserResponse(u *db.User) userResponse {
 	avatar := ""
 	if u.Avatar.Valid {
