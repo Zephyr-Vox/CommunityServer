@@ -62,5 +62,16 @@ func (s *InviteStore) Consume(ctx context.Context, id int64) (*db.Invite, error)
 
 // Delete removes an invite by ID.
 func (s *InviteStore) Delete(ctx context.Context, id int64) error {
-	return mapError(s.q.DeleteInvite(ctx, id))
+	_, err := s.q.DeleteInvite(ctx, id)
+	return mapError(err)
+}
+
+// List returns invites ordered by creation time descending, with
+// limit/offset pagination.
+func (s *InviteStore) List(ctx context.Context, limit, offset int64) ([]db.Invite, error) {
+	invites, err := s.q.ListInvites(ctx, db.ListInvitesParams{Limit: limit, Offset: offset})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return invites, nil
 }

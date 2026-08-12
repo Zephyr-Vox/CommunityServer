@@ -76,13 +76,15 @@ func (q *Queries) CreateInvite(ctx context.Context, arg CreateInviteParams) (Inv
 	return i, err
 }
 
-const deleteInvite = `-- name: DeleteInvite :exec
-DELETE FROM invites WHERE id = ?
+const deleteInvite = `-- name: DeleteInvite :one
+DELETE FROM invites WHERE id = ? RETURNING id
 `
 
-func (q *Queries) DeleteInvite(ctx context.Context, id int64) error {
-	_, err := q.db.ExecContext(ctx, deleteInvite, id)
-	return err
+func (q *Queries) DeleteInvite(ctx context.Context, id int64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, deleteInvite, id)
+	var id_2 int64
+	err := row.Scan(&id_2)
+	return id_2, err
 }
 
 const getInviteByCodeHash = `-- name: GetInviteByCodeHash :one
@@ -107,4 +109,46 @@ func (q *Queries) GetInviteByCodeHash(ctx context.Context, arg GetInviteByCodeHa
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const listInvites = `-- name: ListInvites :many
+SELECT id, code_hash, role, uses_left, expires_at, created_by, created_at FROM invites
+ORDER BY created_at DESC
+LIMIT ? OFFSET ?
+`
+
+type ListInvitesParams struct {
+	Limit  int64 `json:"limit"`
+	Offset int64 `json:"offset"`
+}
+
+func (q *Queries) ListInvites(ctx context.Context, arg ListInvitesParams) ([]Invite, error) {
+	rows, err := q.db.QueryContext(ctx, listInvites, arg.Limit, arg.Offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Invite
+	for rows.Next() {
+		var i Invite
+		if err := rows.Scan(
+			&i.ID,
+			&i.CodeHash,
+			&i.Role,
+			&i.UsesLeft,
+			&i.ExpiresAt,
+			&i.CreatedBy,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

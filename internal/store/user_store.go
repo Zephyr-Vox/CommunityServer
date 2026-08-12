@@ -182,3 +182,10 @@ func (s *UserStore) HasAdmin(ctx context.Context) (bool, error) {
 	}
 	return ok, nil
 }
+
+// Delete removes a user row. Sessions and roles cascade; invites the user
+// created keep their rows with created_by set to NULL (ON DELETE SET NULL).
+func (s *UserStore) Delete(ctx context.Context, id int64) error {
+	_, err := s.q.DeleteUser(ctx, id)
+	return mapError(err)
+}

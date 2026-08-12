@@ -9,6 +9,36 @@ import (
 	"zephyr.vox/server/ce/internal/store"
 )
 
+func TestDeleteUser(t *testing.T) {
+	s, _ := newTestEnv(t)
+	ctx := context.Background()
+
+	u, err := s.Users.CreateUser(ctx, "alice", "hash", "alice", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Users.SetRoles(ctx, u.ID, []string{"member"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Users.Delete(ctx, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Users.GetUserByID(ctx, u.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("want ErrNotFound after delete, got %v", err)
+	}
+	roles, err := s.Users.GetRoles(ctx, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roles) != 0 {
+		t.Fatalf("roles = %v, want cascade empty", roles)
+	}
+	if err := s.Users.Delete(ctx, u.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("second delete want ErrNotFound, got %v", err)
+	}
+}
+
 func TestCreateAndGetUser(t *testing.T) {
 	s, _ := newTestEnv(t)
 	ctx := context.Background()

@@ -68,6 +68,17 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 	return i, err
 }
 
+const deleteUser = `-- name: DeleteUser :one
+DELETE FROM users WHERE id = ? RETURNING id
+`
+
+func (q *Queries) DeleteUser(ctx context.Context, id int64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, deleteUser, id)
+	var id_2 int64
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const deleteUserRoles = `-- name: DeleteUserRoles :exec
 DELETE FROM user_roles WHERE user_id = ?
 `

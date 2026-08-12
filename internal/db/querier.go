@@ -15,10 +15,11 @@ type Querier interface {
 	CreateInvite(ctx context.Context, arg CreateInviteParams) (Invite, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	DeleteExpiredSessions(ctx context.Context, expiresAt int64) (int64, error)
-	DeleteInvite(ctx context.Context, id int64) error
+	DeleteInvite(ctx context.Context, id int64) (int64, error)
 	DeleteSession(ctx context.Context, id int64) error
 	DeleteSessionByPrevTokenHash(ctx context.Context, prevTokenHash sql.NullString) (int64, error)
 	DeleteSessionByTokenHash(ctx context.Context, tokenHash string) error
+	DeleteUser(ctx context.Context, id int64) (int64, error)
 	DeleteUserRoles(ctx context.Context, userID int64) error
 	DeleteUserSessions(ctx context.Context, userID int64) error
 	ExistsAdminRole(ctx context.Context) (bool, error)
@@ -29,6 +30,7 @@ type Querier interface {
 	GetUserByID(ctx context.Context, id int64) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	InsertUserRole(ctx context.Context, arg InsertUserRoleParams) error
+	ListInvites(ctx context.Context, arg ListInvitesParams) ([]Invite, error)
 	ListSessionsByUser(ctx context.Context, userID int64) ([]Session, error)
 	ListUsers(ctx context.Context, arg ListUsersParams) ([]User, error)
 	RotateSession(ctx context.Context, arg RotateSessionParams) (Session, error)

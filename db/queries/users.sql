@@ -51,3 +51,6 @@ DELETE FROM user_roles WHERE user_id = ?;
 
 -- name: ExistsAdminRole :one
 SELECT EXISTS(SELECT 1 FROM user_roles WHERE role = 'admin') AS has_admin;
+
+-- name: DeleteUser :one
+DELETE FROM users WHERE id = ? RETURNING id;

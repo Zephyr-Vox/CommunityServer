@@ -12,5 +12,10 @@ SET uses_left = uses_left - 1
 WHERE id = ? AND uses_left > 0 AND (expires_at IS NULL OR expires_at > CAST(sqlc.arg(now) AS INTEGER))
 RETURNING *;
 
--- name: DeleteInvite :exec
-DELETE FROM invites WHERE id = ?;
+-- name: DeleteInvite :one
+DELETE FROM invites WHERE id = ? RETURNING id;
+
+-- name: ListInvites :many
+SELECT * FROM invites
+ORDER BY created_at DESC
+LIMIT ? OFFSET ?;

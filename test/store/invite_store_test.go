@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -70,6 +71,59 @@ func TestConsumeInvite(t *testing.T) {
 
 	if _, err := s.Invites.Consume(ctx, inv.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("want ErrNotFound for exhausted invite, got %v", err)
+	}
+}
+
+func TestListInvites(t *testing.T) {
+	s, _ := newTestEnv(t)
+	ctx := context.Background()
+	admin := mustCreateUser(t, s, "admin")
+
+	for i := 0; i < 3; i++ {
+		if _, err := s.Invites.Create(ctx, fmt.Sprintf("code%d", i), "member", 1, nil, &admin.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	invites, err := s.Invites.List(ctx, 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invites) != 2 {
+		t.Fatalf("len = %d, want 2", len(invites))
+	}
+	if invites[0].CreatedAt < invites[1].CreatedAt {
+		t.Fatal("want newest first")
+	}
+	page2, err := s.Invites.List(ctx, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2) != 1 {
+		t.Fatalf("page2 len = %d, want 1", len(page2))
+	}
+}
+
+func TestDeleteUserSetsInviteCreatedByNull(t *testing.T) {
+	s, _ := newTestEnv(t)
+	ctx := context.Background()
+	admin := mustCreateUser(t, s, "admin")
+	inv, err := s.Invites.Create(ctx, "codehash", "member", 1, nil, &admin.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Users.Delete(ctx, admin.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Invites.GetByCodeHash(ctx, "codehash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != inv.ID {
+		t.Fatalf("invite = %d, want %d to survive", got.ID, inv.ID)
+	}
+	if got.CreatedBy.Valid {
+		t.Fatalf("created_by = %v, want NULL after admin delete", got.CreatedBy)
 	}
 }
 

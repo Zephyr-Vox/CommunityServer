@@ -38,6 +38,6 @@ CREATE TABLE invites (
     role       TEXT    NOT NULL DEFAULT 'member',    -- role granted when redeemed
     uses_left  INTEGER NOT NULL DEFAULT 1 CHECK (uses_left >= 0),
     expires_at INTEGER,                              -- NULL = never expires
-    created_by INTEGER REFERENCES users(id),         -- admin who created it; NULL = system
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL, -- admin who created it; NULL = system or deleted admin
     created_at INTEGER NOT NULL
 ) STRICT;
