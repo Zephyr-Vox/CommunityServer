@@ -216,7 +216,12 @@ func (c *Cache[K, V]) DeleteExpired() int {
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.purgeExpiredLocked(now)
+}
 
+// purgeExpiredLocked removes expired entries and rebuilds the FIFO order.
+// Callers must hold c.mu.
+func (c *Cache[K, V]) purgeExpiredLocked(now time.Time) int {
 	n := 0
 	for key, e := range c.entries {
 		if !e.expiresAt.IsZero() && !now.Before(e.expiresAt) {
@@ -235,6 +240,23 @@ func (c *Cache[K, V]) DeleteExpired() int {
 		c.order = filtered
 	}
 	return n
+}
+
+// Snapshot returns a copy of every non-expired entry, keyed by cache key.
+// Expired entries are purged as a side effect, mirroring the lazy expiration
+// of Get. The returned map is a deep-enough copy for callers to read without
+// holding the cache lock.
+func (c *Cache[K, V]) Snapshot() map[K]V {
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.purgeExpiredLocked(now)
+
+	out := make(map[K]V, len(c.entries))
+	for key, e := range c.entries {
+		out[key] = e.value
+	}
+	return out
 }
 
 // Len returns the number of cached entries, including not-yet-purged expired

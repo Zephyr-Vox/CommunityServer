@@ -85,6 +85,35 @@ func TestNoTTLNeverExpires(t *testing.T) {
 	}
 }
 
+func TestSnapshot(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(0, 0)}
+	c := newTestCache[string](10*time.Second, clock)
+	c.Set("a", "1")
+	c.Set("b", "2")
+
+	snap := c.Snapshot()
+	if len(snap) != 2 || snap["a"] != "1" || snap["b"] != "2" {
+		t.Fatalf("snapshot = %v, want a and b", snap)
+	}
+
+	// The snapshot is a copy: mutating it must not affect the cache.
+	delete(snap, "a")
+	if _, ok, _ := c.Get(context.Background(), "a"); !ok {
+		t.Fatal("mutating the snapshot must not affect the cache")
+	}
+
+	// Expired entries are purged as a side effect.
+	clock.advance(11 * time.Second)
+	c.Set("c", "3")
+	snap = c.Snapshot()
+	if len(snap) != 1 || snap["c"] != "3" {
+		t.Fatalf("snapshot = %v, want only c", snap)
+	}
+	if c.Len() != 1 {
+		t.Fatalf("len = %d, want 1 after purge", c.Len())
+	}
+}
+
 func TestLoaderPopulatesOnMiss(t *testing.T) {
 	var calls atomic.Int64
 	c := cache.New[string, string](
