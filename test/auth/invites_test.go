@@ -2,10 +2,12 @@ package auth_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -119,7 +121,9 @@ func newInviteEcho(t *testing.T, e *env, svc *auth.InviteService, roles *config.
 	app.Use(jwtMW)
 	authz := rbac.NewAuthorizer(roles)
 	app.Use(rbacecho.AuthN(auth.NewPrincipalResolver(e.principals)))
-	app.POST("/api/v0/admin/invites", auth.InviteCreateHandler(svc), rbacecho.Require(authz, rbac.PermInviteCreate))
+	app.POST("/api/v0/admin/invites", auth.InviteCreateHandler(svc), rbacecho.Require(authz, rbac.PermInviteManage))
+	app.GET("/api/v0/admin/invites", auth.InviteListHandler(svc), rbacecho.Require(authz, rbac.PermInviteManage))
+	app.DELETE("/api/v0/admin/invites/:id", auth.InviteDeleteHandler(svc), rbacecho.Require(authz, rbac.PermInviteManage))
 	return app
 }
 
@@ -196,5 +200,64 @@ func TestInviteCreateHandlerInvalidBody(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s: status = %d, want 400", name, rec.Code)
 		}
+	}
+}
+
+func TestInviteListHandler(t *testing.T) {
+	e := newEnv(t)
+	roles := newRoles(t)
+	svc := auth.NewInviteService(e.stores, roles, e.clock.get)
+	app := newInviteEcho(t, e, svc, roles)
+	boss := e.createUser(t, "boss", "secret123", "admin")
+	token := loginToken(t, e, "boss", "secret123")
+	for i := 0; i < 3; i++ {
+		if _, _, err := svc.Create(context.Background(), boss.ID, "", 1, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec := requestMethodWithToken(t, app, http.MethodGet, "/api/v0/admin/invites", token, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Code int              `json:"code"`
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != 0 || len(resp.Data) != 3 {
+		t.Fatalf("envelope = %+v, want 3 invites", resp)
+	}
+}
+
+func TestInviteDeleteHandler(t *testing.T) {
+	e := newEnv(t)
+	roles := newRoles(t)
+	svc := auth.NewInviteService(e.stores, roles, e.clock.get)
+	app := newInviteEcho(t, e, svc, roles)
+	boss := e.createUser(t, "boss", "secret123", "admin")
+	token := loginToken(t, e, "boss", "secret123")
+	code, inv, err := svc.Create(context.Background(), boss.ID, "", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := requestMethodWithToken(t, app, http.MethodDelete,
+		"/api/v0/admin/invites/"+strconv.FormatInt(inv.ID, 10), token, "")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	svc2 := auth.NewRegisterService(e.stores, roles, auth.RegistrationInvite)
+	if _, err := svc2.Register(context.Background(), "alice", "secret123", "", code); err == nil {
+		t.Fatal("redeeming a deleted invite must fail")
+	}
+
+	rec = requestMethodWithToken(t, app, http.MethodDelete,
+		"/api/v0/admin/invites/"+strconv.FormatInt(inv.ID, 10), token, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("second delete status = %d, want 404", rec.Code)
 	}
 }

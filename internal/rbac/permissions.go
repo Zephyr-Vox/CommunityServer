@@ -7,7 +7,7 @@ const (
 	PermUserUpdate   Permission = "user:update"
 	PermUserDelete   Permission = "user:delete"
 	PermUserKick     Permission = "user:kick"
-	PermInviteCreate Permission = "invite:create"
+	PermInviteManage Permission = "invite:manage"
 )
 
 // AllPermissions is the registry every role configuration is validated against.
@@ -18,7 +18,7 @@ var AllPermissions = []Permission{
 	PermUserUpdate,
 	PermUserDelete,
 	PermUserKick,
-	PermInviteCreate,
+	PermInviteManage,
 }
 
 var allPermissionSet = func() map[Permission]struct{} {

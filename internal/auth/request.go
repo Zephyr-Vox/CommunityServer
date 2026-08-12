@@ -35,3 +35,21 @@ type inviteCreateRequest struct {
 	Uses      int64  `json:"uses" validate:"omitempty,min=1"`
 	ExpiresAt int64  `json:"expires_at" validate:"omitempty,min=1"`
 }
+
+type updateProfileRequest struct {
+	Nickname string  `json:"nickname" validate:"omitempty,max=32"`
+	Avatar   *string `json:"avatar" validate:"omitempty,max=512"`
+}
+
+type setRolesRequest struct {
+	Roles []string `json:"roles" validate:"required,min=1,max=32,dive,required"`
+}
+
+type resetPasswordRequest struct {
+	Password string `json:"password" validate:"required,password"`
+}
+
+type changeOwnPasswordRequest struct {
+	OldPassword string `json:"old_password" validate:"required"`
+	NewPassword string `json:"new_password" validate:"required,password"`
+}

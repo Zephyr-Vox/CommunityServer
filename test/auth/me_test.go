@@ -86,7 +86,7 @@ func TestMeHandlerAdminPermissions(t *testing.T) {
 		}
 		return false
 	}
-	if !has("invite:create") || !has("voice:join") || !has("user:kick") {
+	if !has("invite:manage") || !has("voice:join") || !has("user:kick") {
 		t.Fatalf("permissions = %v, want wildcard expansion", perms)
 	}
 }

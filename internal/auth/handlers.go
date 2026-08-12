@@ -176,7 +176,7 @@ func ActivateHandler(mgr *ActivationManager) echo.HandlerFunc {
 }
 
 // InviteCreateHandler handles POST /api/v0/admin/invites. The route must be
-// mounted behind AuthN and Require(invite:create).
+// mounted behind AuthN and Require(invite:manage).
 //
 // Errors:
 //   - 1 unknown role: role is not defined in roles.yaml
@@ -184,7 +184,7 @@ func ActivateHandler(mgr *ActivationManager) echo.HandlerFunc {
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
-//   - 1003 forbidden: missing invite:create permission
+//   - 1003 forbidden: missing invite:manage permission
 //   - 1009 internal: unexpected server error
 func InviteCreateHandler(svc *InviteService) echo.HandlerFunc {
 	const (
@@ -266,4 +266,411 @@ func StatusHandler(stores *store.Stores, mode RegistrationMode) echo.HandlerFunc
 			ActivationRequired: !hasAdmin,
 		})
 	}
+}
+
+// ListUsersHandler handles GET /api/v0/users. The route must be mounted
+// behind AuthN and Require(user:read).
+//
+// Errors:
+//   - 1 invalid pagination: limit must be 1-100, offset non-negative
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing user:read permission
+//   - 1009 internal: unexpected server error
+func ListUsersHandler(svc *UserService) echo.HandlerFunc {
+	const codeInvalidPagination = 1
+	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+		limit, offset, err := parsePagination(c)
+		if err != nil {
+			return api.NewError(codeInvalidPagination, http.StatusBadRequest, "invalid limit or offset")
+		}
+		users, err := svc.List(c.Request().Context(), limit, offset)
+		if err != nil {
+			return err
+		}
+		resp := make([]userDetailResponse, 0, len(users))
+		for i := range users {
+			resp = append(resp, newUserDetailResponse(&users[i]))
+		}
+		return api.OK(c, http.StatusOK, resp)
+	})
+}
+
+// GetUserHandler handles GET /api/v0/users/:id. The route must be mounted
+// behind AuthN and Require(user:read).
+//
+// Errors:
+//   - 1 invalid id: malformed or non-positive path id
+//   - 2 user not found
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing user:read permission
+//   - 1009 internal: unexpected server error
+func GetUserHandler(svc *UserService) echo.HandlerFunc {
+	const (
+		codeInvalidID    = 1
+		codeUserNotFound = 2
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+		id, err := parsePathID(c)
+		if err != nil {
+			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
+		}
+		user, err := svc.Get(c.Request().Context(), id)
+		if errors.Is(err, store.ErrNotFound) {
+			return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+		}
+		if err != nil {
+			return err
+		}
+		return api.OK(c, http.StatusOK, newUserDetailResponse(user))
+	})
+}
+
+// UpdateUserHandler handles PATCH /api/v0/users/:id. The route must be
+// mounted behind AuthN and Require(user:update).
+//
+// Errors:
+//   - 1 invalid id: malformed or non-positive path id
+//   - 2 user not found
+//   - 1000 invalid request parameters: field validation failed
+//   - 1001 malformed request: body could not be parsed
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing user:update permission
+//   - 1009 internal: unexpected server error
+func UpdateUserHandler(svc *UserService) echo.HandlerFunc {
+	const (
+		codeInvalidID    = 1
+		codeUserNotFound = 2
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+		id, err := parsePathID(c)
+		if err != nil {
+			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
+		}
+		var req updateProfileRequest
+		if err := api.Bind(c, &req); err != nil {
+			return err
+		}
+		user, err := svc.UpdateProfile(c.Request().Context(), id, req.Nickname, req.Avatar)
+		if errors.Is(err, store.ErrNotFound) {
+			return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+		}
+		if err != nil {
+			return err
+		}
+		return api.OK(c, http.StatusOK, newUserResponse(user))
+	})
+}
+
+// SetUserRolesHandler handles PUT /api/v0/users/:id/roles. The route must be
+// mounted behind AuthN and Require(user:update).
+//
+// Errors:
+//   - 1 invalid id: malformed or non-positive path id
+//   - 2 unknown role: role is not defined in roles.yaml
+//   - 3 user not found
+//   - 1000 invalid request parameters: field validation failed
+//   - 1001 malformed request: body could not be parsed
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing user:update permission
+//   - 1009 internal: unexpected server error
+func SetUserRolesHandler(svc *UserService) echo.HandlerFunc {
+	const (
+		codeInvalidID    = 1
+		codeUnknownRole  = 2
+		codeUserNotFound = 3
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+		id, err := parsePathID(c)
+		if err != nil {
+			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
+		}
+		var req setRolesRequest
+		if err := api.Bind(c, &req); err != nil {
+			return err
+		}
+		if err := svc.SetRoles(c.Request().Context(), id, req.Roles); err != nil {
+			switch {
+			case errors.Is(err, ErrUnknownRole):
+				return api.NewError(codeUnknownRole, http.StatusBadRequest, "unknown role")
+			case errors.Is(err, store.ErrNotFound):
+				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			default:
+				return err
+			}
+		}
+		return api.NoContent(c, http.StatusNoContent)
+	})
+}
+
+// ResetUserPasswordHandler handles POST /api/v0/users/:id/password. The
+// route must be mounted behind AuthN and Require(user:update).
+//
+// Errors:
+//   - 1 invalid id: malformed or non-positive path id
+//   - 2 user not found
+//   - 1000 invalid request parameters: field validation failed
+//   - 1001 malformed request: body could not be parsed
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing user:update permission
+//   - 1009 internal: unexpected server error
+func ResetUserPasswordHandler(svc *AuthService) echo.HandlerFunc {
+	const (
+		codeInvalidID    = 1
+		codeUserNotFound = 2
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+		id, err := parsePathID(c)
+		if err != nil {
+			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
+		}
+		var req resetPasswordRequest
+		if err := api.Bind(c, &req); err != nil {
+			return err
+		}
+		if err := svc.ResetPassword(c.Request().Context(), id, req.Password); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			}
+			return err
+		}
+		return api.NoContent(c, http.StatusNoContent)
+	})
+}
+
+// KickUserHandler handles POST /api/v0/users/:id/kick. The route must be
+// mounted behind AuthN and Require(user:kick).
+//
+// Errors:
+//   - 1 invalid id: malformed or non-positive path id
+//   - 2 self action: kicking yourself is not allowed
+//   - 3 user not found
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing user:kick permission
+//   - 1009 internal: unexpected server error
+func KickUserHandler(svc *UserService) echo.HandlerFunc {
+	const (
+		codeInvalidID    = 1
+		codeSelfAction   = 2
+		codeUserNotFound = 3
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		id, err := parsePathID(c)
+		if err != nil {
+			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
+		}
+		if err := svc.Kick(c.Request().Context(), p.UserID, id); err != nil {
+			switch {
+			case errors.Is(err, ErrSelfAction):
+				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot kick yourself")
+			case errors.Is(err, store.ErrNotFound):
+				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			default:
+				return err
+			}
+		}
+		return api.NoContent(c, http.StatusNoContent)
+	})
+}
+
+// BanUserHandler handles POST /api/v0/users/:id/ban. The route must be
+// mounted behind AuthN and Require(user:update).
+//
+// Errors:
+//   - 1 invalid id: malformed or non-positive path id
+//   - 2 self action: banning yourself is not allowed
+//   - 3 user not found
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing user:update permission
+//   - 1009 internal: unexpected server error
+func BanUserHandler(svc *UserService) echo.HandlerFunc {
+	const (
+		codeInvalidID    = 1
+		codeSelfAction   = 2
+		codeUserNotFound = 3
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		id, err := parsePathID(c)
+		if err != nil {
+			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
+		}
+		if err := svc.Ban(c.Request().Context(), p.UserID, id); err != nil {
+			switch {
+			case errors.Is(err, ErrSelfAction):
+				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot ban yourself")
+			case errors.Is(err, store.ErrNotFound):
+				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			default:
+				return err
+			}
+		}
+		return api.NoContent(c, http.StatusNoContent)
+	})
+}
+
+// UnbanUserHandler handles POST /api/v0/users/:id/unban. The route must be
+// mounted behind AuthN and Require(user:update).
+//
+// Errors:
+//   - 1 invalid id: malformed or non-positive path id
+//   - 2 user not found
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing user:update permission
+//   - 1009 internal: unexpected server error
+func UnbanUserHandler(svc *UserService) echo.HandlerFunc {
+	const (
+		codeInvalidID    = 1
+		codeUserNotFound = 2
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+		id, err := parsePathID(c)
+		if err != nil {
+			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
+		}
+		if err := svc.Unban(c.Request().Context(), id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			}
+			return err
+		}
+		return api.NoContent(c, http.StatusNoContent)
+	})
+}
+
+// DeleteUserHandler handles DELETE /api/v0/users/:id. The route must be
+// mounted behind AuthN and Require(user:delete).
+//
+// Errors:
+//   - 1 invalid id: malformed or non-positive path id
+//   - 2 self action: deleting yourself is not allowed
+//   - 3 user not found
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing user:delete permission
+//   - 1009 internal: unexpected server error
+func DeleteUserHandler(svc *UserService) echo.HandlerFunc {
+	const (
+		codeInvalidID    = 1
+		codeSelfAction   = 2
+		codeUserNotFound = 3
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		id, err := parsePathID(c)
+		if err != nil {
+			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
+		}
+		if err := svc.Delete(c.Request().Context(), p.UserID, id); err != nil {
+			switch {
+			case errors.Is(err, ErrSelfAction):
+				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot delete yourself")
+			case errors.Is(err, store.ErrNotFound):
+				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			default:
+				return err
+			}
+		}
+		return api.NoContent(c, http.StatusNoContent)
+	})
+}
+
+// MeProfileHandler handles PATCH /api/v0/me. The route must be mounted behind
+// AuthN; no specific permission is required.
+//
+// Errors:
+//   - 1000 invalid request parameters: field validation failed
+//   - 1001 malformed request: body could not be parsed
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1009 internal: unexpected server error
+func MeProfileHandler(svc *UserService) echo.HandlerFunc {
+	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		var req updateProfileRequest
+		if err := api.Bind(c, &req); err != nil {
+			return err
+		}
+		user, err := svc.UpdateProfile(c.Request().Context(), p.UserID, req.Nickname, req.Avatar)
+		if err != nil {
+			return err
+		}
+		return api.OK(c, http.StatusOK, newUserResponse(user))
+	})
+}
+
+// MePasswordHandler handles POST /api/v0/me/password. The route must be
+// mounted behind AuthN; no specific permission is required.
+//
+// Errors:
+//   - 1 wrong current password: old_password does not match
+//   - 1000 invalid request parameters: field validation failed
+//   - 1001 malformed request: body could not be parsed
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1009 internal: unexpected server error
+func MePasswordHandler(svc *AuthService) echo.HandlerFunc {
+	const codeWrongPassword = 1
+	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		var req changeOwnPasswordRequest
+		if err := api.Bind(c, &req); err != nil {
+			return err
+		}
+		if err := svc.ChangeOwnPassword(c.Request().Context(), p.UserID, req.OldPassword, req.NewPassword); err != nil {
+			if errors.Is(err, ErrWrongPassword) {
+				return api.NewError(codeWrongPassword, http.StatusBadRequest, "wrong current password")
+			}
+			return err
+		}
+		return api.NoContent(c, http.StatusNoContent)
+	})
+}
+
+// InviteListHandler handles GET /api/v0/admin/invites. The route must be
+// mounted behind AuthN and Require(invite:manage).
+//
+// Errors:
+//   - 1 invalid pagination: limit must be 1-100, offset non-negative
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing invite:manage permission
+//   - 1009 internal: unexpected server error
+func InviteListHandler(svc *InviteService) echo.HandlerFunc {
+	const codeInvalidPagination = 1
+	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+		limit, offset, err := parsePagination(c)
+		if err != nil {
+			return api.NewError(codeInvalidPagination, http.StatusBadRequest, "invalid limit or offset")
+		}
+		invites, err := svc.List(c.Request().Context(), limit, offset)
+		if err != nil {
+			return err
+		}
+		resp := make([]inviteResponse, 0, len(invites))
+		for i := range invites {
+			resp = append(resp, newInviteResponse(&invites[i]))
+		}
+		return api.OK(c, http.StatusOK, resp)
+	})
+}
+
+// InviteDeleteHandler handles DELETE /api/v0/admin/invites/:id. The route
+// must be mounted behind AuthN and Require(invite:manage).
+//
+// Errors:
+//   - 1 invalid id: malformed or non-positive path id
+//   - 2 invite not found
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: missing invite:manage permission
+//   - 1009 internal: unexpected server error
+func InviteDeleteHandler(svc *InviteService) echo.HandlerFunc {
+	const (
+		codeInvalidID      = 1
+		codeInviteNotFound = 2
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+		id, err := parsePathID(c)
+		if err != nil {
+			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
+		}
+		if err := svc.Delete(c.Request().Context(), id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return api.NewError(codeInviteNotFound, http.StatusNotFound, "invite not found")
+			}
+			return err
+		}
+		return api.NoContent(c, http.StatusNoContent)
+	})
 }

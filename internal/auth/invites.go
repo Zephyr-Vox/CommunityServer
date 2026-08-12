@@ -88,3 +88,14 @@ func generateInviteCode() (string, error) {
 	}
 	return string(b), nil
 }
+
+// List returns invites ordered by creation time descending with
+// limit/offset pagination.
+func (s *InviteService) List(ctx context.Context, limit, offset int64) ([]db.Invite, error) {
+	return s.stores.Invites.List(ctx, limit, offset)
+}
+
+// Delete removes an invite by ID, or returns ErrNotFound.
+func (s *InviteService) Delete(ctx context.Context, id int64) error {
+	return s.stores.Invites.Delete(ctx, id)
+}

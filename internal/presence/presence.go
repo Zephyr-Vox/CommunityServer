@@ -71,3 +71,10 @@ func (p *Presence) Heartbeat(userID int64, status string) error {
 func (p *Presence) Online() map[int64]State {
 	return p.c.Snapshot()
 }
+
+// Remove drops a user from the registry immediately. Kick, ban and account
+// deletion call this so the user stops showing as online without waiting for
+// the heartbeat TTL.
+func (p *Presence) Remove(userID int64) {
+	p.c.Delete(userID)
+}

@@ -49,6 +49,29 @@ type statusResponse struct {
 	ActivationRequired bool   `json:"activation_required"`
 }
 
+type userDetailResponse struct {
+	userResponse
+	Roles       []string `json:"roles"`
+	Banned      bool     `json:"banned"`
+	LastLoginAt *int64   `json:"last_login_at"`
+	CreatedAt   int64    `json:"created_at"`
+}
+
+func newUserDetailResponse(u *UserWithRoles) userDetailResponse {
+	var lastLoginAt *int64
+	if u.User.LastLoginAt.Valid {
+		v := u.User.LastLoginAt.Int64
+		lastLoginAt = &v
+	}
+	return userDetailResponse{
+		userResponse: newUserResponse(u.User),
+		Roles:        u.Roles,
+		Banned:       u.User.BannedAt.Valid,
+		LastLoginAt:  lastLoginAt,
+		CreatedAt:    u.User.CreatedAt,
+	}
+}
+
 func newUserResponse(u *db.User) userResponse {
 	avatar := ""
 	if u.Avatar.Valid {
