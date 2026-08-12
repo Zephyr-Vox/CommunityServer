@@ -1,17 +1,18 @@
 package auth_test
 
 import (
-	"encoding/json"
 	"net/http"
 	"testing"
 
 	"github.com/labstack/echo/v5"
 
+	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 )
 
 func newStatusEcho(e *env, mode auth.RegistrationMode) *echo.Echo {
 	app := echo.New()
+	app.HTTPErrorHandler = api.ErrorHandler
 	app.GET("/api/v0/auth/status", auth.StatusHandler(e.stores, mode))
 	return app
 }
@@ -22,11 +23,7 @@ func getStatus(t *testing.T, e *env, mode auth.RegistrationMode) map[string]any 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
-	return resp
+	return decodeEnvelopeData(t, rec)
 }
 
 func TestStatusHandlerRequiresActivation(t *testing.T) {

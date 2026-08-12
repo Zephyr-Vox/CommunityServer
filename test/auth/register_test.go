@@ -2,7 +2,6 @@ package auth_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/labstack/echo/v5"
 
+	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/db"
@@ -277,6 +277,7 @@ func newRegisterEcho(t *testing.T, svc *auth.RegisterService) *echo.Echo {
 	t.Helper()
 	app := echo.New()
 	app.Validator = validation.New()
+	app.HTTPErrorHandler = api.ErrorHandler
 	app.POST("/api/v0/auth/register", auth.RegisterHandler(svc))
 	return app
 }
@@ -289,16 +290,13 @@ func TestRegisterHandlerOpenMode(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
-	if resp["access_token"] != nil {
+	data := decodeEnvelopeData(t, rec)
+	if data["access_token"] != nil {
 		t.Fatal("register must not issue tokens")
 	}
-	user, ok := resp["user"].(map[string]any)
+	user, ok := data["user"].(map[string]any)
 	if !ok || user["username"] != "alice" {
-		t.Fatalf("user missing from response: %v", resp["user"])
+		t.Fatalf("user missing from response: %v", data["user"])
 	}
 }
 

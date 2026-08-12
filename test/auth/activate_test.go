@@ -12,6 +12,7 @@ import (
 
 	"github.com/labstack/echo/v5"
 
+	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/validation"
 )
@@ -201,12 +202,18 @@ func TestActivateHandler(t *testing.T) {
 	}
 	app := echo.New()
 	app.Validator = validation.New()
+	app.HTTPErrorHandler = api.ErrorHandler
 	app.POST("/api/v0/admin/activate", auth.ActivateHandler(mgr))
 
 	rec := postJSON(t, app, "/api/v0/admin/activate",
 		`{"code":"`+code+`","username":"boss","password":"secret123"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	data := decodeEnvelopeData(t, rec)
+	user, ok := data["user"].(map[string]any)
+	if !ok || user["username"] != "boss" {
+		t.Fatalf("user missing from response: %v", data["user"])
 	}
 
 	rec = postJSON(t, app, "/api/v0/admin/activate",

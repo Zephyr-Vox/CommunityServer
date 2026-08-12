@@ -2,7 +2,6 @@ package auth_test
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/labstack/echo/v5"
 
+	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/validation"
 )
@@ -17,6 +17,7 @@ import (
 func newAuthEcho(e *env) *echo.Echo {
 	app := echo.New()
 	app.Validator = validation.New()
+	app.HTTPErrorHandler = api.ErrorHandler
 	app.POST("/api/v0/auth/login", auth.LoginHandler(e.svc), auth.LoginRateLimit(1))
 	app.POST("/api/v0/auth/refresh", auth.RefreshHandler(e.svc))
 	app.POST("/api/v0/auth/logout", auth.LogoutHandler(e.svc))
@@ -45,16 +46,13 @@ func TestLoginHandler(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
-	if resp["access_token"] == "" || resp["refresh_token"] == "" {
+	data := decodeEnvelopeData(t, rec)
+	if data["access_token"] == "" || data["refresh_token"] == "" {
 		t.Fatal("tokens missing from response")
 	}
-	user, ok := resp["user"].(map[string]any)
+	user, ok := data["user"].(map[string]any)
 	if !ok || user["username"] != "alice" {
-		t.Fatalf("user missing from response: %v", resp["user"])
+		t.Fatalf("user missing from response: %v", data["user"])
 	}
 }
 
@@ -115,11 +113,8 @@ func TestRefreshHandler(t *testing.T) {
 	e.createUser(t, "alice", "secret123", "member")
 
 	login := postJSON(t, app, "/api/v0/auth/login", loginBody("alice", "secret123", "dev-1"))
-	var loginResp map[string]any
-	if err := json.Unmarshal(login.Body.Bytes(), &loginResp); err != nil {
-		t.Fatal(err)
-	}
-	refreshToken, _ := loginResp["refresh_token"].(string)
+	data := decodeEnvelopeData(t, login)
+	refreshToken, _ := data["refresh_token"].(string)
 
 	rec := postJSON(t, app, "/api/v0/auth/refresh", `{"refresh_token":"`+refreshToken+`"}`)
 	if rec.Code != http.StatusOK {
@@ -139,11 +134,8 @@ func TestLogoutHandler(t *testing.T) {
 	e.createUser(t, "alice", "secret123", "member")
 
 	login := postJSON(t, app, "/api/v0/auth/login", loginBody("alice", "secret123", "dev-1"))
-	var loginResp map[string]any
-	if err := json.Unmarshal(login.Body.Bytes(), &loginResp); err != nil {
-		t.Fatal(err)
-	}
-	refreshToken, _ := loginResp["refresh_token"].(string)
+	data := decodeEnvelopeData(t, login)
+	refreshToken, _ := data["refresh_token"].(string)
 
 	rec := postJSON(t, app, "/api/v0/auth/logout", `{"refresh_token":"`+refreshToken+`"}`)
 	if rec.Code != http.StatusNoContent {

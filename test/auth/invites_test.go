@@ -2,7 +2,6 @@ package auth_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +13,7 @@ import (
 	"github.com/labstack/echo-jwt/v5"
 	"github.com/labstack/echo/v5"
 
+	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/rbac"
@@ -111,6 +111,7 @@ func newInviteEcho(t *testing.T, e *env, svc *auth.InviteService, roles *config.
 	t.Helper()
 	app := echo.New()
 	app.Validator = validation.New()
+	app.HTTPErrorHandler = api.ErrorHandler
 	jwtMW := echojwt.WithConfig(echojwt.Config{
 		SigningKey:    e.secret,
 		NewClaimsFunc: func(c *echo.Context) jwt.Claims { return &auth.Claims{} },
@@ -155,15 +156,12 @@ func TestInviteCreateHandlerAdmin(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
-	code, _ := resp["code"].(string)
+	data := decodeEnvelopeData(t, rec)
+	code, _ := data["code"].(string)
 	if !inviteCodeRe.MatchString(code) {
 		t.Fatalf("code = %q, want 8 chars from 0-9A-Z", code)
 	}
-	if resp["invite"] == nil {
+	if data["invite"] == nil {
 		t.Fatal("invite missing from response")
 	}
 }

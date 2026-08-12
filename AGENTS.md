@@ -29,6 +29,15 @@ ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 - Request/response DTOs go in `request.go` / `response.go`; request-shape validation uses struct tags through `internal/validation`.
 - HTTP handlers all live in the package's `handlers.go`; services/managers stay in their feature files. Handlers that need identity receive the principal via `rbacecho.WithPrincipal`; never re-check auth inside a handler.
 
+## API Response Convention
+
+- Every JSON response is an envelope: `{"code": 0, "message": "", "data": ...}`. `code` 0 with an empty `message` means success and `data` carries the DTO; any non-zero `code` is a business error, `message` explains it, `data` is null.
+- 204 responses have no body and are not wrapped.
+- There is no endpoint-wide global error-code table. Every handler numbers its own business errors from 1; codes may repeat across endpoints, so clients switch on (endpoint, code), never on message strings. The constants are declared locally inside each handler factory, next to their `// Errors:` doc block. Request-level and middleware errors are global and shared by every endpoint, in the 1000 block of `internal/api`: `1000` invalid request parameters (400, field messages in `data.fields`), `1001` malformed request (400), `1002` unauthorized (401), `1003` forbidden (403), `1004` not found (404), `1005` method not allowed (405), `1006` payload too large (413), `1007` unsupported media type (415), `1008` rate limited (429), `1009` internal (500+). Endpoint codes stay in 1..999 so the two ranges never collide.
+- Every handler doc comment lists its possible error codes in this fixed format:
+  `// Errors:` followed by one `//   - <code> <short reason>: <one-line explanation>` per error; shared 1000-block errors are listed with their code.
+- Handlers never build ad-hoc maps for response data or request payloads: use DTOs from `response.go` / `request.go` (per package). Binding and validation go through `api.Bind(c, &req)`: validation failures render as global code `1000` with the uniform message `invalid request parameters` and `data.fields` as a `field -> message` map (field names identify the location; there are no per-field codes); malformed bodies render as global code `1001`. Success is emitted via `api.OK`/`api.NoContent`, errors via `api.NewError`, and `api.ErrorHandler` must be installed on the Echo instance.
+
 ## Testing Guidelines
 
 - Standard library `testing` only; no framework.

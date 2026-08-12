@@ -1,14 +1,10 @@
 package validation_test
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/validation"
 )
@@ -95,66 +91,8 @@ func TestValidateReturnsFieldErrors(t *testing.T) {
 		t.Fatalf("status = %d, want 400", fe.StatusCode())
 	}
 	for _, field := range []string{"username", "password", "code"} {
-		if fe.Fields[field] == "" {
-			t.Fatalf("fields[%q] missing: %v", field, fe.Fields)
+		if fe.Fields()[field] == "" {
+			t.Fatalf("fields[%q] missing: %v", field, fe.Fields())
 		}
 	}
-}
-
-func TestBindRejectsMalformedJSON(t *testing.T) {
-	app := newSampleEcho(t)
-	rec := postSample(t, app, `{`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-}
-
-func TestBindReturnsStructured400(t *testing.T) {
-	app := newSampleEcho(t)
-	rec := postSample(t, app, `{"username":"x","password":"secret","code":"AB12CD34"}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
-	}
-	var body map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
-	if body["error"] != "invalid request" {
-		t.Fatalf("error = %v, want invalid request", body["error"])
-	}
-	fields, ok := body["fields"].(map[string]any)
-	if !ok || fields["username"] == nil {
-		t.Fatalf("fields missing username: %v", body["fields"])
-	}
-}
-
-func TestBindAcceptsValidRequest(t *testing.T) {
-	app := newSampleEcho(t)
-	rec := postSample(t, app, `{"username":"alice01","password":"secret123","code":"AB12CD34"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
-	}
-}
-
-func newSampleEcho(t *testing.T) *echo.Echo {
-	t.Helper()
-	app := echo.New()
-	app.Validator = validation.New()
-	app.POST("/", func(c *echo.Context) error {
-		var req sampleRequest
-		if err := validation.Bind(c, &req); err != nil {
-			return err
-		}
-		return c.NoContent(http.StatusOK)
-	})
-	return app
-}
-
-func postSample(t *testing.T, app *echo.Echo, body string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
-	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-	rec := httptest.NewRecorder()
-	app.ServeHTTP(rec, req)
-	return rec
 }

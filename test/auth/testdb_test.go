@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
@@ -98,4 +100,22 @@ func (e *env) createUser(t *testing.T, username, password string, roles ...strin
 func sha256Hex(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// decodeEnvelopeData decodes a success envelope and returns its data object,
+// failing the test if code is not 0 or message is not empty.
+func decodeEnvelopeData(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode %s: %v", rec.Body.String(), err)
+	}
+	if resp["code"] != float64(0) || resp["message"] != "" {
+		t.Fatalf("envelope = %+v, want code=0 message=\"\"", resp)
+	}
+	data, ok := resp["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("data missing from envelope: %v", resp)
+	}
+	return data
 }

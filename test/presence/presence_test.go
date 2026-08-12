@@ -17,6 +17,7 @@ import (
 	"github.com/labstack/echo-jwt/v5"
 	"github.com/labstack/echo/v5"
 
+	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/presence"
@@ -234,6 +235,7 @@ func (e *env) token(t *testing.T, u *db.User) string {
 func newApp(e *env, p *presence.Presence) *echo.Echo {
 	app := echo.New()
 	app.Validator = validation.New()
+	app.HTTPErrorHandler = api.ErrorHandler
 	app.Use(echojwt.WithConfig(echojwt.Config{
 		SigningKey:    e.secret,
 		NewClaimsFunc: func(c *echo.Context) jwt.Claims { return &auth.Claims{} },
@@ -271,13 +273,20 @@ func TestHeartbeatHandler(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("query status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	var states map[string]struct {
-		Status   string `json:"status"`
-		LastSeen int64  `json:"last_seen"`
+	var resp struct {
+		Code int `json:"code"`
+		Data map[string]struct {
+			Status   string `json:"status"`
+			LastSeen int64  `json:"last_seen"`
+		} `json:"data"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &states); err != nil {
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
+	if resp.Code != 0 {
+		t.Fatalf("code = %d, want 0", resp.Code)
+	}
+	states := resp.Data
 	key := strconv.FormatInt(u.ID, 10)
 	if states[key].Status != "online" {
 		t.Fatalf("states = %v, want alice online", states)
@@ -293,6 +302,16 @@ func TestHeartbeatHandlerInvalidStatus(t *testing.T) {
 	rec := request(t, app, http.MethodPost, "/api/v0/presence/heartbeat", token, `{"status":"invisible"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	var resp struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != 1 || resp.Message != "invalid status" {
+		t.Fatalf("envelope = %+v, want code 1 with invalid status message", resp)
 	}
 }
 
@@ -321,12 +340,15 @@ func TestQueryHandlerReturnsOnlyOnline(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	var states map[string]struct {
-		Status string `json:"status"`
+	var resp struct {
+		Data map[string]struct {
+			Status string `json:"status"`
+		} `json:"data"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &states); err != nil {
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
+	states := resp.Data
 	if _, ok := states[strconv.FormatInt(bob.ID, 10)]; ok {
 		t.Fatalf("bob must be absent: %v", states)
 	}

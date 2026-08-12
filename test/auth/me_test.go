@@ -1,7 +1,6 @@
 package auth_test
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +9,7 @@ import (
 	"github.com/labstack/echo-jwt/v5"
 	"github.com/labstack/echo/v5"
 
+	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/rbac"
@@ -19,6 +19,7 @@ import (
 func newMeEcho(t *testing.T, e *env, roles *config.Roles) *echo.Echo {
 	t.Helper()
 	app := echo.New()
+	app.HTTPErrorHandler = api.ErrorHandler
 	jwtMW := echojwt.WithConfig(echojwt.Config{
 		SigningKey:    e.secret,
 		NewClaimsFunc: func(c *echo.Context) jwt.Claims { return &auth.Claims{} },
@@ -51,18 +52,13 @@ func TestMeHandler(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	var resp struct {
-		Username    string   `json:"username"`
-		Permissions []string `json:"permissions"`
+	data := decodeEnvelopeData(t, rec)
+	if data["username"] != "alice" {
+		t.Fatalf("username = %v, want alice", data["username"])
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
-	if resp.Username != "alice" {
-		t.Fatalf("username = %q, want alice", resp.Username)
-	}
-	if len(resp.Permissions) != 1 || resp.Permissions[0] != "voice:join" {
-		t.Fatalf("permissions = %v, want [voice:join]", resp.Permissions)
+	perms, ok := data["permissions"].([]any)
+	if !ok || len(perms) != 1 || perms[0] != "voice:join" {
+		t.Fatalf("permissions = %v, want [voice:join]", data["permissions"])
 	}
 }
 
@@ -77,14 +73,13 @@ func TestMeHandlerAdminPermissions(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	var resp struct {
-		Permissions []string `json:"permissions"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
+	data := decodeEnvelopeData(t, rec)
+	perms, ok := data["permissions"].([]any)
+	if !ok {
+		t.Fatalf("permissions missing: %v", data)
 	}
 	has := func(want string) bool {
-		for _, p := range resp.Permissions {
+		for _, p := range perms {
 			if p == want {
 				return true
 			}
@@ -92,7 +87,7 @@ func TestMeHandlerAdminPermissions(t *testing.T) {
 		return false
 	}
 	if !has("invite:create") || !has("voice:join") || !has("user:kick") {
-		t.Fatalf("permissions = %v, want wildcard expansion", resp.Permissions)
+		t.Fatalf("permissions = %v, want wildcard expansion", perms)
 	}
 }
 

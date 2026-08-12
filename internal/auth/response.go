@@ -34,6 +34,11 @@ type inviteResponse struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
+type inviteCreateResponse struct {
+	Code   string         `json:"code"`
+	Invite inviteResponse `json:"invite"`
+}
+
 type meResponse struct {
 	userResponse
 	Permissions []string `json:"permissions"`
