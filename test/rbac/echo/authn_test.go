@@ -1,6 +1,7 @@
-package rbac_test
+package echo_test
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,22 @@ import (
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
 )
+
+type staticStore struct {
+	permissions map[string][]rbac.Permission
+}
+
+func (s staticStore) PermissionsForRole(_ context.Context, role string) ([]rbac.Permission, bool, error) {
+	perms, ok := s.permissions[role]
+	return perms, ok, nil
+}
+
+func newTestAuthorizer() *rbac.Authorizer {
+	return rbac.NewAuthorizer(staticStore{permissions: map[string][]rbac.Permission{
+		"member": {rbac.PermVoiceJoin},
+		"admin":  {rbac.Wildcard},
+	}})
+}
 
 func performRequest(t *testing.T, e *echo.Echo) *httptest.ResponseRecorder {
 	t.Helper()
