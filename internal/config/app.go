@@ -24,11 +24,20 @@ type App struct {
 	RefreshTokenTTL  time.Duration
 	LoginRateLimit   float64 // requests per minute
 	RegistrationMode string  // "open" or "invite"
+	Storage          StorageConfig
+}
+
+// StorageConfig configures the local object storage backend.
+type StorageConfig struct {
+	BaseDir string
 }
 
 type appConfig struct {
 	JWTSecret string `mapstructure:"jwt_secret"`
-	Auth      struct {
+	Storage   struct {
+		BaseDir string `mapstructure:"base_dir"`
+	} `mapstructure:"storage"`
+	Auth struct {
 		AccessTokenTTL   string  `mapstructure:"access_token_ttl"`
 		RefreshTokenTTL  string  `mapstructure:"refresh_token_ttl"`
 		LoginRateLimit   float64 `mapstructure:"login_rate_limit"`
@@ -79,12 +88,16 @@ func newApp(cfg appConfig) (*App, error) {
 	if mode != "open" && mode != "invite" {
 		return nil, errors.New(`config: registration_mode must be "open" or "invite"`)
 	}
+	if cfg.Storage.BaseDir == "" {
+		return nil, errors.New("config: storage.base_dir must not be empty")
+	}
 	return &App{
 		JWTSecret:        cfg.JWTSecret,
 		AccessTokenTTL:   accessTTL,
 		RefreshTokenTTL:  refreshTTL,
 		LoginRateLimit:   cfg.Auth.LoginRateLimit,
 		RegistrationMode: mode,
+		Storage:          StorageConfig{BaseDir: cfg.Storage.BaseDir},
 	}, nil
 }
 

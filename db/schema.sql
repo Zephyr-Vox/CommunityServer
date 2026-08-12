@@ -41,3 +41,13 @@ CREATE TABLE invites (
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL, -- admin who created it; NULL = system or deleted admin
     created_at INTEGER NOT NULL
 ) STRICT;
+
+CREATE TABLE objects (
+    bucket        TEXT NOT NULL,                      -- storage bucket (single path segment)
+    name          TEXT NOT NULL,                      -- object name (single path segment)
+    content_type  TEXT NOT NULL,                      -- normalized MIME type
+    size          INTEGER NOT NULL CHECK (size >= 0), -- bytes stored on disk
+    original_name TEXT NOT NULL DEFAULT '',           -- client-provided filename, display only
+    created_at    INTEGER NOT NULL,                   -- Unix milliseconds (UTC)
+    PRIMARY KEY (bucket, name)
+) STRICT;

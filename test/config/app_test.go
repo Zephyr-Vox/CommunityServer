@@ -42,6 +42,9 @@ func TestLoadAppGeneratesDefault(t *testing.T) {
 	if app.RegistrationMode != "invite" {
 		t.Fatalf("registration_mode = %q, want invite", app.RegistrationMode)
 	}
+	if app.Storage.BaseDir != "./data/objects" {
+		t.Fatalf("storage.base_dir = %q, want ./data/objects", app.Storage.BaseDir)
+	}
 
 	info, err := os.Stat(path)
 	if err != nil {
@@ -65,6 +68,9 @@ jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
 access_token_ttl = "30m"
 refresh_token_ttl = "168h"
 login_rate_limit = 5
+
+[storage]
+base_dir = "./data/objects"
 `
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -77,6 +83,9 @@ login_rate_limit = 5
 	if app.AccessTokenTTL != 30*time.Minute || app.RefreshTokenTTL != 7*24*time.Hour || app.LoginRateLimit != 5 {
 		t.Fatalf("custom config not honored: %+v", app)
 	}
+	if app.Storage.BaseDir != "./data/objects" {
+		t.Fatalf("storage.base_dir = %q, want ./data/objects", app.Storage.BaseDir)
+	}
 }
 
 func TestLoadAppRejectsShortSecret(t *testing.T) {
@@ -87,6 +96,9 @@ jwt_secret = "short"
 access_token_ttl = "15m"
 refresh_token_ttl = "720h"
 login_rate_limit = 10
+
+[storage]
+base_dir = "./data/objects"
 `)
 	_, err := config.LoadApp(path)
 	if err == nil || !strings.Contains(err.Error(), "jwt_secret") {
@@ -102,6 +114,9 @@ jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
 access_token_ttl = "abc"
 refresh_token_ttl = "720h"
 login_rate_limit = 10
+
+[storage]
+base_dir = "./data/objects"
 `)
 	_, err := config.LoadApp(path)
 	if err == nil || !strings.Contains(err.Error(), "access_token_ttl") {
@@ -117,6 +132,9 @@ jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
 access_token_ttl = "15m"
 refresh_token_ttl = "720h"
 login_rate_limit = 0
+
+[storage]
+base_dir = "./data/objects"
 `)
 	_, err := config.LoadApp(path)
 	if err == nil || !strings.Contains(err.Error(), "login_rate_limit") {
@@ -133,6 +151,9 @@ access_token_ttl = "15m"
 refresh_token_ttl = "720h"
 login_rate_limit = 10
 registration_mode = "open"
+
+[storage]
+base_dir = "./data/objects"
 `)
 	app, err := config.LoadApp(path)
 	if err != nil {
@@ -140,6 +161,9 @@ registration_mode = "open"
 	}
 	if app.RegistrationMode != "open" {
 		t.Fatalf("registration_mode = %q, want open", app.RegistrationMode)
+	}
+	if app.Storage.BaseDir != "./data/objects" {
+		t.Fatalf("storage.base_dir = %q, want ./data/objects", app.Storage.BaseDir)
 	}
 }
 
@@ -152,9 +176,48 @@ access_token_ttl = "15m"
 refresh_token_ttl = "720h"
 login_rate_limit = 10
 registration_mode = "closed"
+
+[storage]
+base_dir = "./data/objects"
 `)
 	_, err := config.LoadApp(path)
 	if err == nil || !strings.Contains(err.Error(), "registration_mode") {
 		t.Fatalf("want registration_mode error, got %v", err)
+	}
+}
+
+func TestLoadAppCustomStorageBaseDir(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[storage]
+base_dir = "/tmp/objects"
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Storage.BaseDir != "/tmp/objects" {
+		t.Fatalf("storage.base_dir = %q, want /tmp/objects", app.Storage.BaseDir)
+	}
+}
+
+func TestLoadAppRejectsEmptyStorageBaseDir(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "storage.base_dir") {
+		t.Fatalf("want storage.base_dir error, got %v", err)
 	}
 }

@@ -16,6 +16,7 @@ type Querier interface {
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	DeleteExpiredSessions(ctx context.Context, expiresAt int64) (int64, error)
 	DeleteInvite(ctx context.Context, id int64) (int64, error)
+	DeleteObject(ctx context.Context, arg DeleteObjectParams) error
 	DeleteSession(ctx context.Context, id int64) error
 	DeleteSessionByPrevTokenHash(ctx context.Context, prevTokenHash sql.NullString) (int64, error)
 	DeleteSessionByTokenHash(ctx context.Context, tokenHash string) error
@@ -24,6 +25,7 @@ type Querier interface {
 	DeleteUserSessions(ctx context.Context, userID int64) error
 	ExistsAdminRole(ctx context.Context) (bool, error)
 	GetInviteByCodeHash(ctx context.Context, arg GetInviteByCodeHashParams) (Invite, error)
+	GetObject(ctx context.Context, arg GetObjectParams) (Object, error)
 	GetRolesForUser(ctx context.Context, userID int64) ([]string, error)
 	GetSessionByID(ctx context.Context, id int64) (Session, error)
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
@@ -38,6 +40,7 @@ type Querier interface {
 	SetUserPasswordHash(ctx context.Context, arg SetUserPasswordHashParams) error
 	TouchUserLastLogin(ctx context.Context, arg TouchUserLastLoginParams) error
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error)
+	UpsertObject(ctx context.Context, arg UpsertObjectParams) (Object, error)
 	UpsertSession(ctx context.Context, arg UpsertSessionParams) (Session, error)
 }
 

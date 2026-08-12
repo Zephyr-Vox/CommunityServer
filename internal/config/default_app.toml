@@ -7,3 +7,6 @@ access_token_ttl = "15m"
 refresh_token_ttl = "720h"
 login_rate_limit = 10
 registration_mode = "invite"
+
+[storage]
+base_dir = "./data/objects"

@@ -18,6 +18,15 @@ type Invite struct {
 	CreatedAt int64         `json:"created_at"`
 }
 
+type Object struct {
+	Bucket       string `json:"bucket"`
+	Name         string `json:"name"`
+	ContentType  string `json:"content_type"`
+	Size         int64  `json:"size"`
+	OriginalName string `json:"original_name"`
+	CreatedAt    int64  `json:"created_at"`
+}
+
 type Session struct {
 	ID            int64          `json:"id"`
 	UserID        int64          `json:"user_id"`
