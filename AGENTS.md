@@ -27,6 +27,7 @@ ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 - All IDs are 63-bit snowflake IDs; timestamps are Unix milliseconds (UTC); SQL comments are English.
 - Group helpers by what they serve (e.g., `token.go`, `middleware.go`); no generic `utils` packages.
 - Request/response DTOs go in `request.go` / `response.go`; request-shape validation uses struct tags through `internal/validation`.
+- HTTP handlers all live in the package's `handlers.go`; services/managers stay in their feature files. Handlers that need identity receive the principal via `rbacecho.WithPrincipal`; never re-check auth inside a handler.
 
 ## Testing Guidelines
 

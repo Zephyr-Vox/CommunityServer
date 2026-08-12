@@ -5,15 +5,10 @@ import (
 	"crypto/rand"
 	"errors"
 	"math/big"
-	"net/http"
 	"time"
 
-	"github.com/labstack/echo/v5"
-
 	"zephyr.vox/server/ce/internal/db"
-	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
 	"zephyr.vox/server/ce/internal/store"
-	"zephyr.vox/server/ce/internal/validation"
 )
 
 var (
@@ -92,33 +87,4 @@ func generateInviteCode() (string, error) {
 		b[i] = inviteAlphabet[n.Int64()]
 	}
 	return string(b), nil
-}
-
-// InviteCreateHandler handles POST /api/v0/admin/invites. The route must be
-// mounted behind AuthN and Require(invite:create).
-func InviteCreateHandler(svc *InviteService) echo.HandlerFunc {
-	return func(c *echo.Context) error {
-		var req inviteCreateRequest
-		if err := validation.Bind(c, &req); err != nil {
-			return err
-		}
-		p, err := rbacecho.PrincipalOf(c)
-		if err != nil {
-			return echo.ErrUnauthorized
-		}
-
-		code, inv, err := svc.Create(c.Request().Context(), p.UserID, req.Role, req.Uses, optionalInt64(req.ExpiresAt))
-		if err != nil {
-			switch {
-			case errors.Is(err, ErrUnknownRole), errors.Is(err, ErrInvalidExpiry):
-				return echo.ErrBadRequest
-			default:
-				return err
-			}
-		}
-		return c.JSON(http.StatusCreated, map[string]any{
-			"code":   code,
-			"invite": newInviteResponse(inv),
-		})
-	}
 }

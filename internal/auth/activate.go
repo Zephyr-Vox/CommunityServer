@@ -6,14 +6,10 @@ import (
 	"crypto/subtle"
 	"encoding/base32"
 	"errors"
-	"net/http"
 	"sync"
-
-	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/store"
-	"zephyr.vox/server/ce/internal/validation"
 )
 
 var (
@@ -139,26 +135,4 @@ func generateActivationCode() (string, error) {
 		return "", err
 	}
 	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b), nil
-}
-
-// ActivateHandler handles POST /api/v0/admin/activate. It is intentionally
-// unauthenticated: the endpoint exists precisely before any account does.
-func ActivateHandler(mgr *ActivationManager) echo.HandlerFunc {
-	return func(c *echo.Context) error {
-		var req activateRequest
-		if err := validation.Bind(c, &req); err != nil {
-			return err
-		}
-
-		user, err := mgr.Activate(c.Request().Context(), req.Code, req.Username, req.Password, req.Nickname)
-		if err != nil {
-			switch {
-			case errors.Is(err, ErrInvalidActivationCode), errors.Is(err, ErrAdminAlreadyExists):
-				return echo.ErrForbidden
-			default:
-				return err
-			}
-		}
-		return c.JSON(http.StatusOK, userEnvelope{User: newUserResponse(user)})
-	}
 }

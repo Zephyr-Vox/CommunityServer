@@ -32,6 +32,20 @@ func AuthN(resolve PrincipalResolver) echo.MiddlewareFunc {
 	}
 }
 
+// WithPrincipal adapts a handler that needs the authenticated principal. It
+// must be mounted after AuthN, which guarantees the principal exists; a
+// missing one here is a wiring bug and surfaces as a 500, never as a client
+// 401.
+func WithPrincipal(h func(c *echo.Context, p *rbac.Principal) error) echo.HandlerFunc {
+	return func(c *echo.Context) error {
+		p, err := PrincipalOf(c)
+		if err != nil {
+			return err
+		}
+		return h(c, p)
+	}
+}
+
 // Require rejects the request unless the principal has the given permission.
 // It must be mounted after AuthN; a missing principal is treated as
 // unauthenticated. The denial reason goes to the log, never to the client.

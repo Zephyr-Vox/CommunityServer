@@ -4,14 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
-
-	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/store"
-	"zephyr.vox/server/ce/internal/validation"
 )
 
 var (
@@ -146,28 +142,4 @@ func prepareAccount(username, password, nickname string) (passwordHash, resolved
 // hand-typed lowercase input still redeems.
 func normalizeCode(code string) string {
 	return strings.ToUpper(strings.TrimSpace(code))
-}
-
-// RegisterHandler handles POST /api/v0/auth/register. It never issues tokens:
-// the client signs in afterwards with the same credentials.
-func RegisterHandler(svc *RegisterService) echo.HandlerFunc {
-	return func(c *echo.Context) error {
-		var req registerRequest
-		if err := validation.Bind(c, &req); err != nil {
-			return err
-		}
-
-		user, err := svc.Register(c.Request().Context(), req.Username, req.Password, req.Nickname, req.Invite)
-		if err != nil {
-			switch {
-			case errors.Is(err, ErrInvalidInvite):
-				return echo.ErrBadRequest
-			case errors.Is(err, ErrUsernameTaken):
-				return echo.NewHTTPError(http.StatusConflict, "username already taken")
-			default:
-				return err
-			}
-		}
-		return c.JSON(http.StatusCreated, userEnvelope{User: newUserResponse(user)})
-	}
 }
