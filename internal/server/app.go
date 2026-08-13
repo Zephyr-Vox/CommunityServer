@@ -1,0 +1,106 @@
+// Package server assembles every module into a runnable HTTP application.
+package server
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/labstack/echo/v5"
+
+	"zephyr.vox/server/ce/internal/api"
+	"zephyr.vox/server/ce/internal/auth"
+	"zephyr.vox/server/ce/internal/config"
+	"zephyr.vox/server/ce/internal/db"
+	"zephyr.vox/server/ce/internal/presence"
+	"zephyr.vox/server/ce/internal/snowflake"
+	"zephyr.vox/server/ce/internal/store"
+	"zephyr.vox/server/ce/internal/validation"
+)
+
+// App is the fully assembled HTTP application: database, stores, services,
+// middleware and every route.
+type App struct {
+	cfg        *config.App
+	roles      *config.Roles
+	conn       *sql.DB
+	stores     *store.Stores
+	principals *auth.PrincipalCache
+	authSvc    *auth.AuthService
+	register   *auth.RegisterService
+	users      *auth.UserService
+	invites    *auth.InviteService
+	activate   *auth.ActivationManager
+	presence   *presence.Presence
+	echo       *echo.Echo
+}
+
+// New assembles the application from validated configuration and the role
+// configuration: it opens the database, applies the embedded schema, wires
+// every service and mounts all routes. Call Close when done.
+func New(cfg *config.App, roles *config.Roles) (*App, error) {
+	if err := os.MkdirAll(filepath.Dir(cfg.Server.DBPath), 0o755); err != nil {
+		return nil, fmt.Errorf("server: create db dir: %w", err)
+	}
+	conn, err := store.Open(cfg.Server.DBPath)
+	if err != nil {
+		return nil, fmt.Errorf("server: open db: %w", err)
+	}
+	if _, err := conn.Exec(db.SchemaSQL); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("server: apply schema: %w", err)
+	}
+
+	idGen, err := snowflake.New()
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("server: snowflake: %w", err)
+	}
+	now := func() int64 { return time.Now().UnixMilli() }
+	stores := store.New(conn, idGen, now)
+
+	principals := auth.NewPrincipalCache(stores.Users, time.Minute)
+	secret := []byte(cfg.JWTSecret)
+	authSvc := auth.NewAuthService(stores, principals, secret, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, now)
+	register := auth.NewRegisterService(stores, roles, auth.RegistrationMode(cfg.RegistrationMode))
+	pres := presence.New(time.Now)
+	users := auth.NewUserService(stores, roles, principals, pres)
+	invites := auth.NewInviteService(stores, roles, now)
+	activate := auth.NewActivationManager(stores)
+
+	// Do not let groups claim unmatched paths: an unknown route must surface
+	// as a plain 404, not run the group's JWT middleware and return 401.
+	e := echo.NewWithConfig(echo.Config{NoGroupAutoRegister404Routes: true})
+	e.Validator = validation.New()
+	e.HTTPErrorHandler = api.ErrorHandler
+
+	app := &App{
+		cfg:        cfg,
+		roles:      roles,
+		conn:       conn,
+		stores:     stores,
+		principals: principals,
+		authSvc:    authSvc,
+		register:   register,
+		users:      users,
+		invites:    invites,
+		activate:   activate,
+		presence:   pres,
+		echo:       e,
+	}
+	app.routes(e)
+	return app, nil
+}
+
+// Echo returns the assembled HTTP handler, used by tests and by the cmd
+// entry point to serve requests.
+func (a *App) Echo() *echo.Echo {
+	return a.echo
+}
+
+// Close releases the database connection.
+func (a *App) Close() error {
+	return a.conn.Close()
+}
