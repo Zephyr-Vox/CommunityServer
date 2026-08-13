@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -185,11 +184,7 @@ func newEnv(t *testing.T) *env {
 	}
 	t.Cleanup(func() { conn.Close() })
 
-	schema, err := os.ReadFile("../../db/schema.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := conn.Exec(string(schema)); err != nil {
+	if _, err := conn.Exec(db.SchemaSQL); err != nil {
 		t.Fatal(err)
 	}
 

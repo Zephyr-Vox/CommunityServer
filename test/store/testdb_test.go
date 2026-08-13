@@ -2,7 +2,6 @@ package store_test
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -38,11 +37,7 @@ func newTestEnv(t *testing.T) (*store.Stores, *fakeClock) {
 	}
 	t.Cleanup(func() { conn.Close() })
 
-	schema, err := os.ReadFile("../../db/schema.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := conn.Exec(string(schema)); err != nil {
+	if _, err := conn.Exec(db.SchemaSQL); err != nil {
 		t.Fatal(err)
 	}
 
