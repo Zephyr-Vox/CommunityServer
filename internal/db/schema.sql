@@ -1,4 +1,8 @@
-CREATE TABLE users (
+-- Idempotent schema: every statement uses IF NOT EXISTS so restarting against
+-- an existing database succeeds. There is no migration system yet; schema
+-- changes during development require deleting the database file.
+
+CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY,               -- 63-bit snowflake ID
     username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT    NOT NULL,                  -- argon2id encoded hash
@@ -11,13 +15,13 @@ CREATE TABLE users (
     updated_at    INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE user_roles (
+CREATE TABLE IF NOT EXISTS user_roles (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role    TEXT    NOT NULL,                        -- role name defined in roles.yaml
     PRIMARY KEY (user_id, role)
 ) STRICT;
 
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
     id              INTEGER PRIMARY KEY,             -- 63-bit snowflake ID
     user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     device_id       TEXT    NOT NULL,                -- client-provided device identifier
@@ -29,10 +33,10 @@ CREATE TABLE sessions (
     UNIQUE (user_id, device_id)                      -- one session row per device; refresh updates in place
 ) STRICT;
 
-CREATE INDEX idx_sessions_user ON sessions(user_id);
-CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
-CREATE TABLE invites (
+CREATE TABLE IF NOT EXISTS invites (
     id         INTEGER PRIMARY KEY,                  -- 63-bit snowflake ID
     code_hash  TEXT    NOT NULL UNIQUE,              -- SHA-256; plaintext code returned once at creation
     role       TEXT    NOT NULL DEFAULT 'member',    -- role granted when redeemed
@@ -42,7 +46,7 @@ CREATE TABLE invites (
     created_at INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE objects (
+CREATE TABLE IF NOT EXISTS objects (
     bucket        TEXT NOT NULL,                      -- storage bucket (single path segment)
     name          TEXT NOT NULL,                      -- object name (single path segment)
     content_type  TEXT NOT NULL,                      -- normalized MIME type

@@ -5,7 +5,7 @@
 ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 
 - `internal/` — production code, organized by domain: `auth/`, `store/`, `rbac/`, `cache/`, `config/`, `validation/`, `snowflake/`.
-- `internal/db/` — sqlc-generated data access. Never edit by hand.
+- `internal/db/` — sqlc-generated data access (`*.sql.go`); never edit generated files by hand. The only hand-maintained files are `schema.sql` and `schema.go` (the embedded schema).
 - `internal/db/schema.sql` + `db/queries/` — SQL sources. Edit these, then run `sqlc generate`.
 - `test/` — all tests, one subdirectory per package (`test/auth/`, `test/store/`). Business directories contain no `_test.go`.
 - `spec/spec.md` — local design specs. Gitignored; never commit.
