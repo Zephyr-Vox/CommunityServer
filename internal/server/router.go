@@ -21,13 +21,12 @@ func (a *App) routes(e *echo.Echo) {
 	})
 	authnMW := rbacecho.AuthN(auth.NewPrincipalResolver(a.principals))
 	authz := rbac.NewAuthorizer(a.roles)
-	limit := auth.LoginRateLimit(a.cfg.LoginRateLimit)
 
 	api := e.Group("/api/v0")
 	api.GET("/auth/status", auth.StatusHandler(a.stores, auth.RegistrationMode(a.cfg.RegistrationMode)))
 	api.POST("/auth/register", auth.RegisterHandler(a.register))
-	api.POST("/admin/activate", auth.ActivateHandler(a.activate), limit)
-	api.POST("/auth/login", auth.LoginHandler(a.authSvc), limit)
+	api.POST("/admin/activate", auth.ActivateHandler(a.activate), auth.LoginRateLimit(a.cfg.LoginRateLimit))
+	api.POST("/auth/login", auth.LoginHandler(a.authSvc), auth.LoginRateLimit(a.cfg.LoginRateLimit))
 	api.POST("/auth/refresh", auth.RefreshHandler(a.authSvc))
 	api.POST("/auth/logout", auth.LogoutHandler(a.authSvc))
 
