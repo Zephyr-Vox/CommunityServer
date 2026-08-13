@@ -19,11 +19,21 @@ func newTestApp(t *testing.T) *server.App {
 
 func newAppAt(t *testing.T, dir string) *server.App {
 	t.Helper()
+	return newTestAppWith(t, dir, "open", 120)
+}
+
+func newTestAppWithMode(t *testing.T, mode string) *server.App {
+	t.Helper()
+	return newTestAppWith(t, t.TempDir(), mode, 120)
+}
+
+func newTestAppWith(t *testing.T, dir, registrationMode string, loginRateLimit float64) *server.App {
+	t.Helper()
 	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := server.New(testConfig(dir, 8745), roles)
+	app, err := server.New(testConfigFull(dir, 8745, registrationMode, loginRateLimit), roles)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,12 +42,16 @@ func newAppAt(t *testing.T, dir string) *server.App {
 }
 
 func testConfig(dir string, httpPort int) *config.App {
+	return testConfigFull(dir, httpPort, "open", 120)
+}
+
+func testConfigFull(dir string, httpPort int, registrationMode string, loginRateLimit float64) *config.App {
 	return &config.App{
 		JWTSecret:        "0123456789abcdef0123456789abcdef0123456789abcdef",
 		AccessTokenTTL:   15 * time.Minute,
 		RefreshTokenTTL:  30 * 24 * time.Hour,
-		LoginRateLimit:   10,
-		RegistrationMode: "open",
+		LoginRateLimit:   loginRateLimit,
+		RegistrationMode: registrationMode,
 		Server: config.ServerConfig{
 			Host:      "127.0.0.1",
 			HTTPPort:  httpPort,
