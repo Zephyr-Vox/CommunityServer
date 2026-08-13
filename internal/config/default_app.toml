@@ -16,3 +16,8 @@ db_path = "./data/zephyr.db"
 
 [storage]
 base_dir = "./data/objects"
+
+[log]
+level = "info"
+path = "./data/logs"
+archive_keep = 7

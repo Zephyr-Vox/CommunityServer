@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,6 +48,9 @@ func TestLoadAppGeneratesDefault(t *testing.T) {
 	}
 	if app.Server.Host != "0.0.0.0" || app.Server.HTTPPort != 8745 || app.Server.VoicePort != 8746 || app.Server.DBPath != "./data/zephyr.db" {
 		t.Fatalf("server = %+v, want 0.0.0.0:8745 voice 8746 db ./data/zephyr.db", app.Server)
+	}
+	if app.Log.Level != slog.LevelInfo || app.Log.Path != "./data/logs" || app.Log.ArchiveKeep != 7 {
+		t.Fatalf("log = %+v, want info ./data/logs keep 7", app.Log)
 	}
 
 	info, err := os.Stat(path)
@@ -396,5 +400,151 @@ base_dir = "./data/objects"
 	_, err := config.LoadApp(path)
 	if err == nil || !strings.Contains(err.Error(), "server.db_path") {
 		t.Fatalf("want server.db_path error, got %v", err)
+	}
+}
+
+func TestLoadAppCustomLogConfig(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[log]
+level = "debug"
+path = "/tmp/logs"
+archive_keep = 0
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Log.Level != slog.LevelDebug || app.Log.Path != "/tmp/logs" || app.Log.ArchiveKeep != 0 {
+		t.Fatalf("log = %+v, want debug /tmp/logs keep 0", app.Log)
+	}
+}
+
+func TestLoadAppCustomLogKeepMinusOne(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[log]
+archive_keep = -1
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Log.ArchiveKeep != -1 {
+		t.Fatalf("log.archive_keep = %d, want -1", app.Log.ArchiveKeep)
+	}
+}
+
+func TestLoadAppEmptyLogPathMeansConsoleOnly(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[log]
+path = ""
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Log.Path != "" {
+		t.Fatalf("log.path = %q, want empty (console only)", app.Log.Path)
+	}
+}
+
+func TestLoadAppRejectsBadLogLevel(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[log]
+level = "verbose"
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "log.level") {
+		t.Fatalf("want log.level error, got %v", err)
+	}
+}
+
+func TestLoadAppRejectsLogKeepBelowMinusOne(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[log]
+archive_keep = -2
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "log.archive_keep") {
+		t.Fatalf("want log.archive_keep error, got %v", err)
 	}
 }

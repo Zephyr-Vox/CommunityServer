@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,7 @@ type App struct {
 	RegistrationMode string  // "open" or "invite"
 	Server           ServerConfig
 	Storage          StorageConfig
+	Log              LogConfig
 }
 
 // ServerConfig configures the listeners. HTTP binds today; voice_port is
@@ -41,6 +43,14 @@ type ServerConfig struct {
 // StorageConfig configures the local object storage backend.
 type StorageConfig struct {
 	BaseDir string
+}
+
+// LogConfig configures the human-readable log pipeline. Path empty means
+// console-only output (no file persistence).
+type LogConfig struct {
+	Level       slog.Level // minimum level: Debug/Info/Warn/Error
+	Path        string     // log directory; live file is zephyr.log
+	ArchiveKeep int        // -1 keep all archives, 0 no archives, N keep newest N
 }
 
 type appConfig struct {
@@ -60,6 +70,11 @@ type appConfig struct {
 		LoginRateLimit   float64 `mapstructure:"login_rate_limit"`
 		RegistrationMode string  `mapstructure:"registration_mode"`
 	} `mapstructure:"auth"`
+	Log struct {
+		Level       string  `mapstructure:"level"`
+		Path        *string `mapstructure:"path"`
+		ArchiveKeep *int    `mapstructure:"archive_keep"`
+	} `mapstructure:"log"`
 }
 
 // LoadApp reads the server configuration from path. If the file does not
@@ -88,6 +103,10 @@ func newApp(cfg appConfig) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	logLevel, logPath, logKeep, err := validateLog(cfg)
+	if err != nil {
+		return nil, err
+	}
 	mode := cfg.Auth.RegistrationMode
 	if mode == "" {
 		mode = "invite"
@@ -105,6 +124,11 @@ func newApp(cfg appConfig) (*App, error) {
 			DBPath:    cfg.Server.DBPath,
 		},
 		Storage: StorageConfig{BaseDir: cfg.Storage.BaseDir},
+		Log: LogConfig{
+			Level:       logLevel,
+			Path:        logPath,
+			ArchiveKeep: logKeep,
+		},
 	}, nil
 }
 
@@ -145,6 +169,42 @@ func validateApp(cfg appConfig) (accessTTL, refreshTTL time.Duration, err error)
 		return 0, 0, errors.New("config: storage.base_dir must not be empty")
 	}
 	return accessTTL, refreshTTL, nil
+}
+
+// validateLog parses the [log] section, applying defaults when keys are
+// absent. Pointers distinguish "unset" (default) from an explicit 0: an
+// empty path means console-only and archive_keep = 0 means no archives.
+func validateLog(cfg appConfig) (slog.Level, string, int, error) {
+	levelName := cfg.Log.Level
+	if levelName == "" {
+		levelName = "info"
+	}
+	var level slog.Level
+	switch levelName {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		return 0, "", 0, fmt.Errorf(`config: log.level must be "debug", "info", "warn" or "error"`)
+	}
+
+	path := "./data/logs"
+	if cfg.Log.Path != nil {
+		path = *cfg.Log.Path
+	}
+	keep := 7
+	if cfg.Log.ArchiveKeep != nil {
+		keep = *cfg.Log.ArchiveKeep
+	}
+	if keep < -1 {
+		return 0, "", 0, errors.New("config: log.archive_keep must be -1, 0, or a positive integer")
+	}
+	return level, path, keep, nil
 }
 
 func ensureDefaultAppFile(path string) error {
