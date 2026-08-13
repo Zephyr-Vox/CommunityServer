@@ -16,6 +16,7 @@ import (
 )
 
 func main() {
+	printBanner()
 	if err := run(); err != nil {
 		slog.With("module", "main").Error("zephyrd exited with error: " + err.Error())
 		os.Exit(1)
