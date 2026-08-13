@@ -19,7 +19,20 @@ func newTestApp(t *testing.T) *server.App {
 
 func newAppAt(t *testing.T, dir string) *server.App {
 	t.Helper()
-	cfg := &config.App{
+	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := server.New(testConfig(dir, 8745), roles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { app.Close() })
+	return app
+}
+
+func testConfig(dir string, httpPort int) *config.App {
+	return &config.App{
 		JWTSecret:        "0123456789abcdef0123456789abcdef0123456789abcdef",
 		AccessTokenTTL:   15 * time.Minute,
 		RefreshTokenTTL:  30 * 24 * time.Hour,
@@ -27,22 +40,12 @@ func newAppAt(t *testing.T, dir string) *server.App {
 		RegistrationMode: "open",
 		Server: config.ServerConfig{
 			Host:      "127.0.0.1",
-			HTTPPort:  8745,
+			HTTPPort:  httpPort,
 			VoicePort: 8746,
 			DBPath:    filepath.Join(dir, "zephyr.db"),
 		},
 		Storage: config.StorageConfig{BaseDir: filepath.Join(dir, "objects")},
 	}
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	app, err := server.New(cfg, roles)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { app.Close() })
-	return app
 }
 
 func get(t *testing.T, app *server.App, path string) *httptest.ResponseRecorder {
