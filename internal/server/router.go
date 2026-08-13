@@ -1,6 +1,8 @@
 package server
 
 import (
+	"fmt"
+
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/labstack/echo-jwt/v5"
 	"github.com/labstack/echo/v5"
@@ -15,6 +17,10 @@ import (
 // middleware; everything else requires AuthN, and admin endpoints add the
 // matching Require permission middleware.
 func (a *App) routes(e *echo.Echo) {
+	// Global access log: runs for matched routes and for unknown paths, so
+	// 404s are visible too.
+	e.Use(a.requestLogging())
+
 	jwtMW := echojwt.WithConfig(echojwt.Config{
 		SigningKey:    []byte(a.cfg.JWTSecret),
 		NewClaimsFunc: func(c *echo.Context) jwt.Claims { return &auth.Claims{} },
@@ -50,4 +56,17 @@ func (a *App) routes(e *echo.Echo) {
 	admin.GET("/admin/invites", auth.InviteListHandler(a.invites), rbacecho.Require(authz, rbac.PermInviteManage))
 	admin.POST("/admin/invites", auth.InviteCreateHandler(a.invites), rbacecho.Require(authz, rbac.PermInviteManage))
 	admin.DELETE("/admin/invites/:id", auth.InviteDeleteHandler(a.invites), rbacecho.Require(authz, rbac.PermInviteManage))
+}
+
+// logRoutes prints the mounted route table: one INFO summary and one DEBUG
+// line per route. Echo v5 removed the v4 e.Routes() helper, so the table is
+// read from the router; the full list only appears at debug level because it
+// is startup diagnostics, not daily operational output.
+func (a *App) logRoutes() {
+	routes := a.echo.Router().Routes()
+	log := a.logger.With("module", "router")
+	log.Info(fmt.Sprintf("registered %d routes", len(routes)))
+	for _, r := range routes {
+		log.Debug("route " + r.Method + " " + r.Path)
+	}
 }

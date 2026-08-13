@@ -2,6 +2,8 @@ package server_test
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -32,7 +34,7 @@ func TestRunServesAndShutsDownGracefully(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := server.New(testConfig(dir, port), roles)
+	app, err := server.New(testConfig(dir, port), roles, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,7 +16,7 @@ import (
 // GetHandler handles GET /:file for one bucket. The bucket is fixed at
 // wiring time; the route parameter is validated as a single path segment.
 // Success streams the raw file bytes (a binary response, not a JSON
-// envelope); errors go through the central api.ErrorHandler.
+// envelope); errors go through the central API error handler.
 //
 // Errors:
 //   - 1004 not found: object missing or name invalid

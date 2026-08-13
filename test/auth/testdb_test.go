@@ -5,17 +5,27 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http/httptest"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v5"
+
+	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/store"
 )
+
+// newErrorHandler returns a silent API error handler for tests.
+func newErrorHandler() echo.HTTPErrorHandler {
+	return api.NewErrorHandler(slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
 
 type fakeClock struct {
 	mu  sync.Mutex

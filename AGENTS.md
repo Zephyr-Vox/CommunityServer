@@ -4,7 +4,7 @@
 
 ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 
-- `internal/` — production code, organized by domain: `auth/`, `store/`, `rbac/`, `cache/`, `config/`, `validation/`, `snowflake/`.
+- `internal/` — production code, organized by domain: `auth/`, `store/`, `rbac/`, `cache/`, `config/`, `validation/`, `snowflake/`, `logging/`.
 - `internal/db/` — sqlc-generated data access (`*.sql.go`); never edit generated files by hand. The only hand-maintained files are `schema.sql` and `schema.go` (the embedded schema).
 - `internal/db/schema.sql` + `db/queries/` — SQL sources. Edit these, then run `sqlc generate`.
 - `test/` — all tests, one subdirectory per package (`test/auth/`, `test/store/`). Business directories contain no `_test.go`.
@@ -23,7 +23,9 @@ ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 
 - Standard Go: tabs, gofmt, lowercase file names.
 - Prefer modern stdlib idioms: `slices.Contains`/`Sort`, `sync.WaitGroup.Go`, `errors.AsType`.
-- Core packages (`rbac`, `snowflake`, `cache`) must not import Echo or config; adapters live in `internal/rbac/echo` and `internal/validation`.
+- Core packages (`rbac`, `snowflake`, `cache`, `logging`) must not import Echo or config; adapters live in `internal/rbac/echo` and `internal/validation`.
+- Logging uses `log/slog` through `internal/logging` only: human-readable text with optional ANSI colors, a rotating zip file sink, and fanout. No structured logging and no third-party logging libraries.
+- Every application log call carries a `module` attr (or derives from a logger that sets one). Domain packages do not log directly: they return errors, and boundary layers (`cmd`, the HTTP request logger, the API error handler) record them.
 - All IDs are 63-bit snowflake IDs; timestamps are Unix milliseconds (UTC); SQL comments are English.
 - Group helpers by what they serve (e.g., `token.go`, `middleware.go`); no generic `utils` packages.
 - Request/response DTOs go in `request.go` / `response.go`; request-shape validation uses struct tags through `internal/validation`.

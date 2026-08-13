@@ -3,6 +3,8 @@ package presence_test
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -230,7 +232,7 @@ func (e *env) token(t *testing.T, u *db.User) string {
 func newApp(e *env, p *presence.Presence) *echo.Echo {
 	app := echo.New()
 	app.Validator = validation.New()
-	app.HTTPErrorHandler = api.ErrorHandler
+	app.HTTPErrorHandler = api.NewErrorHandler(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	app.Use(echojwt.WithConfig(echojwt.Config{
 		SigningKey:    e.secret,
 		NewClaimsFunc: func(c *echo.Context) jwt.Claims { return &auth.Claims{} },

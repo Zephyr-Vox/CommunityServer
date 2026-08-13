@@ -12,7 +12,6 @@ import (
 
 	"github.com/labstack/echo/v5"
 
-	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/validation"
 )
@@ -202,7 +201,7 @@ func TestActivateHandler(t *testing.T) {
 	}
 	app := echo.New()
 	app.Validator = validation.New()
-	app.HTTPErrorHandler = api.ErrorHandler
+	app.HTTPErrorHandler = newErrorHandler()
 	app.POST("/api/v0/admin/activate", auth.ActivateHandler(mgr))
 
 	rec := postJSON(t, app, "/api/v0/admin/activate",

@@ -1,8 +1,11 @@
 package api_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,7 +30,7 @@ func newApp(t *testing.T) *echo.Echo {
 	t.Helper()
 	app := echo.New()
 	app.Validator = validation.New()
-	app.HTTPErrorHandler = api.ErrorHandler
+	app.HTTPErrorHandler = api.NewErrorHandler(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return app
 }
 
@@ -221,5 +224,23 @@ func TestErrorHandlerUnexpectedIs500Generic(t *testing.T) {
 	resp := decodeEnvelope(t, rec)
 	if resp["code"] != float64(api.CodeInternal) {
 		t.Fatalf("code = %v, want %d", resp["code"], api.CodeInternal)
+	}
+}
+
+func TestErrorHandlerLogsUnhandledWithAPIModule(t *testing.T) {
+	var buf bytes.Buffer
+	app := echo.New()
+	app.HTTPErrorHandler = api.NewErrorHandler(slog.New(slog.NewTextHandler(&buf, nil)))
+	app.GET("/boom", func(c *echo.Context) error { return errors.New("boom") })
+
+	req := httptest.NewRequest(http.MethodGet, "/boom", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if !strings.Contains(buf.String(), "unhandled error") || !strings.Contains(buf.String(), "module=api") {
+		t.Fatalf("unhandled error not logged with api module: %q", buf.String())
 	}
 }

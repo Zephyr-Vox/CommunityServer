@@ -2,6 +2,8 @@ package server_test
 
 import (
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +13,13 @@ import (
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/server"
 )
+
+// testLogger discards every line so server tests stay quiet and never depend
+// on global log state.
+func testLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 func newTestApp(t *testing.T) *server.App {
 	t.Helper()
@@ -33,7 +42,7 @@ func newTestAppWith(t *testing.T, dir, registrationMode string, loginRateLimit f
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := server.New(testConfigFull(dir, 8745, registrationMode, loginRateLimit), roles)
+	app, err := server.New(testConfigFull(dir, 8745, registrationMode, loginRateLimit), roles, testLogger(t))
 	if err != nil {
 		t.Fatal(err)
 	}

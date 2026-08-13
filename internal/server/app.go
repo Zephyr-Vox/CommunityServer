@@ -4,7 +4,9 @@ package server
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -36,12 +38,16 @@ type App struct {
 	activate   *auth.ActivationManager
 	presence   *presence.Presence
 	echo       *echo.Echo
+	logger     *slog.Logger
 }
 
 // New assembles the application from validated configuration and the role
 // configuration: it opens the database, applies the embedded schema, wires
 // every service and mounts all routes. Call Close when done.
-func New(cfg *config.App, roles *config.Roles) (*App, error) {
+func New(cfg *config.App, roles *config.Roles, logger *slog.Logger) (*App, error) {
+	if logger == nil {
+		return nil, errors.New("server: logger must not be nil")
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Server.DBPath), 0o755); err != nil {
 		return nil, fmt.Errorf("server: create db dir: %w", err)
 	}
@@ -73,9 +79,11 @@ func New(cfg *config.App, roles *config.Roles) (*App, error) {
 
 	// Do not let groups claim unmatched paths: an unknown route must surface
 	// as a plain 404, not run the group's JWT middleware and return 401.
-	e := echo.NewWithConfig(echo.Config{NoGroupAutoRegister404Routes: true})
+	// Echo itself logs rarely (one internal error path); tag those lines
+	// with the [echo] module so they are identifiable like everything else.
+	e := echo.NewWithConfig(echo.Config{Logger: logger.With("module", "echo"), NoGroupAutoRegister404Routes: true})
 	e.Validator = validation.New()
-	e.HTTPErrorHandler = api.ErrorHandler
+	e.HTTPErrorHandler = api.NewErrorHandler(logger)
 
 	app := &App{
 		cfg:        cfg,
@@ -90,8 +98,10 @@ func New(cfg *config.App, roles *config.Roles) (*App, error) {
 		activate:   activate,
 		presence:   pres,
 		echo:       e,
+		logger:     logger,
 	}
 	app.routes(e)
+	app.logRoutes()
 	return app, nil
 }
 

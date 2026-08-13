@@ -6,13 +6,12 @@ import (
 
 	"github.com/labstack/echo/v5"
 
-	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 )
 
 func newStatusEcho(e *env, mode auth.RegistrationMode) *echo.Echo {
 	app := echo.New()
-	app.HTTPErrorHandler = api.ErrorHandler
+	app.HTTPErrorHandler = newErrorHandler()
 	app.GET("/api/v0/auth/status", auth.StatusHandler(e.stores, mode))
 	return app
 }

@@ -15,7 +15,6 @@ import (
 	"github.com/labstack/echo-jwt/v5"
 	"github.com/labstack/echo/v5"
 
-	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/presence"
@@ -196,7 +195,7 @@ func newUserAdminEcho(t *testing.T, e *env, svc *auth.UserService, roles *config
 	t.Helper()
 	app := echo.New()
 	app.Validator = validation.New()
-	app.HTTPErrorHandler = api.ErrorHandler
+	app.HTTPErrorHandler = newErrorHandler()
 	app.Use(echojwt.WithConfig(echojwt.Config{
 		SigningKey:    e.secret,
 		NewClaimsFunc: func(c *echo.Context) jwt.Claims { return &auth.Claims{} },

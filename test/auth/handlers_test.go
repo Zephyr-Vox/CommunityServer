@@ -9,7 +9,6 @@ import (
 
 	"github.com/labstack/echo/v5"
 
-	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/validation"
 )
@@ -17,7 +16,7 @@ import (
 func newAuthEcho(e *env) *echo.Echo {
 	app := echo.New()
 	app.Validator = validation.New()
-	app.HTTPErrorHandler = api.ErrorHandler
+	app.HTTPErrorHandler = newErrorHandler()
 	app.POST("/api/v0/auth/login", auth.LoginHandler(e.svc), auth.LoginRateLimit(1))
 	app.POST("/api/v0/auth/refresh", auth.RefreshHandler(e.svc))
 	app.POST("/api/v0/auth/logout", auth.LogoutHandler(e.svc))

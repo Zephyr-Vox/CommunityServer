@@ -2,6 +2,8 @@ package oss_test
 
 import (
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,7 +18,7 @@ import (
 func newHandlerApp(t *testing.T, e *env) *echo.Echo {
 	t.Helper()
 	app := echo.New()
-	app.HTTPErrorHandler = api.ErrorHandler
+	app.HTTPErrorHandler = api.NewErrorHandler(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	h, err := e.objects.GetHandler("avatars")
 	if err != nil {
 		t.Fatal(err)

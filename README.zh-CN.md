@@ -23,7 +23,7 @@ go run ./cmd/zephyrd
 首次启动会自动生成 `config/zephyr.toml` 和 `config/roles.yaml`，并按 `server.db_path`（默认 `./data/zephyr.db`）打开数据库。当系统还没有管理员时，启动日志会打印一次性激活码：
 
 ```sh
-INFO first admin activation required code=ABC234... hint=POST /api/v0/admin/activate ...
+INFO first admin activation required code: ABC234...
 ```
 
 激活首管理员：
@@ -58,6 +58,11 @@ zephyrd -config config/zephyr.toml -roles config/roles.yaml
 | `server.voice_port` | `8746` | 预留的语音通道端口 |
 | `server.db_path` | `./data/zephyr.db` | SQLite 数据库文件 |
 | `storage.base_dir` | `./data/objects` | 本地对象存储根目录 |
+| `log.level` | `info` | 最低日志级别：`debug`、`info`、`warn`、`error` |
+| `log.path` | `./data/logs` | 日志目录（实时 `zephyr.log` + 归档）；空串 = 仅控制台 |
+| `log.archive_keep` | `7` | 保留最近 N 个归档；`0` = 不保留归档；`-1` = 永久保留 |
+
+控制台日志是输出到 stdout 的人类可读彩色日志。配置 `log.path`（默认）时，同一份日志也会写入该目录的 `zephyr.log`；每 7 天将累积文件合并归档为带日期的 `.zip`（`zephyr-YYYY-MM-DD-NN.zip`），并由 `log.archive_keep` 清理旧归档。
 
 `config/roles.yaml` 定义角色及其权限。默认生成内容：
 

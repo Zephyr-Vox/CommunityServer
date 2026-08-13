@@ -7,7 +7,7 @@ import (
 
 // FieldsError describes a 400 validation failure with one message per field.
 // It implements HTTPStatusCoder and the api.FieldErrors interface; the
-// central api.ErrorHandler folds the messages into the response envelope.
+// central API error handler folds the messages into the response envelope.
 type FieldsError struct {
 	fields map[string]string
 }

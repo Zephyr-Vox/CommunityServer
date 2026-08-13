@@ -12,7 +12,6 @@ import (
 
 	"github.com/labstack/echo/v5"
 
-	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/db"
@@ -277,7 +276,7 @@ func newRegisterEcho(t *testing.T, svc *auth.RegisterService) *echo.Echo {
 	t.Helper()
 	app := echo.New()
 	app.Validator = validation.New()
-	app.HTTPErrorHandler = api.ErrorHandler
+	app.HTTPErrorHandler = newErrorHandler()
 	app.POST("/api/v0/auth/register", auth.RegisterHandler(svc))
 	return app
 }

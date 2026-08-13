@@ -23,7 +23,7 @@ go run ./cmd/zephyrd
 The first start generates `config/zephyr.toml` and `config/roles.yaml` automatically and opens the SQLite database configured in `server.db_path` (default `./data/zephyr.db`). When no administrator exists yet, the startup log prints a one-time activation code:
 
 ```sh
-INFO first admin activation required code=ABC234... hint=POST /api/v0/admin/activate ...
+INFO first admin activation required code: ABC234...
 ```
 
 Activate the first admin:
@@ -58,6 +58,11 @@ zephyrd -config config/zephyr.toml -roles config/roles.yaml
 | `server.voice_port` | `8746` | reserved for the future voice channel |
 | `server.db_path` | `./data/zephyr.db` | SQLite database file |
 | `storage.base_dir` | `./data/objects` | local object storage root |
+| `log.level` | `info` | minimum log level: `debug`, `info`, `warn`, `error` |
+| `log.path` | `./data/logs` | log directory (live `zephyr.log` + archives); empty = console only |
+| `log.archive_keep` | `7` | keep the newest N archives; `0` = no archives; `-1` = keep all |
+
+Console logs are human-readable colored lines on stdout. When `log.path` is set (the default), the same lines are also written to `zephyr.log` there; every 7 days the accumulated file is merged into a dated `.zip` archive (`zephyr-YYYY-MM-DD-NN.zip`) and `log.archive_keep` prunes old archives.
 
 `config/roles.yaml` defines roles and their permissions. The generated default has:
 
