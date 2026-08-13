@@ -13,6 +13,7 @@ Single-server community edition of a lightweight voice-community server, in the 
 - Invite management: create / list / delete invite codes
 - Presence: lightweight in-memory heartbeat-based online status
 - Local object storage: disk-backed files with SQLite metadata and MIME detection
+- Avatars: upload/reset with unified JPEG transcoding (any decodable image in, 256×256 JPEG out), served from a public route
 
 ## Quick Start
 
@@ -58,6 +59,10 @@ zephyrd -config config/zephyr.toml -roles config/roles.yaml
 | `server.voice_port` | `8746` | reserved for the future voice channel |
 | `server.db_path` | `./data/zephyr.db` | SQLite database file |
 | `storage.base_dir` | `./data/objects` | local object storage root |
+| `avatar.max_upload_size` | `10485760` | avatar upload size limit in bytes (10 MiB) |
+| `avatar.max_dimension` | `4096` | source image max side in pixels; rejects decompression bombs |
+| `avatar.target_size` | `256` | output avatar side in pixels (square) |
+| `avatar.quality` | `85` | JPEG quality, 0-100 |
 | `log.level` | `info` | minimum log level: `debug`, `info`, `warn`, `error` |
 | `log.path` | `./data/logs` | log directory (live `zephyr.log` + archives); empty = console only |
 | `log.archive_keep` | `7` | keep the newest N archives; `0` = no archives; `-1` = keep all |
@@ -91,10 +96,12 @@ All paths are prefixed with `/api/v0`.
 | Area | Endpoints |
 |---|---|
 | Auth | `GET /auth/status`, `POST /auth/register`, `POST /admin/activate`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout` |
-| Self | `GET /auth/me`, `PATCH /me`, `POST /me/password` |
+| Self | `GET /auth/me`, `PATCH /me`, `POST /me/avatar`, `DELETE /me/avatar`, `POST /me/password` |
 | Users | `GET /users`, `GET /users/:id`, `PATCH /users/:id`, `PUT /users/:id/roles`, `POST /users/:id/password`, `POST /users/:id/kick`, `POST /users/:id/ban`, `POST /users/:id/unban`, `DELETE /users/:id` |
 | Invites | `GET /admin/invites`, `POST /admin/invites`, `DELETE /admin/invites/:id` |
 | Presence | `POST /presence/heartbeat`, `GET /presence` |
+
+Avatar endpoints: `POST /api/v0/me/avatar` accepts a multipart `file` field (any format Go can decode) and stores a uniformly transcoded JPEG; `DELETE /api/v0/me/avatar` resets to the default. The image is served publicly at `GET /avatar/:file` — note this route sits outside the `/api/v0` prefix. The `avatar` field in user DTOs carries the bare object name (e.g. `12345.jpg`); clients build the full URL by joining it with the public prefix, currently the fixed route `/avatar/` (e.g. `/avatar/12345.jpg`).
 
 ## Development
 

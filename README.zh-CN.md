@@ -13,6 +13,7 @@
 - 邀请码管理：创建 / 列表 / 删除
 - presence：轻量内存心跳在线状态
 - 本地对象存储：磁盘文件 + SQLite 元数据 + MIME 探测
+- 头像：上传/重置 + 统一 JPEG 转码（任意可解码图片进，256×256 JPEG 出），公开路由提供读取
 
 ## 快速开始
 
@@ -58,6 +59,10 @@ zephyrd -config config/zephyr.toml -roles config/roles.yaml
 | `server.voice_port` | `8746` | 预留的语音通道端口 |
 | `server.db_path` | `./data/zephyr.db` | SQLite 数据库文件 |
 | `storage.base_dir` | `./data/objects` | 本地对象存储根目录 |
+| `avatar.max_upload_size` | `10485760` | 头像上传大小上限（字节，10 MiB） |
+| `avatar.max_dimension` | `4096` | 源图最大边长（像素），防止解码放大攻击 |
+| `avatar.target_size` | `256` | 输出头像边长（像素），正方形 |
+| `avatar.quality` | `85` | JPEG 质量，0-100 |
 | `log.level` | `info` | 最低日志级别：`debug`、`info`、`warn`、`error` |
 | `log.path` | `./data/logs` | 日志目录（实时 `zephyr.log` + 归档）；空串 = 仅控制台 |
 | `log.archive_keep` | `7` | 保留最近 N 个归档；`0` = 不保留归档；`-1` = 永久保留 |
@@ -91,10 +96,12 @@ zephyrd -config config/zephyr.toml -roles config/roles.yaml
 | 区域 | 接口 |
 |---|---|
 | 认证 | `GET /auth/status`、`POST /auth/register`、`POST /admin/activate`、`POST /auth/login`、`POST /auth/refresh`、`POST /auth/logout` |
-| 自我管理 | `GET /auth/me`、`PATCH /me`、`POST /me/password` |
+| 自我管理 | `GET /auth/me`、`PATCH /me`、`POST /me/avatar`、`DELETE /me/avatar`、`POST /me/password` |
 | 用户管理 | `GET /users`、`GET /users/:id`、`PATCH /users/:id`、`PUT /users/:id/roles`、`POST /users/:id/password`、`POST /users/:id/kick`、`POST /users/:id/ban`、`POST /users/:id/unban`、`DELETE /users/:id` |
 | 邀请码 | `GET /admin/invites`、`POST /admin/invites`、`DELETE /admin/invites/:id` |
 | Presence | `POST /presence/heartbeat`、`GET /presence` |
+
+头像接口：`POST /api/v0/me/avatar` 接收 multipart 的 `file` 字段（任意 Go 可解码的图片格式），统一转码为 JPEG 存储；`DELETE /api/v0/me/avatar` 重置为默认头像。图片通过公开路由 `GET /avatar/:file` 读取——注意该路由不在 `/api/v0` 前缀下。用户 DTO 中的 `avatar` 字段携带裸对象名（如 `12345.jpg`）；客户端拼接公开前缀得到完整 URL，当前前缀固定为 `/avatar/`（如 `/avatar/12345.jpg`）。
 
 ## 开发
 
