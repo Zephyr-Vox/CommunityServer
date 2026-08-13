@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -8,10 +9,12 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"zephyr.vox/server/ce/internal/config"
+	"zephyr.vox/server/ce/internal/logging"
 	"zephyr.vox/server/ce/internal/server"
 )
 
@@ -69,5 +72,39 @@ func TestRunServesAndShutsDownGracefully(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// TestRunBindFailureDoesNotClaimReady locks down the startup ordering: the
+// "http listening" / "LINK START" lines must never appear when the port is
+// already taken, otherwise operators would misread a failed start as a
+// successful initialization.
+func TestRunBindFailureDoesNotClaimReady(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	port := occupied.Addr().(*net.TCPAddr).Port
+
+	dir := t.TempDir()
+	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	logger := slog.New(logging.NewTextHandler(&buf, slog.LevelDebug))
+	app, err := server.New(testConfig(dir, port), roles, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	err = app.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run must fail when the port is already bound")
+	}
+	if strings.Contains(buf.String(), "http listening") || strings.Contains(buf.String(), "LINK START") {
+		t.Fatalf("claimed readiness despite bind failure: %q", buf.String())
 	}
 }
