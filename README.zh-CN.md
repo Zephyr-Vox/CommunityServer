@@ -1,0 +1,106 @@
+# ZephyrVox CommunityServer
+
+[English](README.md) | **中文**
+
+轻量级语音社区服务器的单机社区版，定位类似 TeamSpeak / Discord。基于 Go 1.26、Echo v5 和 SQLite（纯 Go 驱动）构建。
+
+## 功能
+
+- 账号引导：首管理员激活码、开放注册 / 邀请码注册
+- 认证：argon2id 密码、短时效 JWT access token、可轮换且带重用检测的 refresh session
+- 基于角色的授权：权限在 `roles.yaml` 中配置，按路由强制
+- 用户管理：列表/详情、资料、角色、重置密码、踢下线、封禁/解封、硬删除
+- 邀请码管理：创建 / 列表 / 删除
+- presence：轻量内存心跳在线状态
+- 本地对象存储：磁盘文件 + SQLite 元数据 + MIME 探测
+
+## 快速开始
+
+```sh
+go run ./cmd/zephyrd
+```
+
+首次启动会自动生成 `config/zephyr.toml` 和 `config/roles.yaml`，并按 `server.db_path`（默认 `./data/zephyr.db`）打开数据库。当系统还没有管理员时，启动日志会打印一次性激活码：
+
+```sh
+INFO first admin activation required code=ABC234... hint=POST /api/v0/admin/activate ...
+```
+
+激活首管理员：
+
+```sh
+curl -X POST http://localhost:8745/api/v0/admin/activate \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"ABC234...","username":"boss","password":"secret123"}'
+```
+
+然后用同一账号调用 `POST /api/v0/auth/login` 登录。
+
+命令行参数：
+
+```sh
+zephyrd -config config/zephyr.toml -roles config/roles.yaml
+```
+
+## 配置
+
+`config/zephyr.toml` 首次启动自动生成（0600 权限，内含 JWT 密钥）：
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `jwt_secret` | 随机 256 位（64 个十六进制字符） | access token 的 HS256 签名密钥 |
+| `auth.access_token_ttl` | `15m` | access token 有效期 |
+| `auth.refresh_token_ttl` | `720h` | refresh session 滑动有效期 |
+| `auth.login_rate_limit` | `10` | 每 IP 每分钟 login/activate 次数 |
+| `auth.registration_mode` | `invite` | `open` 或 `invite` |
+| `server.host` | `0.0.0.0` | HTTP 监听地址 |
+| `server.http_port` | `8745` | HTTP/REST 监听端口 |
+| `server.voice_port` | `8746` | 预留的语音通道端口 |
+| `server.db_path` | `./data/zephyr.db` | SQLite 数据库文件 |
+| `storage.base_dir` | `./data/objects` | 本地对象存储根目录 |
+
+`config/roles.yaml` 定义角色及其权限。默认生成内容：
+
+- `admin`：`["*"]`
+- `member`：`["voice:join"]`
+
+可用权限：`voice:join`、`user:read`、`user:create`、`user:update`、`user:delete`、`user:kick`、`invite:manage`。
+
+## API 约定
+
+所有 JSON 响应统一信封：
+
+```json
+{"code": 0, "message": "", "data": {...}}
+```
+
+- `code` 为 0 且 `message` 为空表示成功，`data` 携带 DTO。
+- 接口级业务码从 1 开始（每个接口独立编号，见各 handler 文档注释），前端按 `(endpoint, code)` 分支。
+- 共享全局码：`1000` 参数校验失败（字段消息在 `data.fields`）、`1001` 请求格式错误、`1002` 未授权、`1003` 无权限、`1004` 不存在、`1005` 方法不允许、`1006` 请求体过大、`1007` 不支持的媒体类型、`1008` 限流、`1009` 内部错误。
+- `204` 响应无 body；对象下载是原始二进制，不走信封。
+
+## API 一览
+
+所有路径前缀为 `/api/v0`。
+
+| 区域 | 接口 |
+|---|---|
+| 认证 | `GET /auth/status`、`POST /auth/register`、`POST /admin/activate`、`POST /auth/login`、`POST /auth/refresh`、`POST /auth/logout` |
+| 自我管理 | `GET /auth/me`、`PATCH /me`、`POST /me/password` |
+| 用户管理 | `GET /users`、`GET /users/:id`、`PATCH /users/:id`、`PUT /users/:id/roles`、`POST /users/:id/password`、`POST /users/:id/kick`、`POST /users/:id/ban`、`POST /users/:id/unban`、`DELETE /users/:id` |
+| 邀请码 | `GET /admin/invites`、`POST /admin/invites`、`DELETE /admin/invites/:id` |
+| Presence | `POST /presence/heartbeat`、`GET /presence` |
+
+## 开发
+
+```sh
+go build ./...          # 编译
+go vet ./...            # 静态检查
+gofmt -w <files>        # 格式化（Go 使用 Tab）
+go test -race ./...     # 全量测试（带 race detector）
+sqlc generate           # 修改 SQL 后重新生成数据访问代码
+```
+
+业务包内不放置 `_test.go`，测试统一放在 `test/` 下并镜像包路径。绑定真实端口的测试（优雅关闭）需要允许打开本地 socket 的权限。
+
+目前还没有迁移系统：schema 启动时幂等应用，开发期修改 schema 需要删除数据库文件。
