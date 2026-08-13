@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -103,4 +104,12 @@ func (a *App) Echo() *echo.Echo {
 // Close releases the database connection.
 func (a *App) Close() error {
 	return a.conn.Close()
+}
+
+// EnsureActivationCode makes sure a first-admin activation code exists. ok
+// reports whether a code is pending; the plaintext is non-empty only on the
+// first call, because the manager keeps only the SHA-256 digest afterwards.
+// The caller must log the plaintext when it first appears.
+func (a *App) EnsureActivationCode(ctx context.Context) (code string, ok bool, err error) {
+	return a.activate.EnsureCode(ctx)
 }

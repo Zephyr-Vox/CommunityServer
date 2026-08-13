@@ -44,6 +44,20 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	code, pending, err := app.EnsureActivationCode(ctx)
+	if err != nil {
+		return err
+	}
+	if pending {
+		// The plaintext is available exactly once: after this log line only
+		// its digest remains in memory.
+		slog.Info("first admin activation required",
+			"code", code,
+			"hint", `POST /api/v0/admin/activate {"code":"<code>","username":"<admin>","password":"<password>"}`)
+	} else {
+		slog.Info("admin already exists; first-admin activation is disabled")
+	}
+
 	slog.Info("zephyrd starting",
 		"addr", appConfig.Server.Host+":"+strconv.Itoa(appConfig.Server.HTTPPort),
 		"db", appConfig.Server.DBPath)
