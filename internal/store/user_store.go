@@ -57,10 +57,24 @@ func (s *UserStore) GetUserByUsername(ctx context.Context, username string) (*db
 	return &user, nil
 }
 
-// UpdateProfile updates nickname and avatar; a nil avatar clears it.
-func (s *UserStore) UpdateProfile(ctx context.Context, id int64, nickname string, avatar *string) (*db.User, error) {
-	user, err := s.q.UpdateUserProfile(ctx, db.UpdateUserProfileParams{
+// UpdateNickname changes a user's nickname and returns the updated user.
+// It never touches the avatar column; avatar changes go through SetAvatar.
+func (s *UserStore) UpdateNickname(ctx context.Context, id int64, nickname string) (*db.User, error) {
+	user, err := s.q.UpdateUserNickname(ctx, db.UpdateUserNicknameParams{
 		Nickname:  nickname,
+		UpdatedAt: s.now(),
+		ID:        id,
+	})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &user, nil
+}
+
+// SetAvatar sets the user's avatar to the given object name, or clears it
+// when avatar is nil. It returns the updated user.
+func (s *UserStore) SetAvatar(ctx context.Context, id int64, avatar *string) (*db.User, error) {
+	user, err := s.q.SetUserAvatar(ctx, db.SetUserAvatarParams{
 		Avatar:    nullString(avatar),
 		UpdatedAt: s.now(),
 		ID:        id,

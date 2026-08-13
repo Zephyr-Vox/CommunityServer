@@ -68,6 +68,12 @@ func testConfigFull(dir string, httpPort int, registrationMode string, loginRate
 			DBPath:    filepath.Join(dir, "zephyr.db"),
 		},
 		Storage: config.StorageConfig{BaseDir: filepath.Join(dir, "objects")},
+		Avatar: config.AvatarConfig{
+			MaxUploadSize: 10 << 20,
+			MaxDimension:  4096,
+			TargetSize:    256,
+			Quality:       85,
+		},
 	}
 }
 

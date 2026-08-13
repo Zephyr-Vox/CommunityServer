@@ -27,6 +27,7 @@ type App struct {
 	RegistrationMode string  // "open" or "invite"
 	Server           ServerConfig
 	Storage          StorageConfig
+	Avatar           AvatarConfig
 	Log              LogConfig
 }
 
@@ -43,6 +44,16 @@ type ServerConfig struct {
 // StorageConfig configures the local object storage backend.
 type StorageConfig struct {
 	BaseDir string
+}
+
+// AvatarConfig configures avatar uploads and transcoding. All fields are
+// operational parameters the administrator tunes per deployment; there are
+// no hidden constants in the image package.
+type AvatarConfig struct {
+	MaxUploadSize int64 // request body limit in bytes; default 10 MiB
+	MaxDimension  int   // source image max side in pixels; rejects decompression bombs
+	TargetSize    int   // output avatar side in pixels (square)
+	Quality       int   // JPEG quality, 0-100
 }
 
 // LogConfig configures the human-readable log pipeline. Path empty means
@@ -64,6 +75,12 @@ type appConfig struct {
 	Storage struct {
 		BaseDir string `mapstructure:"base_dir"`
 	} `mapstructure:"storage"`
+	Avatar struct {
+		MaxUploadSize *int64 `mapstructure:"max_upload_size"`
+		MaxDimension  *int   `mapstructure:"max_dimension"`
+		TargetSize    *int   `mapstructure:"target_size"`
+		Quality       *int   `mapstructure:"quality"`
+	} `mapstructure:"avatar"`
 	Auth struct {
 		AccessTokenTTL   string  `mapstructure:"access_token_ttl"`
 		RefreshTokenTTL  string  `mapstructure:"refresh_token_ttl"`
@@ -107,6 +124,10 @@ func newApp(cfg appConfig) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	avatar, err := validateAvatar(cfg)
+	if err != nil {
+		return nil, err
+	}
 	mode := cfg.Auth.RegistrationMode
 	if mode == "" {
 		mode = "invite"
@@ -124,6 +145,7 @@ func newApp(cfg appConfig) (*App, error) {
 			DBPath:    cfg.Server.DBPath,
 		},
 		Storage: StorageConfig{BaseDir: cfg.Storage.BaseDir},
+		Avatar:  avatar,
 		Log: LogConfig{
 			Level:       logLevel,
 			Path:        logPath,
@@ -169,6 +191,43 @@ func validateApp(cfg appConfig) (accessTTL, refreshTTL time.Duration, err error)
 		return 0, 0, errors.New("config: storage.base_dir must not be empty")
 	}
 	return accessTTL, refreshTTL, nil
+}
+
+// validateAvatar parses the [avatar] section. Pointers distinguish "unset"
+// (use the default) from an explicit invalid value: an explicit 0 or negative
+// number is an error, an absent key keeps the default.
+func validateAvatar(cfg appConfig) (AvatarConfig, error) {
+	a := AvatarConfig{
+		MaxUploadSize: 10 << 20, // 10 MiB
+		MaxDimension:  4096,
+		TargetSize:    256,
+		Quality:       85,
+	}
+	if cfg.Avatar.MaxUploadSize != nil {
+		if *cfg.Avatar.MaxUploadSize <= 0 {
+			return AvatarConfig{}, errors.New("config: avatar.max_upload_size must be positive")
+		}
+		a.MaxUploadSize = *cfg.Avatar.MaxUploadSize
+	}
+	if cfg.Avatar.MaxDimension != nil {
+		if *cfg.Avatar.MaxDimension <= 0 {
+			return AvatarConfig{}, errors.New("config: avatar.max_dimension must be positive")
+		}
+		a.MaxDimension = *cfg.Avatar.MaxDimension
+	}
+	if cfg.Avatar.TargetSize != nil {
+		if *cfg.Avatar.TargetSize <= 0 {
+			return AvatarConfig{}, errors.New("config: avatar.target_size must be positive")
+		}
+		a.TargetSize = *cfg.Avatar.TargetSize
+	}
+	if cfg.Avatar.Quality != nil {
+		if *cfg.Avatar.Quality < 0 || *cfg.Avatar.Quality > 100 {
+			return AvatarConfig{}, errors.New("config: avatar.quality must be 0-100")
+		}
+		a.Quality = *cfg.Avatar.Quality
+	}
+	return a, nil
 }
 
 // validateLog parses the [log] section, applying defaults when keys are

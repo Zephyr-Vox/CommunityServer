@@ -17,6 +17,8 @@ import (
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/db"
+	"zephyr.vox/server/ce/internal/image"
+	"zephyr.vox/server/ce/internal/oss"
 	"zephyr.vox/server/ce/internal/presence"
 	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/store"
@@ -37,6 +39,8 @@ type App struct {
 	invites    *auth.InviteService
 	activate   *auth.ActivationManager
 	presence   *presence.Presence
+	objects    *oss.LocalObjectStorage
+	avatar     *image.AvatarService
 	echo       *echo.Echo
 	logger     *slog.Logger
 }
@@ -73,7 +77,13 @@ func New(cfg *config.App, roles *config.Roles, logger *slog.Logger) (*App, error
 	authSvc := auth.NewAuthService(stores, principals, secret, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, now)
 	register := auth.NewRegisterService(stores, roles, auth.RegistrationMode(cfg.RegistrationMode))
 	pres := presence.New(time.Now)
-	users := auth.NewUserService(stores, roles, principals, pres)
+	objects, err := oss.NewLocalObjectStorage(cfg.Storage.BaseDir, conn, now)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("server: object storage: %w", err)
+	}
+	avatarSvc := image.NewAvatarService(stores.Users, objects, idGen, cfg.Avatar)
+	users := auth.NewUserService(stores, roles, principals, pres, avatarSvc)
 	invites := auth.NewInviteService(stores, roles, now)
 	activate := auth.NewActivationManager(stores)
 
@@ -97,10 +107,15 @@ func New(cfg *config.App, roles *config.Roles, logger *slog.Logger) (*App, error
 		invites:    invites,
 		activate:   activate,
 		presence:   pres,
+		objects:    objects,
+		avatar:     avatarSvc,
 		echo:       e,
 		logger:     logger,
 	}
-	app.routes(e)
+	if err := app.routes(e); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("server: mount routes: %w", err)
+	}
 	app.logRoutes()
 	return app, nil
 }

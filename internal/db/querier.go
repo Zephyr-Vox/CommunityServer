@@ -36,10 +36,11 @@ type Querier interface {
 	ListSessionsByUser(ctx context.Context, userID int64) ([]Session, error)
 	ListUsers(ctx context.Context, arg ListUsersParams) ([]User, error)
 	RotateSession(ctx context.Context, arg RotateSessionParams) (Session, error)
+	SetUserAvatar(ctx context.Context, arg SetUserAvatarParams) (User, error)
 	SetUserBanned(ctx context.Context, arg SetUserBannedParams) error
 	SetUserPasswordHash(ctx context.Context, arg SetUserPasswordHashParams) error
 	TouchUserLastLogin(ctx context.Context, arg TouchUserLastLoginParams) error
-	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error)
+	UpdateUserNickname(ctx context.Context, arg UpdateUserNicknameParams) (User, error)
 	UpsertObject(ctx context.Context, arg UpsertObjectParams) (Object, error)
 	UpsertSession(ctx context.Context, arg UpsertSessionParams) (Session, error)
 }

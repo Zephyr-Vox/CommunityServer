@@ -37,13 +37,13 @@ func TestMeProfileHandler(t *testing.T) {
 	token := loginToken(t, e, "alice", "secret123")
 
 	rec := requestMethodWithToken(t, app, http.MethodPatch, "/api/v0/me", token,
-		`{"nickname":"Ali","avatar":"https://example.com/a.png"}`)
+		`{"nickname":"Ali"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	data := decodeEnvelopeData(t, rec)
-	if data["nickname"] != "Ali" || data["avatar"] != "https://example.com/a.png" {
-		t.Fatalf("data = %v, want updated profile", data)
+	if data["nickname"] != "Ali" || data["avatar"] != "" {
+		t.Fatalf("data = %v, want updated nickname with untouched avatar", data)
 	}
 }
 

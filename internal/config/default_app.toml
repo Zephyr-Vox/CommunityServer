@@ -17,6 +17,12 @@ db_path = "./data/zephyr.db"
 [storage]
 base_dir = "./data/objects"
 
+[avatar]
+max_upload_size = 10485760  # avatar upload size limit in bytes (default 10 MiB)
+max_dimension = 4096        # source image max side in pixels; rejects decompression bombs
+target_size = 256           # output avatar side in pixels (square)
+quality = 85                # JPEG quality, 0-100
+
 [log]
 level = "info"
 path = "./data/logs"

@@ -46,6 +46,9 @@ func TestLoadAppGeneratesDefault(t *testing.T) {
 	if app.Storage.BaseDir != "./data/objects" {
 		t.Fatalf("storage.base_dir = %q, want ./data/objects", app.Storage.BaseDir)
 	}
+	if app.Avatar.MaxUploadSize != 10<<20 || app.Avatar.MaxDimension != 4096 || app.Avatar.TargetSize != 256 || app.Avatar.Quality != 85 {
+		t.Fatalf("avatar = %+v, want 10 MiB / 4096 / 256 / 85", app.Avatar)
+	}
 	if app.Server.Host != "0.0.0.0" || app.Server.HTTPPort != 8745 || app.Server.VoicePort != 8746 || app.Server.DBPath != "./data/zephyr.db" {
 		t.Fatalf("server = %+v, want 0.0.0.0:8745 voice 8746 db ./data/zephyr.db", app.Server)
 	}
@@ -546,5 +549,92 @@ archive_keep = -2
 	_, err := config.LoadApp(path)
 	if err == nil || !strings.Contains(err.Error(), "log.archive_keep") {
 		t.Fatalf("want log.archive_keep error, got %v", err)
+	}
+}
+
+func TestLoadAppCustomAvatarConfig(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[avatar]
+max_upload_size = 20971520
+max_dimension = 2048
+target_size = 128
+quality = 70
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Avatar.MaxUploadSize != 20971520 || app.Avatar.MaxDimension != 2048 || app.Avatar.TargetSize != 128 || app.Avatar.Quality != 70 {
+		t.Fatalf("avatar = %+v, want custom values", app.Avatar)
+	}
+}
+
+func TestLoadAppRejectsZeroAvatarUploadSize(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[avatar]
+max_upload_size = 0
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "avatar.max_upload_size") {
+		t.Fatalf("want avatar.max_upload_size error, got %v", err)
+	}
+}
+
+func TestLoadAppRejectsBadAvatarQuality(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[avatar]
+quality = 101
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "avatar.quality") {
+		t.Fatalf("want avatar.quality error, got %v", err)
 	}
 }

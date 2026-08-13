@@ -37,8 +37,7 @@ type inviteCreateRequest struct {
 }
 
 type updateProfileRequest struct {
-	Nickname string  `json:"nickname" validate:"omitempty,max=32"`
-	Avatar   *string `json:"avatar" validate:"omitempty,max=512"`
+	Nickname string `json:"nickname" validate:"omitempty,max=32"`
 }
 
 type setRolesRequest struct {

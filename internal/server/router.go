@@ -8,6 +8,7 @@ import (
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/auth"
+	"zephyr.vox/server/ce/internal/image"
 	"zephyr.vox/server/ce/internal/presence"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
@@ -16,10 +17,17 @@ import (
 // routes mounts every endpoint on e. Public endpoints sit outside the JWT
 // middleware; everything else requires AuthN, and admin endpoints add the
 // matching Require permission middleware.
-func (a *App) routes(e *echo.Echo) {
+func (a *App) routes(e *echo.Echo) error {
 	// Global access log: runs for matched routes and for unknown paths, so
 	// 404s are visible too.
 	e.Use(a.requestLogging())
+
+	// Public avatar reads: no AuthN, streamed from the avatars bucket.
+	publicAvatar, err := a.objects.GetHandler(image.AvatarBucket)
+	if err != nil {
+		return err
+	}
+	e.GET("/avatar/:file", publicAvatar)
 
 	jwtMW := echojwt.WithConfig(echojwt.Config{
 		SigningKey:    []byte(a.cfg.JWTSecret),
@@ -39,6 +47,8 @@ func (a *App) routes(e *echo.Echo) {
 	protected := e.Group("/api/v0", jwtMW, authnMW)
 	protected.GET("/auth/me", auth.MeHandler(a.stores.Users, authz))
 	protected.PATCH("/me", auth.MeProfileHandler(a.users))
+	protected.POST("/me/avatar", image.UploadAvatarHandler(a.avatar))
+	protected.DELETE("/me/avatar", image.DeleteAvatarHandler(a.avatar))
 	protected.POST("/me/password", auth.MePasswordHandler(a.authSvc))
 	protected.POST("/presence/heartbeat", presence.HeartbeatHandler(a.presence))
 	protected.GET("/presence", presence.QueryHandler(a.presence))
@@ -56,6 +66,7 @@ func (a *App) routes(e *echo.Echo) {
 	admin.GET("/admin/invites", auth.InviteListHandler(a.invites), rbacecho.Require(authz, rbac.PermInviteManage))
 	admin.POST("/admin/invites", auth.InviteCreateHandler(a.invites), rbacecho.Require(authz, rbac.PermInviteManage))
 	admin.DELETE("/admin/invites/:id", auth.InviteDeleteHandler(a.invites), rbacecho.Require(authz, rbac.PermInviteManage))
+	return nil
 }
 
 // logRoutes prints the mounted route table: one INFO summary and one DEBUG

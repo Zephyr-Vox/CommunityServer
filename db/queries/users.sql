@@ -9,9 +9,15 @@ INSERT INTO users (id, username, password_hash, nickname, avatar, created_at, up
 VALUES (?, ?, ?, ?, ?, ?, ?)
 RETURNING *;
 
--- name: UpdateUserProfile :one
+-- name: UpdateUserNickname :one
 UPDATE users
-SET nickname = ?, avatar = ?, updated_at = ?
+SET nickname = ?, updated_at = ?
+WHERE id = ?
+RETURNING *;
+
+-- name: SetUserAvatar :one
+UPDATE users
+SET avatar = ?, updated_at = ?
 WHERE id = ?
 RETURNING *;
 

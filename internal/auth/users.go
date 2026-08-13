@@ -26,6 +26,13 @@ type PresenceRevoker interface {
 	Remove(userID int64)
 }
 
+// AvatarCleaner removes a user's avatar object on account deletion.
+// image.AvatarService satisfies it; the interface keeps auth free of any
+// image-domain dependency. Cleanup is best-effort and never fails deletion.
+type AvatarCleaner interface {
+	DeleteAvatar(ctx context.Context, name string) error
+}
+
 // UserWithRoles is a user row together with its role names.
 type UserWithRoles struct {
 	User  *db.User
@@ -35,21 +42,24 @@ type UserWithRoles struct {
 // UserService implements admin user management and the /me self-service
 // endpoints on top of the stores.
 type UserService struct {
-	stores     *store.Stores
-	users      *store.UserStore
-	roles      RoleProvider
-	principals *PrincipalCache
-	presence   PresenceRevoker
+	stores        *store.Stores
+	users         *store.UserStore
+	roles         RoleProvider
+	principals    *PrincipalCache
+	presence      PresenceRevoker
+	avatarCleaner AvatarCleaner
 }
 
-// NewUserService returns a UserService.
-func NewUserService(stores *store.Stores, roles RoleProvider, principals *PrincipalCache, presence PresenceRevoker) *UserService {
+// NewUserService returns a UserService. avatarCleaner may be nil, in which
+// case account deletion leaves avatar objects behind.
+func NewUserService(stores *store.Stores, roles RoleProvider, principals *PrincipalCache, presence PresenceRevoker, avatarCleaner AvatarCleaner) *UserService {
 	return &UserService{
-		stores:     stores,
-		users:      stores.Users,
-		roles:      roles,
-		principals: principals,
-		presence:   presence,
+		stores:        stores,
+		users:         stores.Users,
+		roles:         roles,
+		principals:    principals,
+		presence:      presence,
+		avatarCleaner: avatarCleaner,
 	}
 }
 
@@ -85,10 +95,11 @@ func (s *UserService) Get(ctx context.Context, userID int64) (*UserWithRoles, er
 	return &UserWithRoles{User: user, Roles: roles}, nil
 }
 
-// UpdateProfile changes nickname and/or avatar. An empty nickname keeps the
-// current one; a nil avatar keeps the current one, while an empty string
-// clears it.
-func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname string, avatar *string) (*db.User, error) {
+// UpdateProfile changes a user's nickname. An empty nickname keeps the
+// current one. Avatar changes are out of scope: they go through the avatar
+// endpoints in the image domain, so arbitrary strings can never enter the
+// avatar column here.
+func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname string) (*db.User, error) {
 	user, err := s.users.GetUserByID(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -96,19 +107,7 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 	if nickname == "" {
 		nickname = user.Nickname
 	}
-	if avatar == nil {
-		var current *string
-		if user.Avatar.Valid {
-			v := user.Avatar.String
-			current = &v
-		}
-		avatar = current
-	}
-	if avatar != nil && *avatar == "" {
-		// An explicit empty string clears the avatar (stores NULL).
-		avatar = nil
-	}
-	return s.users.UpdateProfile(ctx, userID, nickname, avatar)
+	return s.users.UpdateNickname(ctx, userID, nickname)
 }
 
 // SetRoles replaces a user's roles after validating them against the role
@@ -182,10 +181,18 @@ func (s *UserService) Unban(ctx context.Context, userID int64) error {
 }
 
 // Delete hard-deletes a user. Sessions and roles cascade; invites the user
-// created keep their rows with created_by set to NULL.
+// created keep their rows with created_by set to NULL. The user's avatar
+// object is removed best-effort first, if a cleaner is wired up.
 func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
+	}
+	user, err := s.users.GetUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if s.avatarCleaner != nil && user.Avatar.Valid {
+		_ = s.avatarCleaner.DeleteAvatar(ctx, user.Avatar.String) // best-effort
 	}
 	if err := s.users.Delete(ctx, userID); err != nil {
 		return err

@@ -92,26 +92,49 @@ func TestCreateUserDuplicateUsername(t *testing.T) {
 	}
 }
 
-func TestUpdateUserProfile(t *testing.T) {
+func TestUpdateNicknameAndAvatar(t *testing.T) {
 	s, _ := newTestEnv(t)
 	ctx := context.Background()
 	u := mustCreateUser(t, s, "alice")
 
-	avatar := "https://example.com/a.png"
-	got, err := s.Users.UpdateProfile(ctx, u.ID, "Alice!", &avatar)
+	got, err := s.Users.UpdateNickname(ctx, u.ID, "Alice!")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Nickname != "Alice!" || !got.Avatar.Valid || got.Avatar.String != avatar {
+	if got.Nickname != "Alice!" || got.Avatar.Valid {
 		t.Fatalf("unexpected profile: %+v", got)
 	}
 
-	cleared, err := s.Users.UpdateProfile(ctx, u.ID, "Alice!", nil)
+	name := "12345.jpg"
+	got, err = s.Users.SetAvatar(ctx, u.ID, &name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Nickname != "Alice!" || !got.Avatar.Valid || got.Avatar.String != name {
+		t.Fatalf("avatar not set: %+v", got)
+	}
+
+	cleared, err := s.Users.SetAvatar(ctx, u.ID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cleared.Avatar.Valid {
 		t.Fatal("avatar should be null after clearing")
+	}
+	// Setting an avatar must not clobber the nickname and vice versa.
+	got, err = s.Users.SetAvatar(ctx, u.ID, &name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Nickname != "Alice!" {
+		t.Fatalf("SetAvatar clobbered nickname: %+v", got)
+	}
+	got, err = s.Users.UpdateNickname(ctx, u.ID, "Alice2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Avatar.Valid || got.Avatar.String != name {
+		t.Fatalf("UpdateNickname clobbered avatar: %+v", got)
 	}
 }
 

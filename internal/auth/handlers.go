@@ -350,7 +350,7 @@ func UpdateUserHandler(svc *UserService) echo.HandlerFunc {
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		user, err := svc.UpdateProfile(c.Request().Context(), id, req.Nickname, req.Avatar)
+		user, err := svc.UpdateProfile(c.Request().Context(), id, req.Nickname)
 		if errors.Is(err, store.ErrNotFound) {
 			return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
 		}
@@ -585,7 +585,7 @@ func MeProfileHandler(svc *UserService) echo.HandlerFunc {
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		user, err := svc.UpdateProfile(c.Request().Context(), p.UserID, req.Nickname, req.Avatar)
+		user, err := svc.UpdateProfile(c.Request().Context(), p.UserID, req.Nickname)
 		if err != nil {
 			return err
 		}

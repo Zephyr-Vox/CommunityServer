@@ -27,7 +27,7 @@ import (
 func newUserService(t *testing.T, e *env) (*auth.UserService, *presence.Presence) {
 	t.Helper()
 	pres := presence.New(time.Now)
-	svc := auth.NewUserService(e.stores, newRoles(t), e.principals, pres)
+	svc := auth.NewUserService(e.stores, newRoles(t), e.principals, pres, nil)
 	return svc, pres
 }
 
@@ -60,26 +60,27 @@ func TestUserServiceUpdateProfile(t *testing.T) {
 	ctx := context.Background()
 	u := e.createUser(t, "alice", "secret123", "member")
 
-	avatar := "https://example.com/a.png"
-	updated, err := svc.UpdateProfile(ctx, u.ID, "Ali", &avatar)
+	updated, err := svc.UpdateProfile(ctx, u.ID, "Ali")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.Nickname != "Ali" || !updated.Avatar.Valid || updated.Avatar.String != avatar {
+	if updated.Nickname != "Ali" {
 		t.Fatalf("updated = %+v", updated)
 	}
+	if updated.Avatar.Valid {
+		t.Fatal("UpdateProfile must not touch the avatar column")
+	}
 
-	cleared := ""
-	updated, err = svc.UpdateProfile(ctx, u.ID, "", &cleared)
+	// Empty nickname keeps the current one.
+	updated, err = svc.UpdateProfile(ctx, u.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.Nickname != "Ali" || updated.Avatar.Valid {
-		t.Fatalf("clear failed: %+v", updated)
+	if updated.Nickname != "Ali" {
+		t.Fatalf("empty nickname should keep current, got %+v", updated)
 	}
-
-	if _, err := svc.UpdateProfile(ctx, 99999, "x", nil); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("want ErrNotFound, got %v", err)
+	if _, err := svc.UpdateProfile(ctx, 12345, "X"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("want ErrNotFound for unknown user, got %v", err)
 	}
 }
 

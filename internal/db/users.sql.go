@@ -229,6 +229,37 @@ func (q *Queries) ListUsers(ctx context.Context, arg ListUsersParams) ([]User, e
 	return items, nil
 }
 
+const setUserAvatar = `-- name: SetUserAvatar :one
+UPDATE users
+SET avatar = ?, updated_at = ?
+WHERE id = ?
+RETURNING id, username, password_hash, nickname, avatar, auth_version, banned_at, last_login_at, created_at, updated_at
+`
+
+type SetUserAvatarParams struct {
+	Avatar    sql.NullString `json:"avatar"`
+	UpdatedAt int64          `json:"updated_at"`
+	ID        int64          `json:"id"`
+}
+
+func (q *Queries) SetUserAvatar(ctx context.Context, arg SetUserAvatarParams) (User, error) {
+	row := q.db.QueryRowContext(ctx, setUserAvatar, arg.Avatar, arg.UpdatedAt, arg.ID)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Username,
+		&i.PasswordHash,
+		&i.Nickname,
+		&i.Avatar,
+		&i.AuthVersion,
+		&i.BannedAt,
+		&i.LastLoginAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const setUserBanned = `-- name: SetUserBanned :exec
 UPDATE users
 SET banned_at = ?, updated_at = ?
@@ -280,27 +311,21 @@ func (q *Queries) TouchUserLastLogin(ctx context.Context, arg TouchUserLastLogin
 	return err
 }
 
-const updateUserProfile = `-- name: UpdateUserProfile :one
+const updateUserNickname = `-- name: UpdateUserNickname :one
 UPDATE users
-SET nickname = ?, avatar = ?, updated_at = ?
+SET nickname = ?, updated_at = ?
 WHERE id = ?
 RETURNING id, username, password_hash, nickname, avatar, auth_version, banned_at, last_login_at, created_at, updated_at
 `
 
-type UpdateUserProfileParams struct {
-	Nickname  string         `json:"nickname"`
-	Avatar    sql.NullString `json:"avatar"`
-	UpdatedAt int64          `json:"updated_at"`
-	ID        int64          `json:"id"`
+type UpdateUserNicknameParams struct {
+	Nickname  string `json:"nickname"`
+	UpdatedAt int64  `json:"updated_at"`
+	ID        int64  `json:"id"`
 }
 
-func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error) {
-	row := q.db.QueryRowContext(ctx, updateUserProfile,
-		arg.Nickname,
-		arg.Avatar,
-		arg.UpdatedAt,
-		arg.ID,
-	)
+func (q *Queries) UpdateUserNickname(ctx context.Context, arg UpdateUserNicknameParams) (User, error) {
+	row := q.db.QueryRowContext(ctx, updateUserNickname, arg.Nickname, arg.UpdatedAt, arg.ID)
 	var i User
 	err := row.Scan(
 		&i.ID,
