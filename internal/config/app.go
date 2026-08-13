@@ -24,7 +24,18 @@ type App struct {
 	RefreshTokenTTL  time.Duration
 	LoginRateLimit   float64 // requests per minute
 	RegistrationMode string  // "open" or "invite"
+	Server           ServerConfig
 	Storage          StorageConfig
+}
+
+// ServerConfig configures the listeners. HTTP binds today; voice_port is
+// reserved for the future voice channel and is not used by the server yet
+// (the transport — KCP, WebRTC, ... — is an implementation detail).
+type ServerConfig struct {
+	Host      string // listen host, e.g. "0.0.0.0"
+	HTTPPort  int    // HTTP/REST listener port
+	VoicePort int    // future voice channel listener port
+	DBPath    string // SQLite database file path
 }
 
 // StorageConfig configures the local object storage backend.
@@ -34,7 +45,13 @@ type StorageConfig struct {
 
 type appConfig struct {
 	JWTSecret string `mapstructure:"jwt_secret"`
-	Storage   struct {
+	Server    struct {
+		Host      string `mapstructure:"host"`
+		HTTPPort  int    `mapstructure:"http_port"`
+		VoicePort int    `mapstructure:"voice_port"`
+		DBPath    string `mapstructure:"db_path"`
+	} `mapstructure:"server"`
+	Storage struct {
 		BaseDir string `mapstructure:"base_dir"`
 	} `mapstructure:"storage"`
 	Auth struct {
@@ -67,29 +84,13 @@ func LoadApp(path string) (*App, error) {
 }
 
 func newApp(cfg appConfig) (*App, error) {
-	if len(cfg.JWTSecret) < 32 {
-		return nil, errors.New("config: jwt_secret must be at least 32 characters")
-	}
-	accessTTL, err := time.ParseDuration(cfg.Auth.AccessTokenTTL)
-	if err != nil || accessTTL <= 0 {
-		return nil, fmt.Errorf("config: invalid access_token_ttl %q", cfg.Auth.AccessTokenTTL)
-	}
-	refreshTTL, err := time.ParseDuration(cfg.Auth.RefreshTokenTTL)
-	if err != nil || refreshTTL <= 0 {
-		return nil, fmt.Errorf("config: invalid refresh_token_ttl %q", cfg.Auth.RefreshTokenTTL)
-	}
-	if cfg.Auth.LoginRateLimit <= 0 {
-		return nil, errors.New("config: login_rate_limit must be positive")
+	accessTTL, refreshTTL, err := validateApp(cfg)
+	if err != nil {
+		return nil, err
 	}
 	mode := cfg.Auth.RegistrationMode
 	if mode == "" {
 		mode = "invite"
-	}
-	if mode != "open" && mode != "invite" {
-		return nil, errors.New(`config: registration_mode must be "open" or "invite"`)
-	}
-	if cfg.Storage.BaseDir == "" {
-		return nil, errors.New("config: storage.base_dir must not be empty")
 	}
 	return &App{
 		JWTSecret:        cfg.JWTSecret,
@@ -97,8 +98,53 @@ func newApp(cfg appConfig) (*App, error) {
 		RefreshTokenTTL:  refreshTTL,
 		LoginRateLimit:   cfg.Auth.LoginRateLimit,
 		RegistrationMode: mode,
-		Storage:          StorageConfig{BaseDir: cfg.Storage.BaseDir},
+		Server: ServerConfig{
+			Host:      cfg.Server.Host,
+			HTTPPort:  cfg.Server.HTTPPort,
+			VoicePort: cfg.Server.VoicePort,
+			DBPath:    cfg.Server.DBPath,
+		},
+		Storage: StorageConfig{BaseDir: cfg.Storage.BaseDir},
 	}, nil
+}
+
+// validateApp checks every config value and returns the parsed token TTLs.
+// registration_mode is allowed to be empty here; newApp fills the default.
+func validateApp(cfg appConfig) (accessTTL, refreshTTL time.Duration, err error) {
+	if len(cfg.JWTSecret) < 32 {
+		return 0, 0, errors.New("config: jwt_secret must be at least 32 characters")
+	}
+	accessTTL, err = time.ParseDuration(cfg.Auth.AccessTokenTTL)
+	if err != nil || accessTTL <= 0 {
+		return 0, 0, fmt.Errorf("config: invalid access_token_ttl %q", cfg.Auth.AccessTokenTTL)
+	}
+	refreshTTL, err = time.ParseDuration(cfg.Auth.RefreshTokenTTL)
+	if err != nil || refreshTTL <= 0 {
+		return 0, 0, fmt.Errorf("config: invalid refresh_token_ttl %q", cfg.Auth.RefreshTokenTTL)
+	}
+	if cfg.Auth.LoginRateLimit <= 0 {
+		return 0, 0, errors.New("config: login_rate_limit must be positive")
+	}
+	mode := cfg.Auth.RegistrationMode
+	if mode != "" && mode != "open" && mode != "invite" {
+		return 0, 0, errors.New(`config: registration_mode must be "open" or "invite"`)
+	}
+	if cfg.Server.Host == "" {
+		return 0, 0, errors.New("config: server.host must not be empty")
+	}
+	if cfg.Server.HTTPPort < 1 || cfg.Server.HTTPPort > 65535 {
+		return 0, 0, errors.New("config: server.http_port must be 1-65535")
+	}
+	if cfg.Server.VoicePort < 1 || cfg.Server.VoicePort > 65535 {
+		return 0, 0, errors.New("config: server.voice_port must be 1-65535")
+	}
+	if cfg.Server.DBPath == "" {
+		return 0, 0, errors.New("config: server.db_path must not be empty")
+	}
+	if cfg.Storage.BaseDir == "" {
+		return 0, 0, errors.New("config: storage.base_dir must not be empty")
+	}
+	return accessTTL, refreshTTL, nil
 }
 
 func ensureDefaultAppFile(path string) error {

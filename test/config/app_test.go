@@ -45,6 +45,9 @@ func TestLoadAppGeneratesDefault(t *testing.T) {
 	if app.Storage.BaseDir != "./data/objects" {
 		t.Fatalf("storage.base_dir = %q, want ./data/objects", app.Storage.BaseDir)
 	}
+	if app.Server.Host != "0.0.0.0" || app.Server.HTTPPort != 8745 || app.Server.VoicePort != 8746 || app.Server.DBPath != "./data/zephyr.db" {
+		t.Fatalf("server = %+v, want 0.0.0.0:8745 voice 8746 db ./data/zephyr.db", app.Server)
+	}
 
 	info, err := os.Stat(path)
 	if err != nil {
@@ -69,6 +72,12 @@ access_token_ttl = "30m"
 refresh_token_ttl = "168h"
 login_rate_limit = 5
 
+[server]
+host = "0.0.0.0"
+http_port = 9000
+voice_port = 9091
+db_path = "/tmp/zephyr.db"
+
 [storage]
 base_dir = "./data/objects"
 `
@@ -86,6 +95,9 @@ base_dir = "./data/objects"
 	if app.Storage.BaseDir != "./data/objects" {
 		t.Fatalf("storage.base_dir = %q, want ./data/objects", app.Storage.BaseDir)
 	}
+	if app.Server.Host != "0.0.0.0" || app.Server.HTTPPort != 9000 || app.Server.VoicePort != 9091 || app.Server.DBPath != "/tmp/zephyr.db" {
+		t.Fatalf("server = %+v, want 0.0.0.0:9000 voice 9091 db /tmp/zephyr.db", app.Server)
+	}
 }
 
 func TestLoadAppRejectsShortSecret(t *testing.T) {
@@ -96,6 +108,12 @@ jwt_secret = "short"
 access_token_ttl = "15m"
 refresh_token_ttl = "720h"
 login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
 
 [storage]
 base_dir = "./data/objects"
@@ -115,6 +133,12 @@ access_token_ttl = "abc"
 refresh_token_ttl = "720h"
 login_rate_limit = 10
 
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
 [storage]
 base_dir = "./data/objects"
 `)
@@ -132,6 +156,12 @@ jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
 access_token_ttl = "15m"
 refresh_token_ttl = "720h"
 login_rate_limit = 0
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
 
 [storage]
 base_dir = "./data/objects"
@@ -151,6 +181,12 @@ access_token_ttl = "15m"
 refresh_token_ttl = "720h"
 login_rate_limit = 10
 registration_mode = "open"
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
 
 [storage]
 base_dir = "./data/objects"
@@ -177,6 +213,12 @@ refresh_token_ttl = "720h"
 login_rate_limit = 10
 registration_mode = "closed"
 
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
 [storage]
 base_dir = "./data/objects"
 `)
@@ -194,6 +236,12 @@ jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
 access_token_ttl = "15m"
 refresh_token_ttl = "720h"
 login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
 
 [storage]
 base_dir = "/tmp/objects"
@@ -215,9 +263,138 @@ jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
 access_token_ttl = "15m"
 refresh_token_ttl = "720h"
 login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
 `)
 	_, err := config.LoadApp(path)
 	if err == nil || !strings.Contains(err.Error(), "storage.base_dir") {
 		t.Fatalf("want storage.base_dir error, got %v", err)
+	}
+}
+
+func TestLoadAppCustomServer(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "127.0.0.1"
+http_port = 9090
+voice_port = 9091
+db_path = "/var/lib/zephyr/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Server.Host != "127.0.0.1" || app.Server.HTTPPort != 9090 || app.Server.VoicePort != 9091 || app.Server.DBPath != "/var/lib/zephyr/zephyr.db" {
+		t.Fatalf("server = %+v, want custom values", app.Server)
+	}
+}
+
+func TestLoadAppRejectsEmptyServerHost(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = ""
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "server.host") {
+		t.Fatalf("want server.host error, got %v", err)
+	}
+}
+
+func TestLoadAppRejectsInvalidHTTPPort(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 0
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "server.http_port") {
+		t.Fatalf("want server.http_port error, got %v", err)
+	}
+}
+
+func TestLoadAppRejectsInvalidVoicePort(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 70000
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "server.voice_port") {
+		t.Fatalf("want server.voice_port error, got %v", err)
+	}
+}
+
+func TestLoadAppRejectsEmptyServerDBPath(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = ""
+
+[storage]
+base_dir = "./data/objects"
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "server.db_path") {
+		t.Fatalf("want server.db_path error, got %v", err)
 	}
 }

@@ -8,5 +8,11 @@ refresh_token_ttl = "720h"
 login_rate_limit = 10
 registration_mode = "invite"
 
+[server]
+host = "0.0.0.0"
+http_port = 8745
+voice_port = 8746
+db_path = "./data/zephyr.db"
+
 [storage]
 base_dir = "./data/objects"
