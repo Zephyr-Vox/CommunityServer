@@ -52,6 +52,10 @@ func TestLoadAppGeneratesDefault(t *testing.T) {
 	if app.Server.Host != "0.0.0.0" || app.Server.HTTPPort != 8745 || app.Server.VoicePort != 8746 || app.Server.DBPath != "./data/zephyr.db" {
 		t.Fatalf("server = %+v, want 0.0.0.0:8745 voice 8746 db ./data/zephyr.db", app.Server)
 	}
+	if app.Server.TLSMode != config.TLSModeRequired || app.Server.TLSCertPath != "./data/tls" ||
+		app.Server.TLSCertValidYears != 10 || len(app.Server.TLSCertExtraSANs) != 0 {
+		t.Fatalf("tls = %+v, want required ./data/tls 10y no extra sans", app.Server)
+	}
 	if app.Log.Level != slog.LevelInfo || app.Log.Path != "./data/logs" || app.Log.ArchiveKeep != 7 {
 		t.Fatalf("log = %+v, want info ./data/logs keep 7", app.Log)
 	}
@@ -403,6 +407,258 @@ base_dir = "./data/objects"
 	_, err := config.LoadApp(path)
 	if err == nil || !strings.Contains(err.Error(), "server.db_path") {
 		t.Fatalf("want server.db_path error, got %v", err)
+	}
+}
+
+func TestLoadAppDefaultsTLSWhenFieldsMissing(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "/tmp/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Server.TLSMode != config.TLSModeRequired {
+		t.Fatalf("tls_mode = %q, want required", app.Server.TLSMode)
+	}
+	if app.Server.TLSCertPath != "/tmp/tls" {
+		t.Fatalf("tls_cert_path = %q, want /tmp/tls", app.Server.TLSCertPath)
+	}
+	if app.Server.TLSCertValidYears != 10 {
+		t.Fatalf("tls_cert_valid_years = %d, want 10", app.Server.TLSCertValidYears)
+	}
+}
+
+func TestLoadAppCustomTLSConfig(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+tls_mode = "optional"
+tls_cert = "/certs/server.crt"
+tls_key = "/certs/server.key"
+tls_cert_path = "/var/lib/zephyr/tls"
+tls_cert_valid_years = 5
+tls_cert_extra_sans = ["", "  voice.example.com  ", "10.0.0.1"]
+
+[storage]
+base_dir = "./data/objects"
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := app.Server
+	if s.TLSMode != config.TLSModeOptional || s.TLSCert != "/certs/server.crt" || s.TLSKey != "/certs/server.key" {
+		t.Fatalf("tls file mode = %+v", s)
+	}
+	if s.TLSCertPath != "/var/lib/zephyr/tls" || s.TLSCertValidYears != 5 {
+		t.Fatalf("tls generation config = %+v", s)
+	}
+	if len(s.TLSCertExtraSANs) != 2 || s.TLSCertExtraSANs[0] != "voice.example.com" || s.TLSCertExtraSANs[1] != "10.0.0.1" {
+		t.Fatalf("tls_cert_extra_sans = %v", s.TLSCertExtraSANs)
+	}
+}
+
+func TestLoadAppRejectsOffWithCertPaths(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+tls_mode = "off"
+tls_cert = "/certs/server.crt"
+
+[storage]
+base_dir = "./data/objects"
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "tls_mode = off") {
+		t.Fatalf("want tls_mode = off error, got %v", err)
+	}
+}
+
+func TestLoadAppRejectsSingleCertPath(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+tls_mode = "required"
+tls_cert = "/certs/server.crt"
+
+[storage]
+base_dir = "./data/objects"
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "tls_cert and server.tls_key") {
+		t.Fatalf("want tls_cert/tls_key error, got %v", err)
+	}
+}
+
+func TestLoadAppRejectsInvalidTLSMode(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+tls_mode = "sometimes"
+
+[storage]
+base_dir = "./data/objects"
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "tls_mode") {
+		t.Fatalf("want tls_mode error, got %v", err)
+	}
+}
+
+func TestLoadAppRejectsInvalidCertValidYears(t *testing.T) {
+	for _, years := range []string{"0", "101"} {
+		path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+tls_cert_valid_years = `+years+`
+
+[storage]
+base_dir = "./data/objects"
+`)
+		_, err := config.LoadApp(path)
+		if err == nil || !strings.Contains(err.Error(), "tls_cert_valid_years") {
+			t.Fatalf("years %s: want tls_cert_valid_years error, got %v", years, err)
+		}
+	}
+}
+
+func TestLoadAppRejectsInvalidExtraSAN(t *testing.T) {
+	invalid := []string{
+		"bad/name",
+		"bad,comma",
+		"foo..bar",
+		"a[b]",
+		"a=b",
+		"-bad.example.com",
+		"bad-.example.com",
+		"*.",
+		"foo.*.example.com",
+		"*foo.example.com",
+		strings.Repeat("a", 64) + ".example.com",
+		strings.Repeat("a.", 126) + "com",
+	}
+	for _, san := range invalid {
+		path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+tls_cert_extra_sans = ["`+san+`"]
+
+[storage]
+base_dir = "./data/objects"
+`)
+		_, err := config.LoadApp(path)
+		if err == nil || !strings.Contains(err.Error(), "tls_cert_extra_sans") {
+			t.Fatalf("san %q: want tls_cert_extra_sans error, got %v", san, err)
+		}
+	}
+}
+
+func TestLoadAppAcceptsWildcardAndNormalizesSAN(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+tls_cert_extra_sans = ["*.example.com", "VOICE.Example.COM", "10.0.0.1"]
+
+[storage]
+base_dir = "./data/objects"
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"*.example.com", "voice.example.com", "10.0.0.1"}
+	if len(app.Server.TLSCertExtraSANs) != len(want) {
+		t.Fatalf("sans = %v, want %v", app.Server.TLSCertExtraSANs, want)
+	}
+	for i := range want {
+		if app.Server.TLSCertExtraSANs[i] != want[i] {
+			t.Fatalf("sans = %v, want %v", app.Server.TLSCertExtraSANs, want)
+		}
 	}
 }
 

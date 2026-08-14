@@ -405,9 +405,9 @@ func newCertificateTemplate(cfg Config, now time.Time) (*x509.Certificate, error
 	for _, san := range cfg.ExtraSANs {
 		// Blank and whitespace-only entries would produce an invalid empty
 		// dNSName that x509.CreateCertificate does not reject but strict TLS
-		// tooling may. Trim and skip them defensively; the config layer also
-		// validates, but this package should not emit a broken certificate
-		// even when called directly.
+		// tooling may. Trim and skip them defensively; full DNS/IP validation
+		// is the config layer's responsibility, so callers that construct a
+		// Config by hand must validate their own SANs.
 		san = strings.TrimSpace(san)
 		if san == "" {
 			continue

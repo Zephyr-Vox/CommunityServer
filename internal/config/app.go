@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,14 +32,35 @@ type App struct {
 	Log              LogConfig
 }
 
+const (
+	// TLSModeOff disables TLS entirely: the control plane is plaintext and no
+	// certificate is generated or loaded.
+	TLSModeOff = "off"
+	// TLSModeOptional serves plaintext and TLS on the same HTTP port.
+	TLSModeOptional = "optional"
+	// TLSModeRequired serves TLS only; plaintext requests never connect.
+	TLSModeRequired = "required"
+
+	// defaultTLSCertValidYears is the auto-generated certificate lifetime.
+	// It is an availability default, not a security claim: renewal reuses the
+	// same private key, so key lifetime is controlled by rotation policy.
+	defaultTLSCertValidYears = 10
+)
+
 // ServerConfig configures the listeners. HTTP binds today; voice_port is
 // reserved for the future voice channel and is not used by the server yet
 // (the transport — KCP, WebRTC, ... — is an implementation detail).
 type ServerConfig struct {
-	Host      string // listen host, e.g. "0.0.0.0"
-	HTTPPort  int    // HTTP/REST listener port
-	VoicePort int    // future voice channel listener port
-	DBPath    string // SQLite database file path
+	Host              string   // listen host, e.g. "0.0.0.0"
+	HTTPPort          int      // HTTP/REST listener port
+	VoicePort         int      // future voice channel listener port
+	DBPath            string   // SQLite database file path
+	TLSMode           string   // "off", "optional" or "required"
+	TLSCert           string   // PEM certificate path; empty + empty key = auto mode
+	TLSKey            string   // PEM private key path; empty + empty cert = auto mode
+	TLSCertPath       string   // auto-mode certificate store path
+	TLSCertValidYears int      // auto-mode certificate validity in years
+	TLSCertExtraSANs  []string // additional DNS names / IPs appended to defaults
 }
 
 // StorageConfig configures the local object storage backend.
@@ -67,10 +89,16 @@ type LogConfig struct {
 type appConfig struct {
 	JWTSecret string `mapstructure:"jwt_secret"`
 	Server    struct {
-		Host      string `mapstructure:"host"`
-		HTTPPort  int    `mapstructure:"http_port"`
-		VoicePort int    `mapstructure:"voice_port"`
-		DBPath    string `mapstructure:"db_path"`
+		Host              string   `mapstructure:"host"`
+		HTTPPort          int      `mapstructure:"http_port"`
+		VoicePort         int      `mapstructure:"voice_port"`
+		DBPath            string   `mapstructure:"db_path"`
+		TLSMode           string   `mapstructure:"tls_mode"`
+		TLSCert           string   `mapstructure:"tls_cert"`
+		TLSKey            string   `mapstructure:"tls_key"`
+		TLSCertPath       string   `mapstructure:"tls_cert_path"`
+		TLSCertValidYears *int     `mapstructure:"tls_cert_valid_years"`
+		TLSCertExtraSANs  []string `mapstructure:"tls_cert_extra_sans"`
 	} `mapstructure:"server"`
 	Storage struct {
 		BaseDir string `mapstructure:"base_dir"`
@@ -128,6 +156,10 @@ func newApp(cfg appConfig) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	serverCfg, err := validateServerTLS(cfg)
+	if err != nil {
+		return nil, err
+	}
 	mode := cfg.Auth.RegistrationMode
 	if mode == "" {
 		mode = "invite"
@@ -138,20 +170,122 @@ func newApp(cfg appConfig) (*App, error) {
 		RefreshTokenTTL:  refreshTTL,
 		LoginRateLimit:   cfg.Auth.LoginRateLimit,
 		RegistrationMode: mode,
-		Server: ServerConfig{
-			Host:      cfg.Server.Host,
-			HTTPPort:  cfg.Server.HTTPPort,
-			VoicePort: cfg.Server.VoicePort,
-			DBPath:    cfg.Server.DBPath,
-		},
-		Storage: StorageConfig{BaseDir: cfg.Storage.BaseDir},
-		Avatar:  avatar,
+		Server:           serverCfg,
+		Storage:          StorageConfig{BaseDir: cfg.Storage.BaseDir},
+		Avatar:           avatar,
 		Log: LogConfig{
 			Level:       logLevel,
 			Path:        logPath,
 			ArchiveKeep: logKeep,
 		},
 	}, nil
+}
+
+// validateServerTLS fills TLS defaults and validates the [server] TLS block.
+// It is separate from validateApp so basic listener checks stay readable and
+// the TLS defaults are applied in exactly one place.
+func validateServerTLS(cfg appConfig) (ServerConfig, error) {
+	s := ServerConfig{
+		Host:      cfg.Server.Host,
+		HTTPPort:  cfg.Server.HTTPPort,
+		VoicePort: cfg.Server.VoicePort,
+		DBPath:    cfg.Server.DBPath,
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.Server.TLSMode))
+	if mode == "" {
+		// Secure default: an existing hand-written config without tls_mode
+		// must not silently downgrade to plaintext.
+		mode = TLSModeRequired
+	}
+	if mode != TLSModeOff && mode != TLSModeOptional && mode != TLSModeRequired {
+		return ServerConfig{}, errors.New(`config: server.tls_mode must be "off", "optional" or "required"`)
+	}
+	s.TLSMode = mode
+	s.TLSCert = cfg.Server.TLSCert
+	s.TLSKey = cfg.Server.TLSKey
+	if mode == TLSModeOff {
+		if s.TLSCert != "" || s.TLSKey != "" {
+			return ServerConfig{}, errors.New("config: server.tls_cert and server.tls_key must be empty when tls_mode = off")
+		}
+	} else if (s.TLSCert == "") != (s.TLSKey == "") {
+		return ServerConfig{}, errors.New("config: server.tls_cert and server.tls_key must both be set or both be empty")
+	}
+
+	path := strings.TrimSpace(cfg.Server.TLSCertPath)
+	if path == "" {
+		path = filepath.Join(filepath.Dir(s.DBPath), "tls")
+	}
+	s.TLSCertPath = path
+
+	years := defaultTLSCertValidYears
+	if cfg.Server.TLSCertValidYears != nil {
+		years = *cfg.Server.TLSCertValidYears
+	}
+	if years < 1 || years > 100 {
+		return ServerConfig{}, errors.New("config: server.tls_cert_valid_years must be 1-100")
+	}
+	s.TLSCertValidYears = years
+
+	sans := make([]string, 0, len(cfg.Server.TLSCertExtraSANs))
+	for _, san := range cfg.Server.TLSCertExtraSANs {
+		san = strings.ToLower(strings.TrimSpace(san))
+		if san == "" {
+			continue
+		}
+		if net.ParseIP(san) != nil {
+			sans = append(sans, san)
+			continue
+		}
+		if !validDNSName(san) {
+			return ServerConfig{}, errors.New("config: server.tls_cert_extra_sans contains an invalid DNS name")
+		}
+		sans = append(sans, san)
+	}
+	s.TLSCertExtraSANs = sans
+	return s, nil
+}
+
+// validDNSName reports whether name is a valid DNS name for a certificate
+// SAN: ASCII letters/digits/hyphens per label, labels 1-63 chars, total at
+// most 253 chars, and at most one leftmost "*." wildcard. IP literals are
+// handled by net.ParseIP before this is called.
+func validDNSName(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	if strings.HasPrefix(name, "*.") {
+		name = name[2:]
+		if name == "" {
+			return false
+		}
+	} else if strings.Contains(name, "*") {
+		return false
+	}
+	if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") || strings.Contains(name, "..") {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if !validDNSLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+func validDNSLabel(label string) bool {
+	if len(label) < 1 || len(label) > 63 {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for _, r := range label {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // validateApp checks every config value and returns the parsed token TTLs.
