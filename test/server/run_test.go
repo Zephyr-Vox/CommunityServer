@@ -205,6 +205,10 @@ func TestRunOptionalSurvivesEmptyAndIdleConnections(t *testing.T) {
 	cfg.Server.TLSCertPath = filepath.Join(dir, "tls")
 
 	addr, cancel, done := startRun(t, cfg)
+	// startRun returns as soon as Run is dispatched to a goroutine; wait for
+	// the listener to be up before opening raw connections, otherwise the
+	// dials race net.Listen and fail intermittently with connection refused.
+	waitReady(t, &http.Client{Timeout: 2 * time.Second}, "http://"+addr)
 
 	// A client that connects and immediately closes must be dropped without
 	// killing the listener.
