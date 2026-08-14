@@ -47,13 +47,17 @@ func TestParseAccessRejectsTampered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tampered := token[:len(token)-1]
-	if token[len(token)-1] == 'a' {
-		tampered += "b"
+	// Replace a character in the signature. The final base64url character
+	// carries ignored padding bits, so mutating only it can leave the decoded
+	// signature unchanged (e.g. 'Y' -> 'a'); the second-to-last character is
+	// fully significant, so the tamper always changes the signature.
+	tampered := []byte(token)
+	if tampered[len(tampered)-2] == 'A' {
+		tampered[len(tampered)-2] = 'B'
 	} else {
-		tampered += "a"
+		tampered[len(tampered)-2] = 'A'
 	}
-	if _, err := auth.ParseAccess(secret, tampered); err == nil {
+	if _, err := auth.ParseAccess(secret, string(tampered)); err == nil {
 		t.Fatal("tampered token must be rejected")
 	}
 }
