@@ -13,7 +13,7 @@ host = "0.0.0.0"   # 监听地址；join URL 会用它，公网部署请填实�
 http_port = 8745
 voice_port = 8746
 db_path = "./data/zephyr.db"
-tls_mode = "required"          # off | optional | required
+tls_mode = "required"          # off | required
 tls_cert = ""                  # PEM 证书路径；空 = 自动生成自签证书
 tls_key = ""                   # PEM 私钥路径；空 = 自动生成
 tls_cert_path = "./data/tls"   # 自动模式证书存储路径；与 db_path 同步调整

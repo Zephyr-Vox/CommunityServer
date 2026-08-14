@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -457,7 +458,7 @@ host = "0.0.0.0"
 http_port = 8080
 voice_port = 8081
 db_path = "./data/zephyr.db"
-tls_mode = "optional"
+tls_mode = "required"
 tls_cert = "/certs/server.crt"
 tls_key = "/certs/server.key"
 tls_cert_path = "/var/lib/zephyr/tls"
@@ -472,7 +473,7 @@ base_dir = "./data/objects"
 		t.Fatal(err)
 	}
 	s := app.Server
-	if s.TLSMode != config.TLSModeOptional || s.TLSCert != "/certs/server.crt" || s.TLSKey != "/certs/server.key" {
+	if s.TLSMode != config.TLSModeRequired || s.TLSCert != "/certs/server.crt" || s.TLSKey != "/certs/server.key" {
 		t.Fatalf("tls file mode = %+v", s)
 	}
 	if s.TLSCertPath != "/var/lib/zephyr/tls" || s.TLSCertValidYears != 5 {
@@ -536,7 +537,8 @@ base_dir = "./data/objects"
 }
 
 func TestLoadAppRejectsInvalidTLSMode(t *testing.T) {
-	path := writeApp(t, `
+	for _, mode := range []string{"sometimes", "optional"} {
+		path := writeApp(t, fmt.Sprintf(`
 jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
 
 [auth]
@@ -549,14 +551,15 @@ host = "0.0.0.0"
 http_port = 8080
 voice_port = 8081
 db_path = "./data/zephyr.db"
-tls_mode = "sometimes"
+tls_mode = %q
 
 [storage]
 base_dir = "./data/objects"
-`)
-	_, err := config.LoadApp(path)
-	if err == nil || !strings.Contains(err.Error(), "tls_mode") {
-		t.Fatalf("want tls_mode error, got %v", err)
+`, mode))
+		_, err := config.LoadApp(path)
+		if err == nil || !strings.Contains(err.Error(), "tls_mode") {
+			t.Fatalf("tls_mode %q: want tls_mode error, got %v", mode, err)
+		}
 	}
 }
 

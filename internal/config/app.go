@@ -36,8 +36,6 @@ const (
 	// TLSModeOff disables TLS entirely: the control plane is plaintext and no
 	// certificate is generated or loaded.
 	TLSModeOff = "off"
-	// TLSModeOptional serves plaintext and TLS on the same HTTP port.
-	TLSModeOptional = "optional"
 	// TLSModeRequired serves TLS only; plaintext requests never connect.
 	TLSModeRequired = "required"
 
@@ -55,7 +53,7 @@ type ServerConfig struct {
 	HTTPPort          int      // HTTP/REST listener port
 	VoicePort         int      // future voice channel listener port
 	DBPath            string   // SQLite database file path
-	TLSMode           string   // "off", "optional" or "required"
+	TLSMode           string   // "off" or "required"
 	TLSCert           string   // PEM certificate path; empty + empty key = auto mode
 	TLSKey            string   // PEM private key path; empty + empty cert = auto mode
 	TLSCertPath       string   // auto-mode certificate store path
@@ -197,8 +195,8 @@ func validateServerTLS(cfg appConfig) (ServerConfig, error) {
 		// must not silently downgrade to plaintext.
 		mode = TLSModeRequired
 	}
-	if mode != TLSModeOff && mode != TLSModeOptional && mode != TLSModeRequired {
-		return ServerConfig{}, errors.New(`config: server.tls_mode must be "off", "optional" or "required"`)
+	if mode != TLSModeOff && mode != TLSModeRequired {
+		return ServerConfig{}, errors.New(`config: server.tls_mode must be "off" or "required"`)
 	}
 	s.TLSMode = mode
 	s.TLSCert = cfg.Server.TLSCert

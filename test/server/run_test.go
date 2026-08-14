@@ -226,28 +226,11 @@ func TestRunRequiredRoutesTLSHandshakeErrorsThroughSlog(t *testing.T) {
 	}
 }
 
-func TestRunOptionalServesPlaintextAndTLS(t *testing.T) {
+func TestRunRequiredServesHTTP2(t *testing.T) {
 	dir := t.TempDir()
 	port := freePort(t)
 	cfg := testConfig(dir, port)
-	cfg.Server.TLSMode = config.TLSModeOptional
-	cfg.Server.TLSCertPath = filepath.Join(dir, "tls")
-
-	addr, cancel, done := startRun(t, cfg)
-	waitReady(t, insecureHTTPSClient(2*time.Second), "https://"+addr)
-	waitReady(t, &http.Client{Timeout: 2 * time.Second}, "http://"+addr)
-
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("Run returned error after cancel: %v", err)
-	}
-}
-
-func TestRunOptionalServesHTTP2(t *testing.T) {
-	dir := t.TempDir()
-	port := freePort(t)
-	cfg := testConfig(dir, port)
-	cfg.Server.TLSMode = config.TLSModeOptional
+	cfg.Server.TLSMode = config.TLSModeRequired
 	cfg.Server.TLSCertPath = filepath.Join(dir, "tls")
 
 	addr, cancel, done := startRun(t, cfg)
@@ -291,44 +274,6 @@ func TestRunOffRejectsTLS(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Run returned error after cancel: %v", err)
-	}
-}
-
-func TestRunOptionalSurvivesEmptyAndIdleConnections(t *testing.T) {
-	dir := t.TempDir()
-	port := freePort(t)
-	cfg := testConfig(dir, port)
-	cfg.Server.TLSMode = config.TLSModeOptional
-	cfg.Server.TLSCertPath = filepath.Join(dir, "tls")
-
-	addr, cancel, done := startRun(t, cfg)
-	// startRun returns as soon as Run is dispatched to a goroutine; wait for
-	// the listener to be up before opening raw connections, otherwise the
-	// dials race net.Listen and fail intermittently with connection refused.
-	waitReady(t, &http.Client{Timeout: 2 * time.Second}, "http://"+addr)
-
-	// A client that connects and immediately closes must be dropped without
-	// killing the listener.
-	empty, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	empty.Close()
-
-	// An idle client that never sends a byte must not block the accept loop;
-	// classification happens concurrently and times out on its own.
-	idle, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer idle.Close()
-
-	waitReady(t, insecureHTTPSClient(2*time.Second), "https://"+addr)
-	waitReady(t, &http.Client{Timeout: 2 * time.Second}, "http://"+addr)
-
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("Run returned error after empty/idle connections: %v", err)
 	}
 }
 

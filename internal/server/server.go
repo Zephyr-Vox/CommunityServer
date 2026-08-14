@@ -13,7 +13,6 @@ import (
 
 	"zephyr.vox/server/ce/internal/cert"
 	"zephyr.vox/server/ce/internal/config"
-	"zephyr.vox/server/ce/internal/protocol"
 	"zephyr.vox/server/ce/internal/servercard"
 )
 
@@ -58,9 +57,9 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 		// Plaintext only: no certificate is loaded or generated.
 		if runOpts.ForceRegenerateCert {
 			ln.Close()
-			return errors.New("server: -force-regenerate-cert requires tls_mode optional or required")
+			return errors.New("server: -force-regenerate-cert requires tls_mode required")
 		}
-	case config.TLSModeRequired, config.TLSModeOptional:
+	case config.TLSModeRequired:
 		bundle, err := cert.LoadOrCreate(cert.Config{
 			StorePath:  a.cfg.Server.TLSCertPath,
 			CertFile:   a.cfg.Server.TLSCert,
@@ -77,11 +76,7 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 			NextProtos:   []string{"h2", "http/1.1"},
 			Certificates: []tls.Certificate{bundle.Certificate},
 		}
-		if mode == config.TLSModeRequired {
-			ln = tls.NewListener(ln, tlsCfg)
-		} else {
-			ln = protocol.NewHTTPDemuxListener(ln, tlsCfg)
-		}
+		ln = tls.NewListener(ln, tlsCfg)
 		joinURL := ""
 		if !isWildcardHost(a.cfg.Server.Host) {
 			card, err := servercard.New(a.cfg.Server.Host, a.cfg.Server.HTTPPort, bundle.Fingerprint, "", true)
