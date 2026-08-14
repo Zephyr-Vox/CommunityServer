@@ -74,7 +74,7 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 		}
 		tlsCfg := &tls.Config{
 			MinVersion:   tls.VersionTLS12,
-			NextProtos:   []string{"http/1.1"},
+			NextProtos:   []string{"h2", "http/1.1"},
 			Certificates: []tls.Certificate{bundle.Certificate},
 		}
 		if mode == config.TLSModeRequired {

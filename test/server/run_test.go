@@ -243,6 +243,36 @@ func TestRunOptionalServesPlaintextAndTLS(t *testing.T) {
 	}
 }
 
+func TestRunOptionalServesHTTP2(t *testing.T) {
+	dir := t.TempDir()
+	port := freePort(t)
+	cfg := testConfig(dir, port)
+	cfg.Server.TLSMode = config.TLSModeOptional
+	cfg.Server.TLSCertPath = filepath.Join(dir, "tls")
+
+	addr, cancel, done := startRun(t, cfg)
+	client := &http.Client{Transport: &http.Transport{
+		ForceAttemptHTTP2: true,
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+	}}
+	resp, err := client.Get("https://" + addr + "/api/v0/auth/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if resp.ProtoMajor != 2 {
+		t.Fatalf("negotiated %s, want HTTP/2", resp.Proto)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error after cancel: %v", err)
+	}
+}
+
 func TestRunOffRejectsTLS(t *testing.T) {
 	dir := t.TempDir()
 	port := freePort(t)
