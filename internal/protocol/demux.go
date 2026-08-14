@@ -1,4 +1,7 @@
-package server
+// Package protocol demultiplexes TCP connections by their first byte so a
+// single port can serve plaintext HTTP and TLS. It has no dependency on Echo
+// or config; callers wire the returned listener into net/http.
+package protocol
 
 import (
 	"bufio"
@@ -9,20 +12,21 @@ import (
 )
 
 const (
-	// sniffTimeout bounds how long an accepted connection may wait for its
-	// first byte. Without it, an idle client would occupy a classification
-	// goroutine forever; with it, dead connections are dropped quickly.
-	sniffTimeout = 3 * time.Second
-	// sniffQueueSize bounds how many classified connections can wait for
+	// firstByteTimeout bounds how long an accepted connection may wait for
+	// its first byte. Without it, an idle client would occupy a
+	// classification goroutine forever; with it, dead connections are
+	// dropped quickly.
+	firstByteTimeout = 3 * time.Second
+	// classifyQueueSize bounds how many classified connections can wait for
 	// http.Server to accept them before classification backpressure applies.
-	sniffQueueSize = 64
+	classifyQueueSize = 64
 )
 
-// sniffListener serves plaintext HTTP and TLS on the same TCP port for
-// tls_mode = optional. A background accept loop accepts raw connections and
-// classifies each one concurrently, so an empty or idle connection can never
-// block the accept loop or surface as a fatal Serve error.
-type sniffListener struct {
+// HTTPDemuxListener serves plaintext HTTP and TLS on the same TCP port. A
+// background accept loop accepts raw connections and classifies each one
+// concurrently, so an empty or idle connection can never block the accept
+// loop or surface as a fatal Serve error.
+type HTTPDemuxListener struct {
 	net.Listener
 	tlsConfig *tls.Config
 	conns     chan net.Conn
@@ -32,18 +36,20 @@ type sniffListener struct {
 	acceptErr error
 }
 
-func newSniffListener(ln net.Listener, tlsConfig *tls.Config) net.Listener {
-	l := &sniffListener{
+// NewHTTPDemuxListener wraps ln and returns a listener whose Accept yields
+// connections already classified as TLS or plaintext HTTP.
+func NewHTTPDemuxListener(ln net.Listener, tlsConfig *tls.Config) net.Listener {
+	l := &HTTPDemuxListener{
 		Listener:  ln,
 		tlsConfig: tlsConfig,
-		conns:     make(chan net.Conn, sniffQueueSize),
+		conns:     make(chan net.Conn, classifyQueueSize),
 		closed:    make(chan struct{}),
 	}
 	go l.acceptLoop()
 	return l
 }
 
-func (l *sniffListener) acceptLoop() {
+func (l *HTTPDemuxListener) acceptLoop() {
 	for {
 		conn, err := l.Listener.Accept()
 		if err != nil {
@@ -59,8 +65,8 @@ func (l *sniffListener) acceptLoop() {
 	}
 }
 
-func (l *sniffListener) classify(conn net.Conn) {
-	if err := conn.SetReadDeadline(time.Now().Add(sniffTimeout)); err != nil {
+func (l *HTTPDemuxListener) classify(conn net.Conn) {
+	if err := conn.SetReadDeadline(time.Now().Add(firstByteTimeout)); err != nil {
 		conn.Close()
 		return
 	}
@@ -90,7 +96,7 @@ func (l *sniffListener) classify(conn net.Conn) {
 	}
 }
 
-func (l *sniffListener) Accept() (net.Conn, error) {
+func (l *HTTPDemuxListener) Accept() (net.Conn, error) {
 	l.mu.Lock()
 	err := l.acceptErr
 	l.mu.Unlock()
@@ -105,13 +111,13 @@ func (l *sniffListener) Accept() (net.Conn, error) {
 	}
 }
 
-func (l *sniffListener) Close() error {
+func (l *HTTPDemuxListener) Close() error {
 	l.closeOnce.Do(func() { close(l.closed) })
 	return l.Listener.Close()
 }
 
-// bufferedConn preserves the bytes already read by the sniffing bufio.Reader;
-// net/http will then see the complete request/TLS stream.
+// bufferedConn preserves the bytes already read by the classifying
+// bufio.Reader; net/http will then see the complete request/TLS stream.
 type bufferedConn struct {
 	net.Conn
 	r *bufio.Reader

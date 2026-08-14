@@ -13,6 +13,7 @@ import (
 
 	"zephyr.vox/server/ce/internal/cert"
 	"zephyr.vox/server/ce/internal/config"
+	"zephyr.vox/server/ce/internal/protocol"
 	"zephyr.vox/server/ce/internal/servercard"
 )
 
@@ -79,7 +80,7 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 		if mode == config.TLSModeRequired {
 			ln = tls.NewListener(ln, tlsCfg)
 		} else {
-			ln = newSniffListener(ln, tlsCfg)
+			ln = protocol.NewHTTPDemuxListener(ln, tlsCfg)
 		}
 		joinURL := ""
 		if !isWildcardHost(a.cfg.Server.Host) {
