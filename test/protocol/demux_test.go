@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"net/http"
@@ -23,7 +24,11 @@ func startDemuxServer(t *testing.T, handler http.Handler) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	demux := protocol.NewHTTPDemuxListener(ln, testTLSConfig(t))
+	return serveDemux(t, protocol.NewHTTPDemuxListener(ln, testTLSConfig(t)), handler)
+}
+
+func serveDemux(t *testing.T, demux net.Listener, handler http.Handler) string {
+	t.Helper()
 	srv := &http.Server{Handler: handler}
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(demux) }()
@@ -35,7 +40,26 @@ func startDemuxServer(t *testing.T, handler http.Handler) string {
 			t.Error("demux server did not stop")
 		}
 	})
-	return ln.Addr().String()
+	return demux.Addr().String()
+}
+
+type temporaryError struct{}
+
+func (temporaryError) Error() string   { return "temporary accept error" }
+func (temporaryError) Timeout() bool   { return false }
+func (temporaryError) Temporary() bool { return true }
+
+type flakyListener struct {
+	net.Listener
+	failures int
+}
+
+func (l *flakyListener) Accept() (net.Conn, error) {
+	if l.failures > 0 {
+		l.failures--
+		return nil, temporaryError{}
+	}
+	return l.Listener.Accept()
 }
 
 func testTLSConfig(t *testing.T) *tls.Config {
@@ -124,5 +148,52 @@ func TestHTTPDemuxListenerSurvivesEmptyAndIdleConnections(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status after empty/idle connections = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestHTTPDemuxListenerRetriesTemporaryAcceptErrors(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	flaky := &flakyListener{Listener: ln, failures: 3}
+	addr := serveDemux(t, protocol.NewHTTPDemuxListener(flaky, testTLSConfig(t)), http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	resp, err := http.Get("http://" + addr + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status after temporary accept errors = %d, want 200", resp.StatusCode)
+	}
+}
+
+var errPermanentAccept = errors.New("permanent accept error")
+
+type permanentErrorListener struct{}
+
+func (permanentErrorListener) Accept() (net.Conn, error) { return nil, errPermanentAccept }
+func (permanentErrorListener) Close() error              { return nil }
+func (permanentErrorListener) Addr() net.Addr            { return nil }
+
+func TestHTTPDemuxListenerStopsOnPermanentAcceptError(t *testing.T) {
+	demux := protocol.NewHTTPDemuxListener(permanentErrorListener{}, testTLSConfig(t))
+	defer demux.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := demux.Accept()
+		errCh <- err
+	}()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, errPermanentAccept) {
+			t.Fatalf("Accept error = %v, want permanent accept error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Accept did not return permanent error")
 	}
 }

@@ -28,39 +28,62 @@ const (
 // loop or surface as a fatal Serve error.
 type HTTPDemuxListener struct {
 	net.Listener
-	tlsConfig *tls.Config
-	conns     chan net.Conn
-	closed    chan struct{}
-	closeOnce sync.Once
-	mu        sync.Mutex
-	acceptErr error
+	tlsConfig  *tls.Config
+	conns      chan net.Conn
+	closed     chan struct{}
+	acceptDone chan struct{}
+	closeOnce  sync.Once
+	mu         sync.Mutex
+	acceptErr  error
 }
 
 // NewHTTPDemuxListener wraps ln and returns a listener whose Accept yields
 // connections already classified as TLS or plaintext HTTP.
 func NewHTTPDemuxListener(ln net.Listener, tlsConfig *tls.Config) net.Listener {
 	l := &HTTPDemuxListener{
-		Listener:  ln,
-		tlsConfig: tlsConfig,
-		conns:     make(chan net.Conn, classifyQueueSize),
-		closed:    make(chan struct{}),
+		Listener:   ln,
+		tlsConfig:  tlsConfig,
+		conns:      make(chan net.Conn, classifyQueueSize),
+		closed:     make(chan struct{}),
+		acceptDone: make(chan struct{}),
 	}
 	go l.acceptLoop()
 	return l
 }
 
 func (l *HTTPDemuxListener) acceptLoop() {
+	var tempDelay time.Duration
 	for {
 		conn, err := l.Listener.Accept()
 		if err != nil {
-			// The underlying listener failed (usually Close). Store it so
-			// every future Accept returns the same error instead of blocking
+			// Transient OS errors (EMFILE, ENFILE, ...) must not kill the
+			// accept path; back off like net/http and try again. Only a
+			// permanent failure (usually Close) ends the loop, and its error
+			// is stored so every future Accept returns it instead of blocking
 			// forever after the channel is drained.
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				select {
+				case <-time.After(tempDelay):
+				case <-l.closed:
+					return
+				}
+				continue
+			}
 			l.mu.Lock()
 			l.acceptErr = err
 			l.mu.Unlock()
+			close(l.acceptDone)
 			return
 		}
+		tempDelay = 0
 		go l.classify(conn)
 	}
 }
@@ -108,6 +131,11 @@ func (l *HTTPDemuxListener) Accept() (net.Conn, error) {
 		return conn, nil
 	case <-l.closed:
 		return nil, net.ErrClosed
+	case <-l.acceptDone:
+		l.mu.Lock()
+		err := l.acceptErr
+		l.mu.Unlock()
+		return nil, err
 	}
 }
 
