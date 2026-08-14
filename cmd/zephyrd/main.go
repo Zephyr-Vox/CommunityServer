@@ -26,6 +26,8 @@ func main() {
 func run() error {
 	appConfigPath := flag.String("config", "config/zephyr.toml", "path to zephyr.toml (generated on first start)")
 	rolesPath := flag.String("roles", "config/roles.yaml", "path to roles.yaml (generated on first start)")
+	forceRegenerateCert := flag.Bool("force-regenerate-cert", false,
+		"regenerate the auto-generated self-signed certificate on startup (auto mode only)")
 	flag.Parse()
 
 	appConfig, err := config.LoadApp(*appConfigPath)
@@ -68,7 +70,7 @@ func run() error {
 
 	addr := appConfig.Server.Host + ":" + strconv.Itoa(appConfig.Server.HTTPPort)
 	log.Info("zephyrd starting on " + addr + ", db " + appConfig.Server.DBPath)
-	return app.Run(ctx)
+	return app.Run(ctx, server.RunOptions{ForceRegenerateCert: *forceRegenerateCert})
 }
 
 // newLogger builds the human-readable logger: stdout always, plus a rotating

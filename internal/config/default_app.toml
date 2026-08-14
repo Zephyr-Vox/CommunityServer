@@ -9,7 +9,7 @@ login_rate_limit = 10
 registration_mode = "invite"
 
 [server]
-host = "0.0.0.0"
+host = "0.0.0.0"   # 监听地址；join URL 会用它，公网部署请填实际可达域名/IP
 http_port = 8745
 voice_port = 8746
 db_path = "./data/zephyr.db"

@@ -66,6 +66,7 @@ func testConfigFull(dir string, httpPort int, registrationMode string, loginRate
 			HTTPPort:  httpPort,
 			VoicePort: 8746,
 			DBPath:    filepath.Join(dir, "zephyr.db"),
+			TLSMode:   config.TLSModeOff,
 		},
 		Storage: config.StorageConfig{BaseDir: filepath.Join(dir, "objects")},
 		Avatar: config.AvatarConfig{
