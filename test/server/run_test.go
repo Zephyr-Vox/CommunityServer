@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +31,25 @@ func freePort(t *testing.T) int {
 	port := l.Addr().(*net.TCPAddr).Port
 	l.Close()
 	return port
+}
+
+// lockedBuffer is a bytes.Buffer safe for concurrent log writes from the
+// server's multiple slog handlers.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func startRun(t *testing.T, cfg *config.App) (string, func(), <-chan error) {
@@ -156,6 +176,53 @@ func TestRunRequiredRejectsPlaintextAndServesHTTPS(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Run returned error after cancel: %v", err)
+	}
+}
+
+func TestRunRequiredRoutesTLSHandshakeErrorsThroughSlog(t *testing.T) {
+	dir := t.TempDir()
+	port := freePort(t)
+	cfg := testConfig(dir, port)
+	cfg.Server.TLSMode = config.TLSModeRequired
+	cfg.Server.TLSCertPath = filepath.Join(dir, "tls")
+
+	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf lockedBuffer
+	logger := slog.New(logging.NewTextHandler(&buf, slog.LevelDebug))
+	app, err := server.New(cfg, roles, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- app.Run(ctx) }()
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	waitReady(t, insecureHTTPSClient(2*time.Second), "https://"+addr)
+
+	// A plaintext request to the TLS listener makes net/http log a handshake
+	// error. It must go through slog as module=http instead of stderr.
+	plain := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, _ := plain.Get("http://" + addr + "/api/v0/auth/status")
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error after cancel: %v", err)
+	}
+
+	logs := buf.String()
+	if !strings.Contains(logs, "TLS handshake error") {
+		t.Fatalf("TLS handshake error must go through slog, got: %q", logs)
+	}
+	if !strings.Contains(logs, "[http]") {
+		t.Fatalf("TLS handshake error must carry module=http, got: %q", logs)
 	}
 }
 

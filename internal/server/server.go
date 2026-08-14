@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -141,7 +142,11 @@ func (a *App) serve(ctx context.Context, ln net.Listener, tlsInfo func()) error 
 	// module, file sink). The reserved color attr makes it stand out in
 	// magenta on terminals; files and pipes render it plain.
 	log.Info("System initialization finished, LINK START!", "color", "magenta")
-	srv := &http.Server{Addr: addr, Handler: a.echo}
+	srv := &http.Server{
+		Addr:     addr,
+		Handler:  a.echo,
+		ErrorLog: slog.NewLogLogger(a.logger.With("module", "http").Handler(), slog.LevelError),
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.Serve(ln)
