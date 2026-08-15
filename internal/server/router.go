@@ -14,9 +14,10 @@ import (
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
 )
 
-// routes mounts every endpoint on e. Public endpoints sit outside the JWT
-// middleware; everything else requires AuthN, and admin endpoints add the
-// matching Require permission middleware.
+// routes mounts every endpoint on e. Groups mirror URL prefixes only; each
+// route declares the middleware it needs, so public routes are explicit
+// rather than the default. Authed routes attach jwtMW + authnMW via authed,
+// and permission-protected routes add the matching Require middleware.
 func (a *App) routes(e *echo.Echo) error {
 	// Global access log: runs for matched routes and for unknown paths, so
 	// 404s are visible too.
@@ -36,36 +37,48 @@ func (a *App) routes(e *echo.Echo) error {
 	authnMW := rbacecho.AuthN(auth.NewPrincipalResolver(a.principals))
 	authz := rbac.NewAuthorizer(a.roles)
 
+	// authed wraps the standard authentication chain; extra middleware (e.g.
+	// permission checks) runs after it.
+	authed := func(extra ...echo.MiddlewareFunc) []echo.MiddlewareFunc {
+		return append([]echo.MiddlewareFunc{jwtMW, authnMW}, extra...)
+	}
+
 	api := e.Group("/api/v0")
-	api.GET("/auth/status", auth.StatusHandler(a.stores, auth.RegistrationMode(a.cfg.RegistrationMode)))
-	api.POST("/auth/register", auth.RegisterHandler(a.register))
-	api.POST("/admin/activate", auth.ActivateHandler(a.activate), auth.LoginRateLimit(a.cfg.LoginRateLimit))
-	api.POST("/auth/login", auth.LoginHandler(a.authSvc), auth.LoginRateLimit(a.cfg.LoginRateLimit))
-	api.POST("/auth/refresh", auth.RefreshHandler(a.authSvc))
-	api.POST("/auth/logout", auth.LogoutHandler(a.authSvc))
 
-	protected := e.Group("/api/v0", jwtMW, authnMW)
-	protected.GET("/auth/me", auth.MeHandler(a.stores.Users, authz))
-	protected.PATCH("/me", auth.MeProfileHandler(a.users))
-	protected.POST("/me/avatar", image.UploadAvatarHandler(a.avatar))
-	protected.DELETE("/me/avatar", image.DeleteAvatarHandler(a.avatar))
-	protected.POST("/me/password", auth.MePasswordHandler(a.authSvc))
-	protected.POST("/presence/heartbeat", presence.HeartbeatHandler(a.presence))
-	protected.GET("/presence", presence.QueryHandler(a.presence))
+	authGroup := api.Group("/auth")
+	authGroup.GET("/status", auth.StatusHandler(a.stores, auth.RegistrationMode(a.cfg.RegistrationMode)))
+	authGroup.POST("/register", auth.RegisterHandler(a.register))
+	authGroup.POST("/login", auth.LoginHandler(a.authSvc), auth.LoginRateLimit(a.cfg.LoginRateLimit))
+	authGroup.POST("/refresh", auth.RefreshHandler(a.authSvc))
+	authGroup.POST("/logout", auth.LogoutHandler(a.authSvc))
+	authGroup.GET("/me", auth.MeHandler(a.stores.Users, authz), authed()...)
 
-	admin := e.Group("/api/v0", jwtMW, authnMW)
-	admin.GET("/users", auth.ListUsersHandler(a.users), rbacecho.Require(authz, rbac.PermUserRead))
-	admin.GET("/users/:id", auth.GetUserHandler(a.users), rbacecho.Require(authz, rbac.PermUserRead))
-	admin.PATCH("/users/:id", auth.UpdateUserHandler(a.users), rbacecho.Require(authz, rbac.PermUserUpdate))
-	admin.PUT("/users/:id/roles", auth.SetUserRolesHandler(a.users), rbacecho.Require(authz, rbac.PermUserUpdate))
-	admin.POST("/users/:id/password", auth.ResetUserPasswordHandler(a.authSvc), rbacecho.Require(authz, rbac.PermUserUpdate))
-	admin.POST("/users/:id/kick", auth.KickUserHandler(a.users), rbacecho.Require(authz, rbac.PermUserKick))
-	admin.POST("/users/:id/ban", auth.BanUserHandler(a.users), rbacecho.Require(authz, rbac.PermUserUpdate))
-	admin.POST("/users/:id/unban", auth.UnbanUserHandler(a.users), rbacecho.Require(authz, rbac.PermUserUpdate))
-	admin.DELETE("/users/:id", auth.DeleteUserHandler(a.users), rbacecho.Require(authz, rbac.PermUserDelete))
-	admin.GET("/admin/invites", auth.InviteListHandler(a.invites), rbacecho.Require(authz, rbac.PermInviteManage))
-	admin.POST("/admin/invites", auth.InviteCreateHandler(a.invites), rbacecho.Require(authz, rbac.PermInviteManage))
-	admin.DELETE("/admin/invites/:id", auth.InviteDeleteHandler(a.invites), rbacecho.Require(authz, rbac.PermInviteManage))
+	me := api.Group("/me")
+	me.PATCH("", auth.MeProfileHandler(a.users), authed()...)
+	me.POST("/avatar", image.UploadAvatarHandler(a.avatar), authed()...)
+	me.DELETE("/avatar", image.DeleteAvatarHandler(a.avatar), authed()...)
+	me.POST("/password", auth.MePasswordHandler(a.authSvc), authed()...)
+
+	presenceGroup := api.Group("/presence")
+	presenceGroup.POST("/heartbeat", presence.HeartbeatHandler(a.presence), authed()...)
+	presenceGroup.GET("", presence.QueryHandler(a.presence), authed()...)
+
+	users := api.Group("/users")
+	users.GET("", auth.ListUsersHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserRead))...)
+	users.GET("/:id", auth.GetUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserRead))...)
+	users.PATCH("/:id", auth.UpdateUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
+	users.PUT("/:id/roles", auth.SetUserRolesHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
+	users.POST("/:id/password", auth.ResetUserPasswordHandler(a.authSvc), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
+	users.POST("/:id/kick", auth.KickUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserKick))...)
+	users.POST("/:id/ban", auth.BanUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
+	users.POST("/:id/unban", auth.UnbanUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
+	users.DELETE("/:id", auth.DeleteUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserDelete))...)
+
+	admin := api.Group("/admin")
+	admin.POST("/activate", auth.ActivateHandler(a.activate), auth.LoginRateLimit(a.cfg.LoginRateLimit))
+	admin.GET("/invites", auth.InviteListHandler(a.invites), authed(rbacecho.Require(authz, rbac.PermInviteManage))...)
+	admin.POST("/invites", auth.InviteCreateHandler(a.invites), authed(rbacecho.Require(authz, rbac.PermInviteManage))...)
+	admin.DELETE("/invites/:id", auth.InviteDeleteHandler(a.invites), authed(rbacecho.Require(authz, rbac.PermInviteManage))...)
 	return nil
 }
 
