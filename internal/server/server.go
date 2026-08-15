@@ -139,9 +139,11 @@ func (a *App) serve(ctx context.Context, ln net.Listener, tlsInfo func()) error 
 	// magenta on terminals; files and pipes render it plain.
 	log.Info("System initialization finished, LINK START!", "color", "magenta")
 	srv := &http.Server{
-		Addr:     addr,
-		Handler:  a.echo,
-		ErrorLog: slog.NewLogLogger(a.logger.With("module", "http").Handler(), slog.LevelError),
+		Addr:              addr,
+		Handler:           a.echo,
+		ErrorLog:          slog.NewLogLogger(a.logger.With("module", "http").Handler(), slog.LevelError),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() {
