@@ -27,13 +27,16 @@ go run ./cmd/zephyrd
 INFO first admin activation required code: ABC234...
 ```
 
-激活首管理员：
+激活首管理员。默认配置使用 HTTPS 并提供自动生成的自签证书，本地 curl 需要加 `-k`：
 
 ```sh
-curl -X POST http://localhost:8745/api/v0/admin/activate \
+curl -k -X POST https://localhost:8745/api/v0/admin/activate \
   -H 'Content-Type: application/json' \
   -d '{"code":"ABC234...","username":"boss","password":"secret123"}'
 ```
+
+如果只想在本地用明文 HTTP 调试，把 `config/zephyr.toml` 里的
+`server.tls_mode` 改成 `"off"`，再把上面的地址换回 `http://localhost:8745`。
 
 然后用同一账号调用 `POST /api/v0/auth/login` 登录。
 
@@ -58,6 +61,7 @@ zephyrd -config config/zephyr.toml -roles config/roles.yaml
 | `server.http_port` | `8745` | HTTP/REST 监听端口 |
 | `server.voice_port` | `8746` | 预留的语音通道端口 |
 | `server.db_path` | `./data/zephyr.db` | SQLite 数据库文件 |
+| `server.tls_mode` | `required` | TLS 模式：`off` 或 `required`；`required` 会自动生成自签证书 |
 | `storage.base_dir` | `./data/objects` | 本地对象存储根目录 |
 | `avatar.max_upload_size` | `10485760` | 头像上传大小上限（字节，10 MiB） |
 | `avatar.max_dimension` | `4096` | 源图最大边长（像素），防止解码放大攻击 |

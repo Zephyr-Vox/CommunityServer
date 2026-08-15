@@ -27,13 +27,17 @@ The first start generates `config/zephyr.toml` and `config/roles.yaml` automatic
 INFO first admin activation required code: ABC234...
 ```
 
-Activate the first admin:
+Activate the first admin. The default config serves HTTPS with an
+auto-generated self-signed certificate, so local curl calls need `-k`:
 
 ```sh
-curl -X POST http://localhost:8745/api/v0/admin/activate \
+curl -k -X POST https://localhost:8745/api/v0/admin/activate \
   -H 'Content-Type: application/json' \
   -d '{"code":"ABC234...","username":"boss","password":"secret123"}'
 ```
+
+For plaintext local testing, set `server.tls_mode = "off"` in
+`config/zephyr.toml` and use `http://localhost:8745` instead.
 
 Then sign in with the same credentials at `POST /api/v0/auth/login`.
 
@@ -58,6 +62,7 @@ zephyrd -config config/zephyr.toml -roles config/roles.yaml
 | `server.http_port` | `8745` | HTTP/REST listener port |
 | `server.voice_port` | `8746` | reserved for the future voice channel |
 | `server.db_path` | `./data/zephyr.db` | SQLite database file |
+| `server.tls_mode` | `required` | TLS mode: `off` or `required`; `required` auto-generates a self-signed certificate |
 | `storage.base_dir` | `./data/objects` | local object storage root |
 | `avatar.max_upload_size` | `10485760` | avatar upload size limit in bytes (10 MiB) |
 | `avatar.max_dimension` | `4096` | source image max side in pixels; rejects decompression bombs |
