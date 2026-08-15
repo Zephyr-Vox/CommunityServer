@@ -197,6 +197,15 @@ func (s *UserStore) HasAdmin(ctx context.Context) (bool, error) {
 	return ok, nil
 }
 
+// CountUsersWithRole returns how many users currently hold role.
+func (s *UserStore) CountUsersWithRole(ctx context.Context, role string) (int64, error) {
+	n, err := s.q.CountUsersWithRole(ctx, role)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return n, nil
+}
+
 // Delete removes a user row. Sessions and roles cascade; invites the user
 // created keep their rows with created_by set to NULL (ON DELETE SET NULL).
 func (s *UserStore) Delete(ctx context.Context, id int64) error {

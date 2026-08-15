@@ -12,6 +12,7 @@ import (
 type Querier interface {
 	BumpUserAuthVersion(ctx context.Context, arg BumpUserAuthVersionParams) error
 	ConsumeInvite(ctx context.Context, arg ConsumeInviteParams) (Invite, error)
+	CountUsersWithRole(ctx context.Context, role string) (int64, error)
 	CreateInvite(ctx context.Context, arg CreateInviteParams) (Invite, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	DeleteExpiredSessions(ctx context.Context, expiresAt int64) (int64, error)

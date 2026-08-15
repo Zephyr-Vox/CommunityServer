@@ -26,6 +26,17 @@ func (q *Queries) BumpUserAuthVersion(ctx context.Context, arg BumpUserAuthVersi
 	return err
 }
 
+const countUsersWithRole = `-- name: CountUsersWithRole :one
+SELECT COUNT(*) AS count FROM user_roles WHERE role = ?
+`
+
+func (q *Queries) CountUsersWithRole(ctx context.Context, role string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countUsersWithRole, role)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (id, username, password_hash, nickname, avatar, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)

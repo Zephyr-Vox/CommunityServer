@@ -368,6 +368,7 @@ func UpdateUserHandler(svc *UserService) echo.HandlerFunc {
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 unknown role: role is not defined in roles.yaml
 //   - 3 user not found
+//   - 4 last admin: the only admin cannot be demoted
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -378,6 +379,7 @@ func SetUserRolesHandler(svc *UserService) echo.HandlerFunc {
 		codeInvalidID    = 1
 		codeUnknownRole  = 2
 		codeUserNotFound = 3
+		codeLastAdmin    = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
 		id, err := parsePathID(c)
@@ -394,6 +396,8 @@ func SetUserRolesHandler(svc *UserService) echo.HandlerFunc {
 				return api.NewError(codeUnknownRole, http.StatusBadRequest, "unknown role")
 			case errors.Is(err, store.ErrNotFound):
 				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			case errors.Is(err, ErrLastAdmin):
+				return api.NewError(codeLastAdmin, http.StatusBadRequest, "cannot remove the last admin")
 			default:
 				return err
 			}
@@ -479,6 +483,7 @@ func KickUserHandler(svc *UserService) echo.HandlerFunc {
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 self action: banning yourself is not allowed
 //   - 3 user not found
+//   - 4 last admin: the only admin cannot be banned
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing user:update permission
 //   - 1009 internal: unexpected server error
@@ -487,6 +492,7 @@ func BanUserHandler(svc *UserService) echo.HandlerFunc {
 		codeInvalidID    = 1
 		codeSelfAction   = 2
 		codeUserNotFound = 3
+		codeLastAdmin    = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
 		id, err := parsePathID(c)
@@ -499,6 +505,8 @@ func BanUserHandler(svc *UserService) echo.HandlerFunc {
 				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot ban yourself")
 			case errors.Is(err, store.ErrNotFound):
 				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			case errors.Is(err, ErrLastAdmin):
+				return api.NewError(codeLastAdmin, http.StatusBadRequest, "cannot remove the last admin")
 			default:
 				return err
 			}
@@ -543,6 +551,7 @@ func UnbanUserHandler(svc *UserService) echo.HandlerFunc {
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 self action: deleting yourself is not allowed
 //   - 3 user not found
+//   - 4 last admin: the only admin cannot be deleted
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing user:delete permission
 //   - 1009 internal: unexpected server error
@@ -551,6 +560,7 @@ func DeleteUserHandler(svc *UserService) echo.HandlerFunc {
 		codeInvalidID    = 1
 		codeSelfAction   = 2
 		codeUserNotFound = 3
+		codeLastAdmin    = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
 		id, err := parsePathID(c)
@@ -563,6 +573,8 @@ func DeleteUserHandler(svc *UserService) echo.HandlerFunc {
 				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot delete yourself")
 			case errors.Is(err, store.ErrNotFound):
 				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			case errors.Is(err, ErrLastAdmin):
+				return api.NewError(codeLastAdmin, http.StatusBadRequest, "cannot remove the last admin")
 			default:
 				return err
 			}

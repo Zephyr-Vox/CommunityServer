@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -103,6 +104,69 @@ func TestUserServiceSetRoles(t *testing.T) {
 
 	if err := svc.SetRoles(ctx, u.ID, []string{"moderator"}); !errors.Is(err, auth.ErrUnknownRole) {
 		t.Fatalf("err = %v, want ErrUnknownRole", err)
+	}
+}
+
+func TestUserServiceSetRolesDeduplicates(t *testing.T) {
+	e := newEnv(t)
+	svc, _ := newUserService(t, e)
+	ctx := context.Background()
+	u := e.createUser(t, "alice", "secret123", "member")
+
+	if err := svc.SetRoles(ctx, u.ID, []string{"member", "member", "admin", "member"}); err != nil {
+		t.Fatal(err)
+	}
+	roles, err := e.stores.Users.GetRoles(ctx, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roles) != 2 || !slices.Contains(roles, "member") || !slices.Contains(roles, "admin") {
+		t.Fatalf("roles = %v, want [member admin] without duplicates", roles)
+	}
+}
+
+func TestUserServiceProtectsLastAdmin(t *testing.T) {
+	e := newEnv(t)
+	svc, _ := newUserService(t, e)
+	ctx := context.Background()
+	boss := e.createUser(t, "boss", "secret123", "admin")
+	alice := e.createUser(t, "alice", "secret123", "member")
+
+	if err := svc.SetRoles(ctx, boss.ID, []string{"member"}); !errors.Is(err, auth.ErrLastAdmin) {
+		t.Fatalf("demote last admin: err = %v, want ErrLastAdmin", err)
+	}
+	roles, err := e.stores.Users.GetRoles(ctx, boss.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(roles, "admin") {
+		t.Fatal("boss must still be admin after rejected demotion")
+	}
+
+	if err := svc.Ban(ctx, alice.ID, boss.ID); !errors.Is(err, auth.ErrLastAdmin) {
+		t.Fatalf("ban last admin: err = %v, want ErrLastAdmin", err)
+	}
+	user, err := e.stores.Users.GetUserByID(ctx, boss.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.BannedAt.Valid {
+		t.Fatal("boss must not be banned after rejected ban")
+	}
+
+	if err := svc.Delete(ctx, alice.ID, boss.ID); !errors.Is(err, auth.ErrLastAdmin) {
+		t.Fatalf("delete last admin: err = %v, want ErrLastAdmin", err)
+	}
+	if _, err := e.stores.Users.GetUserByID(ctx, boss.ID); err != nil {
+		t.Fatal("boss must still exist after rejected deletion")
+	}
+
+	// Promoting a second admin makes the demotion legal.
+	if err := svc.SetRoles(ctx, alice.ID, []string{"admin"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetRoles(ctx, boss.ID, []string{"member"}); err != nil {
+		t.Fatal(err)
 	}
 }
 

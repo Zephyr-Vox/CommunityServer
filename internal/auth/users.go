@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 
 	"github.com/labstack/echo/v5"
@@ -17,6 +18,9 @@ var (
 	// ErrInvalidPagination is returned when limit/offset query parameters are
 	// missing, malformed or out of range.
 	ErrInvalidPagination = errors.New("auth: invalid pagination")
+	// ErrLastAdmin is returned when an operation would remove the last user
+	// holding the admin role, locking the deployment out of administration.
+	ErrLastAdmin = errors.New("auth: cannot remove the last admin")
 )
 
 // PresenceRevoker removes a user from the online registry immediately after
@@ -112,20 +116,64 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 
 // SetRoles replaces a user's roles after validating them against the role
 // configuration, then clears the principal cache so the change is immediate.
+// Duplicate roles are accepted and collapsed. The last admin cannot be
+// demoted, banned or deleted: doing so would lock the deployment out.
 func (s *UserService) SetRoles(ctx context.Context, userID int64, roles []string) error {
-	if _, err := s.users.GetUserByID(ctx, userID); err != nil {
-		return err
-	}
+	roles = dedupeRoles(roles)
 	for _, role := range roles {
 		if !s.roles.HasRole(role) {
 			return ErrUnknownRole
 		}
 	}
-	if err := s.users.SetRoles(ctx, userID, roles); err != nil {
+	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
+		if _, err := tx.Users.GetUserByID(ctx, userID); err != nil {
+			return err
+		}
+		last, err := isLastAdmin(ctx, tx.Users, userID)
+		if err != nil {
+			return err
+		}
+		if last && !slices.Contains(roles, adminRole) {
+			return ErrLastAdmin
+		}
+		return tx.Users.SetRoles(ctx, userID, roles)
+	}); err != nil {
 		return err
 	}
 	s.principals.Invalidate(userID)
 	return nil
+}
+
+// dedupeRoles collapses repeated role names while preserving first-seen order.
+func dedupeRoles(roles []string) []string {
+	seen := make(map[string]struct{}, len(roles))
+	out := make([]string, 0, len(roles))
+	for _, role := range roles {
+		if _, ok := seen[role]; ok {
+			continue
+		}
+		seen[role] = struct{}{}
+		out = append(out, role)
+	}
+	return out
+}
+
+// isLastAdmin reports whether userID currently holds the admin role and is
+// the only user who does. Call it inside the same transaction as the mutation
+// so a concurrent role change cannot remove the last admin.
+func isLastAdmin(ctx context.Context, users *store.UserStore, userID int64) (bool, error) {
+	roles, err := users.GetRoles(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	if !slices.Contains(roles, adminRole) {
+		return false, nil
+	}
+	n, err := users.CountUsersWithRole(ctx, adminRole)
+	if err != nil {
+		return false, err
+	}
+	return n <= 1, nil
 }
 
 // Kick bumps auth_version and deletes every session in one transaction, then
@@ -157,10 +205,19 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
 	}
-	if _, err := s.users.GetUserByID(ctx, userID); err != nil {
-		return err
-	}
-	if err := s.users.Ban(ctx, userID); err != nil {
+	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
+		if _, err := tx.Users.GetUserByID(ctx, userID); err != nil {
+			return err
+		}
+		last, err := isLastAdmin(ctx, tx.Users, userID)
+		if err != nil {
+			return err
+		}
+		if last {
+			return ErrLastAdmin
+		}
+		return tx.Users.Ban(ctx, userID)
+	}); err != nil {
 		return err
 	}
 	s.principals.Invalidate(userID)
@@ -191,10 +248,26 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	if err != nil {
 		return err
 	}
+	// Reject before the best-effort avatar cleanup so a refused deletion does
+	// not destroy the avatar; the transactional check below is authoritative.
+	if last, err := isLastAdmin(ctx, s.users, userID); err != nil {
+		return err
+	} else if last {
+		return ErrLastAdmin
+	}
 	if s.avatarCleaner != nil && user.Avatar.Valid {
 		_ = s.avatarCleaner.DeleteAvatar(ctx, user.Avatar.String) // best-effort
 	}
-	if err := s.users.Delete(ctx, userID); err != nil {
+	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
+		last, err := isLastAdmin(ctx, tx.Users, userID)
+		if err != nil {
+			return err
+		}
+		if last {
+			return ErrLastAdmin
+		}
+		return tx.Users.Delete(ctx, userID)
+	}); err != nil {
 		return err
 	}
 	s.principals.Invalidate(userID)
