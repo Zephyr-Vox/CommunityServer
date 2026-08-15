@@ -19,6 +19,12 @@ const (
 	argonThreads = 2
 )
 
+// dummyPasswordHash is a fixed argon2id hash with production parameters.
+// Login verifies unknown-username attempts against it so the argon2id cost is
+// paid either way and response timing does not reveal whether an account
+// exists.
+const dummyPasswordHash = "$argon2id$v=19$m=65536,t=3,p=2$a2hiWpgd32hQmnpfbEbpug$4824/H6vT+YvIUwnGiSUUXThRg3P6gj1/xCJV2517bQ"
+
 // HashPassword encodes a password as an argon2id PHC string with a fresh
 // random salt, so two hashes of the same password always differ.
 func HashPassword(password string) (string, error) {

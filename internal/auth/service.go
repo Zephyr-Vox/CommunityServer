@@ -74,6 +74,10 @@ func NewAuthService(
 func (s *AuthService) Login(ctx context.Context, username, password, deviceID string) (*LoginResult, error) {
 	user, err := s.users.GetUserByUsername(ctx, username)
 	if errors.Is(err, store.ErrNotFound) {
+		// Burn the same argon2id cost as a real password check so the
+		// response time does not let unauthenticated callers enumerate
+		// usernames.
+		_, _ = VerifyPassword(password, dummyPasswordHash)
 		return nil, ErrInvalidCredentials
 	}
 	if err != nil {
