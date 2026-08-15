@@ -217,6 +217,78 @@ func TestDeleteInvalidates(t *testing.T) {
 	}
 }
 
+func TestDeleteDuringLoadPreventsStaleSet(t *testing.T) {
+	var calls atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	c := cache.New[string, string](
+		cache.WithLoader[string, string](func(_ context.Context, key string) (string, error) {
+			if calls.Add(1) == 1 {
+				close(started)
+				<-release
+				return "stale", nil
+			}
+			return "fresh", nil
+		}),
+	)
+	ctx := context.Background()
+
+	done := make(chan struct{})
+	go func() {
+		c.Get(ctx, "a")
+		close(done)
+	}()
+	<-started
+	c.Delete("a") // key is not cached yet; must still tombstone the key
+	close(release)
+	<-done
+
+	if c.Len() != 0 {
+		t.Fatalf("stale loader result must not be cached, len = %d", c.Len())
+	}
+
+	got, ok, err := c.Get(ctx, "a")
+	if err != nil || !ok || got != "fresh" {
+		t.Fatalf("reload = (%q, %v, %v), want (fresh, true, nil)", got, ok, err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("loader calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestSetDuringLoadPreventsStaleOverwrite(t *testing.T) {
+	var calls atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	c := cache.New[string, string](
+		cache.WithLoader[string, string](func(_ context.Context, key string) (string, error) {
+			calls.Add(1)
+			close(started)
+			<-release
+			return "stale", nil
+		}),
+	)
+	ctx := context.Background()
+
+	done := make(chan struct{})
+	go func() {
+		c.Get(ctx, "a")
+		close(done)
+	}()
+	<-started
+	c.Set("a", "fresh")
+	close(release)
+	<-done
+
+	got, ok, err := c.Get(ctx, "a")
+	if err != nil || !ok || got != "fresh" {
+		t.Fatalf("get = (%q, %v, %v), want (fresh, true, nil)", got, ok, err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("loader calls = %d, want 1", calls.Load())
+	}
+}
+
 func TestClear(t *testing.T) {
 	c := cache.New[string, string]()
 	c.Set("a", "1")

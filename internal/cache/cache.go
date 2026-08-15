@@ -95,6 +95,14 @@ func WithClock[K comparable, V any](now func() time.Time) Option[K, V] {
 type Cache[K comparable, V any] struct {
 	mu      sync.RWMutex
 	entries map[K]entry[V]
+	// tombstones records, per key, how many times Delete or Set has
+	// invalidated it while a loader was in flight. Loader results are only
+	// stored if the generation captured before the load still matches, so an
+	// invalidation during an in-flight load can never resurrect the stale
+	// value. Tombstones exist only while a load can still write back: Delete
+	// without an in-flight load leaves none, and every load removes its key's
+	// tombstone when it finishes.
+	tombstones map[K]uint64
 	// order is the FIFO insertion order used by max-size eviction. A key is
 	// appended when first inserted and keeps its position across overwrites.
 	order []K
@@ -121,12 +129,13 @@ func New[K comparable, V any](opts ...Option[K, V]) *Cache[K, V] {
 		opt(&cfg)
 	}
 	return &Cache[K, V]{
-		entries:  make(map[K]entry[V]),
-		inflight: make(map[K]*inflight[V]),
-		ttl:      cfg.ttl,
-		loader:   cfg.loader,
-		maxSize:  cfg.maxSize,
-		now:      cfg.now,
+		entries:    make(map[K]entry[V]),
+		tombstones: make(map[K]uint64),
+		inflight:   make(map[K]*inflight[V]),
+		ttl:        cfg.ttl,
+		loader:     cfg.loader,
+		maxSize:    cfg.maxSize,
+		now:        cfg.now,
 	}
 }
 
@@ -167,9 +176,18 @@ func (c *Cache[K, V]) Set(key K, value V) {
 		expiresAt = c.now().Add(c.ttl)
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inflightMu.Lock()
+	_, inflight := c.inflight[key]
 
+	c.mu.Lock()
+	if inflight {
+		// Invalidate the in-flight loader so it cannot overwrite this fresh
+		// value with a stale result; the load's completion cleanup removes
+		// the tombstone afterwards.
+		c.tombstones[key]++
+	} else {
+		delete(c.tombstones, key)
+	}
 	if _, exists := c.entries[key]; !exists {
 		c.order = append(c.order, key)
 		if c.maxSize > 0 && len(c.order) > c.maxSize {
@@ -179,24 +197,44 @@ func (c *Cache[K, V]) Set(key K, value V) {
 		}
 	}
 	c.entries[key] = entry[V]{value: value, expiresAt: expiresAt}
+	c.mu.Unlock()
+	c.inflightMu.Unlock()
 }
 
 // Delete removes key immediately, invalidating it for all subsequent Gets.
 // It is the event-driven invalidation hook used by write paths (for example,
-// clearing a cached principal after a password change).
+// clearing a cached principal after a password change). When a loader is in
+// flight the invalidation is remembered so it cannot re-populate the stale
+// value; without an in-flight loader no tombstone is kept, keeping the map
+// bounded.
 func (c *Cache[K, V]) Delete(key K) {
+	// Entry removal and the tombstone decision must be one critical section:
+	// if an in-flight load writes just before us, the entry deletion removes
+	// its stale result; if we win the lock first, the tombstone makes the
+	// load's storeIfNotInvalidated reject it. Splitting the two would let a
+	// stale snapshot slip in between and survive until TTL expiry.
+	c.inflightMu.Lock()
+	_, inflight := c.inflight[key]
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.entries[key]; !ok {
-		return
+	if inflight {
+		// A loader is running and could still write back a stale snapshot;
+		// remember the invalidation until that load finishes.
+		c.tombstones[key]++
+	} else {
+		delete(c.tombstones, key)
 	}
-	delete(c.entries, key)
-	for i, k := range c.order {
-		if k == key {
-			c.order = append(c.order[:i], c.order[i+1:]...)
-			break
+	if _, ok := c.entries[key]; ok {
+		delete(c.entries, key)
+		for i, k := range c.order {
+			if k == key {
+				c.order = append(c.order[:i], c.order[i+1:]...)
+				break
+			}
 		}
 	}
+	c.mu.Unlock()
+	c.inflightMu.Unlock()
 }
 
 // Clear removes all entries and resets the FIFO order. In-flight loader
@@ -205,6 +243,7 @@ func (c *Cache[K, V]) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries = make(map[K]entry[V])
+	c.tombstones = make(map[K]uint64)
 	c.order = nil
 }
 
@@ -284,7 +323,20 @@ func (c *Cache[K, V]) get(key K) (V, bool) {
 		return zero, false
 	}
 	if !e.expiresAt.IsZero() && !c.now().Before(e.expiresAt) {
-		c.Delete(key)
+		c.mu.Lock()
+		// Re-check under the write lock: another goroutine may have refreshed
+		// the entry since the read lock was released. TTL expiry is not an
+		// invalidation, so no tombstone is recorded.
+		if cur, ok := c.entries[key]; ok && !cur.expiresAt.IsZero() && !c.now().Before(cur.expiresAt) {
+			delete(c.entries, key)
+			for i, k := range c.order {
+				if k == key {
+					c.order = append(c.order[:i], c.order[i+1:]...)
+					break
+				}
+			}
+		}
+		c.mu.Unlock()
 		var zero V
 		return zero, false
 	}
@@ -326,16 +378,21 @@ func (c *Cache[K, V]) load(ctx context.Context, key K) (V, bool, error) {
 	c.inflight[key] = call
 	c.inflightMu.Unlock()
 
+	gen := c.tombstoneVersion(key)
 	value, err := c.loader(ctx, key)
 	if err == nil {
-		c.Set(key, value)
+		c.storeIfNotInvalidated(key, value, gen)
 	}
 
 	call.value = value
 	call.err = err
 	close(call.ready) // publishes value/err to waiters
 
+	// Clear the tombstone and deregister under one inflightMu critical
+	// section: a new load can only register after both happen, so it always
+	// captures the fresh generation instead of an about-to-be-cleared one.
 	c.inflightMu.Lock()
+	c.clearTombstone(key)
 	delete(c.inflight, key)
 	c.inflightMu.Unlock()
 
@@ -344,4 +401,49 @@ func (c *Cache[K, V]) load(ctx context.Context, key K) (V, bool, error) {
 		return zero, false, err
 	}
 	return value, true, nil
+}
+
+// clearTombstone drops any invalidation marker for key. It must be called
+// while holding inflightMu (or when no loader can start), so a new load can
+// never capture a generation that is about to be cleared.
+func (c *Cache[K, V]) clearTombstone(key K) {
+	c.mu.Lock()
+	delete(c.tombstones, key)
+	c.mu.Unlock()
+}
+
+// tombstoneVersion returns the current invalidation generation for key.
+func (c *Cache[K, V]) tombstoneVersion(key K) uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tombstones[key]
+}
+
+// storeIfNotInvalidated stores value only if key's invalidation generation
+// still matches gen, i.e. no Delete happened since the generation was read.
+// The check and the store happen under the same lock as Delete, closing the
+// race between "check then set" and a concurrent invalidation.
+func (c *Cache[K, V]) storeIfNotInvalidated(key K, value V, gen uint64) bool {
+	var expiresAt time.Time
+	if c.ttl > 0 {
+		expiresAt = c.now().Add(c.ttl)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tombstones[key] != gen {
+		return false
+	}
+	delete(c.tombstones, key)
+
+	if _, exists := c.entries[key]; !exists {
+		c.order = append(c.order, key)
+		if c.maxSize > 0 && len(c.order) > c.maxSize {
+			oldest := c.order[0]
+			c.order = c.order[1:]
+			delete(c.entries, oldest)
+		}
+	}
+	c.entries[key] = entry[V]{value: value, expiresAt: expiresAt}
+	return true
 }
