@@ -338,6 +338,84 @@ func TestPutOverwriteFailureRestoresOldFile(t *testing.T) {
 	}
 }
 
+func TestPutKeepsStaleBackupUntilCommit(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	if _, err := e.objects.Put(ctx, "avatars", "1.png", strings.NewReader("old"),
+		oss.PutOptions{ContentType: "image/png"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a crash between stashing the old file and renaming the new one.
+	path := filepath.Join(e.root, "avatars", "1.png")
+	backup := path + ".bak"
+	if err := os.Rename(path, backup); err != nil {
+		t.Fatal(err)
+	}
+
+	// Break the metadata connection so the upsert after the file swap fails.
+	if err := e.conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.objects.Put(ctx, "avatars", "1.png", strings.NewReader("new content"),
+		oss.PutOptions{ContentType: "image/jpeg"}); err == nil {
+		t.Fatal("want metadata failure")
+	}
+
+	// The old copy must be restored to path, and the backup consumed.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("file content = %q, want old after failed commit", data)
+	}
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup should be consumed by the restore, stat err = %v", err)
+	}
+
+	// Reopen the database: the old metadata row must match the restored file.
+	conn, err := store.Open(e.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	objects, err := oss.NewLocalObjectStorage(e.root, conn, e.clock.get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := objects.Stat(ctx, "avatars", "1.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.Size != 3 || obj.ContentType != "image/png" {
+		t.Fatalf("metadata = %+v, want old row", obj)
+	}
+
+	// A later successful Put must commit the new file, then remove the backup.
+	if _, err := objects.Put(ctx, "avatars", "1.png", strings.NewReader("new"),
+		oss.PutOptions{ContentType: "text/plain"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("file content = %q, want new", data)
+	}
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup should be cleaned after commit, stat err = %v", err)
+	}
+	obj, err = objects.Stat(ctx, "avatars", "1.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.Size != 3 || obj.ContentType != "text/plain" {
+		t.Fatalf("metadata = %+v, want committed row", obj)
+	}
+}
+
 func TestNewLocalObjectStorageRejectsEmptyRoot(t *testing.T) {
 	e := newEnv(t)
 	if _, err := oss.NewLocalObjectStorage("", e.conn, e.clock.get); err == nil {

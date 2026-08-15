@@ -66,6 +66,8 @@ func NewLocalObjectStorage(root string, conn *sql.DB, now func() int64) (*LocalO
 // to a same-directory temp file, fsyncs, atomically renames, and records the
 // row last. An existing file is stashed aside first so a failed metadata
 // commit restores the old file instead of leaving a row pointing at nothing.
+// A stale backup left by a crashed overwrite is kept until the new file and
+// its metadata are committed, so the last old copy is never discarded early.
 func (s *LocalObjectStorage) Put(ctx context.Context, bucket, name string, src io.Reader, opts PutOptions) (Object, error) {
 	if err := validateComponent(bucket); err != nil {
 		return Object{}, err
@@ -129,8 +131,13 @@ func (s *LocalObjectStorage) Put(ctx context.Context, bucket, name string, src i
 		hadOldFile = true
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Object{}, fmt.Errorf("oss: stat existing object: %w", err)
-	} else {
-		_ = os.Remove(backup) // stale backup from a crashed overwrite
+	} else if _, err := os.Lstat(backup); err == nil {
+		// Crash recovery: the previous overwrite stashed the old file but
+		// never finished. Keep this backup as the only old copy until the new
+		// file and metadata are committed.
+		hadOldFile = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Object{}, fmt.Errorf("oss: stat backup file: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, path); err != nil {
