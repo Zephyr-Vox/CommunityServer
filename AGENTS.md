@@ -4,12 +4,34 @@
 
 ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 
-- `internal/` — production code, organized by domain: `auth/`, `store/`, `rbac/`, `cache/`, `config/`, `validation/`, `snowflake/`, `logging/`.
+- `internal/` — production code, organized by domain: `auth/`, `store/`, `rbac/`, `cache/`, `config/`, `validation/`, `snowflake/`, `logging/`, `protocol/`.
+- `internal/protocol/` — the voice wire protocol domain: UDP datagram codec, AEAD/HKDF crypto, replay window, per-session rate limit, channel registry, in-memory session manager and UDP server. It has no Echo/HTTP dependency; HTTP/control-plane adapters belong to the application layers.
 - `internal/db/` — sqlc-generated data access (`*.sql.go`); never edit generated files by hand. The only hand-maintained files are `schema.sql` and `schema.go` (the embedded schema).
 - `internal/db/schema.sql` + `db/queries/` — SQL sources. Edit these, then run `sqlc generate`.
 - `VERSION` at the module root — plain version text, embedded into the binary by the root `version` package and printed after the startup banner.
 - `test/` — all tests, one subdirectory per package (`test/auth/`, `test/store/`). Business directories contain no `_test.go`.
 - `spec/spec.md` — local design specs. Gitignored; never commit.
+
+## Architecture Invariants
+
+- One process instance is exactly one community server. There is no tenant or multi-server concept; "creating a server" means first-time initialization/bootstrap of this backend process. Do not introduce a `servers` table or tenant scoping.
+- `owner` is the only immutable built-in role: globally unique, always grants `*`, bypasses channel/group ACLs, and is protected by last-owner rules. It may be transferred by the current owner; the previous owner is demoted to `member`.
+- A user is fully connected only while both the WS control channel and, when in voice, the UDP data channel are alive. If either drops, the server clears that user's connection state (membership, voice session, presence) and the client must reconnect.
+- A user has at most one active voice-channel membership and one UDP voice session. Joining a voice channel allocates or reuses that session. Text channels have no server-side membership or active pointer; the focused text channel is purely client UI state and is never persisted or broadcast.
+- Only `voice` channels can be temporary. `text` and `announcement` channels are always permanent; a temporary voice channel carries text chat as a secondary capability and is deleted when its last voice member leaves.
+- The server pushes every event for channels visible to a WS connection; there are no per-channel message subscriptions or server-side focus state. Clients decide locally which events affect their current UI focus.
+- Presence is server-global user status (`online` / `dnd` / `afk` / `offline` / `invisible`) plus optional user activity with user-controlled privacy. Channel membership is a separate event stream and is filtered by channel ACL visibility.
+- State/control events must be delivered immediately in `seq` order. Message events are lower priority and may later be coalesced into batches and pushed asynchronously; batching must never delay state/control events.
+- Voice overload control uses fixed hard upper bounds as safety caps plus elastic soft limits adjusted by server load (fast decrease, slow recovery). Hard limits are startup configuration values with defaults and are optional to specify; the protocol package receives them from the application layer.
+- Role definitions and role assignments live in the database; there is no runtime roles.yaml. On first initialization the built-in roles (`owner`, `admin`, `member`) are seeded into the database.
+- Roles are defined once at server scope. Every role has an immutable key and an editable display name; `owner` is mandatory, always grants `*`, and only its display name may change.
+- Group/channel permission configs either inherit the nearest non-inheriting parent config or store a local copied snapshot that can be customized. Once a local snapshot exists, parent changes no longer propagate. Permission edits must be validated so the owner can always reset/repair the permission system.
+- Channels have a configurable capacity. A full channel rejects join; until real capacity limits are chosen, the default is the maximum value.
+- A metadata endpoint owns UDP voice endpoint discovery and exposes a single protocol version; the HTTP API and WS protocol are part of that one version, not separately versioned. Clients check the version themselves. The server never falls back to older protocol versions.
+- Voice diagnostics (`voice.stats` events) are part of the realtime protocol and are scoped to the user's own session/channel.
+- StateStore uses versioned state snapshots rather than holding a global write lock while serializing snapshots.
+- State synchronization is pluggable behind one sync-strategy interface. v1 implements full snapshot sync; visibility-aware fragment digest sync is the preferred future optimization and must not require wire-protocol breaking changes when introduced.
+- Server metrics are exposed through a metrics endpoint guarded by a `server.metrics` permission; per-user voice diagnostics use scoped `voice.stats` events instead.
 
 ## Build, Test, and Development Commands
 
