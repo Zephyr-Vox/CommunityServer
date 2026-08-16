@@ -28,12 +28,12 @@ func newTestApp(t *testing.T) *server.App {
 
 func newAppAt(t *testing.T, dir string) *server.App {
 	t.Helper()
-	return newTestAppWith(t, dir, "open", 120)
+	return newTestAppWith(t, dir, "open", 1200)
 }
 
 func newTestAppWithMode(t *testing.T, mode string) *server.App {
 	t.Helper()
-	return newTestAppWith(t, t.TempDir(), mode, 120)
+	return newTestAppWith(t, t.TempDir(), mode, 1200)
 }
 
 func newTestAppWith(t *testing.T, dir, registrationMode string, loginRateLimit float64) *server.App {
@@ -51,7 +51,7 @@ func newTestAppWith(t *testing.T, dir, registrationMode string, loginRateLimit f
 }
 
 func testConfig(dir string, httpPort int) *config.App {
-	return testConfigFull(dir, httpPort, "open", 120)
+	return testConfigFull(dir, httpPort, "open", 1200)
 }
 
 func testConfigFull(dir string, httpPort int, registrationMode string, loginRateLimit float64) *config.App {
