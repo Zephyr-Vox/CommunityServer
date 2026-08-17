@@ -12,8 +12,21 @@ Single-server community edition of a lightweight voice-community server, in the 
 - User management: list/detail, profile, roles, password reset, kick, ban/unban, hard delete
 - Invite management: create / list / delete invite codes
 - Presence: lightweight in-memory heartbeat-based online status
+- Realtime protocol model: each client has its own WS control connection; one account has at most one logical UDP voice session
 - Local object storage: disk-backed files with SQLite metadata and MIME detection
 - Avatars: upload/reset with unified JPEG transcoding (any decodable image in, 256×256 JPEG out), served from a public route
+
+## Realtime Connection Model
+
+The target realtime protocol keeps control and voice state separate:
+
+- A user may keep multiple WS control connections open, one for each client. Every connection receives the server and channel state it can see.
+- An account has at most one voice membership and one logical UDP voice session. A new voice join may replace the old voice session, but it does not close the old client's WS control connection.
+- Losing UDP voice keeps the WS control connections and presence alive. The server reports `voice.disconnected` or `voice.revoked`; the client can retry the channel join or show that voice is unavailable.
+- Closing the WS that owns voice immediately stops its UDP session and removes only that voice membership. Other WS connections remain usable.
+- Presence becomes offline only after the user's last WS control connection closes.
+
+This is the target protocol model. The current HTTP API list below still reflects the routes implemented in this repository.
 
 ## Quick Start
 
