@@ -32,7 +32,7 @@ var (
 	// would reuse a GCM nonce under the same direction key. Reading keeps
 	// working; only sending is disabled until the session expires.
 	ErrSequenceExhausted = errors.New("protocol: sequence exhausted")
-	// ErrInvalidUserID is returned by Create for a non-positive user id.
+	// ErrInvalidUserID is returned by Prepare for a non-positive user id.
 	ErrInvalidUserID = errors.New("protocol: user id must be positive")
 	// ErrSessionNotFound is returned when a session id is unknown or expired.
 	ErrSessionNotFound = errors.New("protocol: session not found")
@@ -105,20 +105,22 @@ type RevokedSessionSnapshot struct {
 type RevocationHandler func(reason RevocationReason, snap RevokedSessionSnapshot)
 
 // ExpiryHandler receives sessions that expired naturally and were removed by
-// Get or Purge. It runs outside Manager and Session locks, but on the UDP read
-// loop for lazy Get, so it must be non-blocking. Explicit Delete,
-// InvalidateUser and preemption do not emit expiry callbacks.
+// Get, Send, SessionIDByUser or Purge. It runs outside Manager and Session
+// locks on the goroutine that discovered the expiry, so it must be
+// non-blocking. Natural expiry rejects new Sends through active=false but does
+// not wait for pre-reserved writes because it has no notification ordering.
+// Explicit Delete, InvalidateUser and preemption do not emit expiry callbacks.
 type ExpiryHandler func(userID int64, sessionID [16]byte)
 
-// SessionInfo is the result of a successful Create call: the session id and,
-// in encrypted mode, the one-time master key for the caller's negotiation
-// response.
+// SessionInfo is the result of a successful ActivatePrepared call: the session
+// id and, in encrypted mode, the one-time master key for the caller's
+// negotiation response.
 type SessionInfo struct {
 	ID               [16]byte
 	Encrypted        bool
 	MasterKey        []byte // nil in plaintext mode
 	ExpiresAt        int64  // Unix milliseconds at creation time; slides with traffic
-	ReplacedPrevious bool   // whether Create preempted an active session
+	ReplacedPrevious bool   // whether activation preempted an active session
 }
 
 // SessionSnapshot is immutable diagnostic state for one session. It never
@@ -227,20 +229,6 @@ func (m *Manager) nowMillis() int64 {
 	return m.now().UnixMilli()
 }
 
-// Create registers a new active session for userID. One user has at most one
-// active session: creating a new session preempts the old one immediately.
-// Only an actually-active old session triggers RevocationReplaced; an
-// already-expired leftover is removed silently and does not count as
-// "replaced". The returned master key (encrypted mode only) is a one-time
-// secret and is not stored in the Manager.
-func (m *Manager) Create(userID int64, deviceID string, encrypted bool) (SessionInfo, error) {
-	prepared, err := m.Prepare(userID, deviceID, encrypted)
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	return m.ActivatePrepared(prepared, nil)
-}
-
 // Prepare performs every fallible session allocation without publishing it to
 // the Manager. The caller must later pass the result to ActivatePrepared.
 func (m *Manager) Prepare(userID int64, deviceID string, encrypted bool) (*PreparedSession, error) {
@@ -276,7 +264,7 @@ func (m *Manager) Prepare(userID int64, deviceID string, encrypted bool) (*Prepa
 	sess := newSession(id, userID, deviceID, encrypted, nowMS, c2sAEAD, s2cAEAD, m.limits, m.now)
 	// ExpiresAt is mutable after the session is published, so snapshot it
 	// under Session.mu before insertion. This also orders the response read
-	// before any future UDP Touch.
+	// before any future UDP traffic updates it.
 	sess.mu.Lock()
 	expiresAt := sess.ExpiresAt
 	sess.mu.Unlock()
@@ -285,7 +273,7 @@ func (m *Manager) Prepare(userID int64, deviceID string, encrypted bool) (*Prepa
 }
 
 // ActivatePrepared publishes prepared when the user's current session matches
-// expectedOldID. A nil expectation permits Create's unconditional preemption.
+// expectedOldID. A nil expectation permits an unconditional preemption.
 func (m *Manager) ActivatePrepared(prepared *PreparedSession, expectedOldID *[16]byte) (SessionInfo, error) {
 	if prepared == nil || prepared.session == nil || prepared.owner != m {
 		return SessionInfo{}, ErrSessionPrecondition
@@ -309,8 +297,7 @@ func (m *Manager) ActivatePrepared(prepared *PreparedSession, expectedOldID *[16
 	// same live session.
 	prepared.used = true
 	replaced := false
-	var snapshot *RevokedSessionSnapshot
-	var replacedSession *Session
+	var removedSession *Session
 	var revokeHandler RevocationHandler
 	if oldID, exists := m.byUser[userID]; exists {
 		if old, ok := m.sessions[oldID]; ok {
@@ -321,9 +308,7 @@ func (m *Manager) ActivatePrepared(prepared *PreparedSession, expectedOldID *[16
 			old.deactivateLocked()
 			old.mu.Unlock()
 			delete(m.sessions, oldID)
-			if replaced {
-				replacedSession = old
-			}
+			removedSession = old
 		}
 		delete(m.byUser, userID)
 	}
@@ -332,20 +317,10 @@ func (m *Manager) ActivatePrepared(prepared *PreparedSession, expectedOldID *[16
 	revokeHandler = m.onRevoke
 	m.mu.Unlock()
 	prepared.mu.Unlock()
-	if replacedSession != nil {
-		// The table swap is complete before waiting for Send, so another Create
-		// cannot observe a partially removed old session under Manager.mu.
-		replacedSession.sendMu.Lock()
-		replacedSession.mu.Lock()
-		snap := newRevokedSnapshotLocked(replacedSession)
-		replacedSession.mu.Unlock()
-		replacedSession.sendMu.Unlock()
-		snapshot = &snap
-	}
-
-	if snapshot != nil && revokeHandler != nil {
-		revokeHandler(RevocationReplaced, *snapshot)
-	}
+	// Explicit replacement must drain an already-reserved Send even when the
+	// session expired while that syscall was blocked. Expiry only suppresses the
+	// best-effort notification; it cannot release the write-order barrier.
+	runRevocation(revocationWork{session: removedSession, reason: RevocationReplaced, handler: revokeHandler, notify: replaced})
 
 	info := prepared.info
 	info.ReplacedPrevious = replaced
@@ -453,19 +428,6 @@ func (m *Manager) SessionIDByUser(userID int64) ([16]byte, bool) {
 	return [16]byte{}, false
 }
 
-// Touch slides the session deadline to now + SessionTTL. The UDP server calls
-// this (via Session.acceptPacket) for every packet that passes decryption and
-// replay, audio and heartbeat alike.
-func (m *Manager) Touch(id [16]byte) {
-	sess, ok := m.getSession(id)
-	if !ok {
-		return
-	}
-	sess.mu.Lock()
-	sess.touchLocked(m.nowMillis())
-	sess.mu.Unlock()
-}
-
 // InvalidateUser deletes every session registered to userID and returns how
 // many table entries were removed. Active sessions produce one
 // RevocationRevoked snapshot each; expired leftovers are removed silently.
@@ -479,9 +441,8 @@ func (m *Manager) InvalidateUser(userID int64) int {
 		return 0
 	}
 	sess, ok := m.sessions[id]
-	delete(m.sessions, id)
-	delete(m.byUser, userID)
 	if !ok {
+		delete(m.byUser, userID)
 		m.mu.Unlock()
 		return 0
 	}
@@ -492,18 +453,15 @@ func (m *Manager) InvalidateUser(userID int64) int {
 	sess.deactivateLocked()
 	sess.mu.Unlock()
 
+	delete(m.sessions, id)
+	delete(m.byUser, userID)
 	handler := m.onRevoke
 	m.mu.Unlock()
 
-	if active && handler != nil {
-		sess.sendMu.Lock()
-		sess.mu.Lock()
-		snap := newRevokedSnapshotLocked(sess)
-		sess.mu.Unlock()
-		sess.sendMu.Unlock()
-		// Run outside the manager lock: the handler may send a UDP packet.
-		handler(RevocationRevoked, snap)
-	}
+	// This always drains sendMu, including when the session expired or no UDP
+	// callback is wired. Otherwise an already-blocked Send could write old audio
+	// after this method returned. Only a still-active session may notify peers.
+	runRevocation(revocationWork{session: sess, reason: RevocationRevoked, handler: handler, notify: active})
 	return 1
 }
 
@@ -675,11 +633,44 @@ func (s *Session) reserveSendSeq() (seq uint64, encrypted bool, s2cAEAD cipher.A
 	return s.sendSeq, s.encrypted, s.s2cAEAD, cloneUDPAddr(s.remote), nil
 }
 
+// revocationWork retains a removed session until its in-flight Send operation
+// has drained and any eligible UDP notification has been reserved.
+type revocationWork struct {
+	session *Session
+	reason  RevocationReason
+	handler RevocationHandler
+	notify  bool
+}
+
+// runRevocation serializes explicit revocation behind old audio writes without
+// holding Manager.mu. It drains sendMu even without a notification handler so
+// removal is a Send barrier. A missing peer or exhausted sequence skips the
+// best-effort callback because no valid UDP notification can be built.
+func runRevocation(work revocationWork) {
+	if work.session == nil {
+		return
+	}
+
+	work.session.sendMu.Lock()
+	var snapshot *RevokedSessionSnapshot
+	if work.notify && work.handler != nil {
+		work.session.mu.Lock()
+		if work.session.remote != nil && work.session.sendSeq < math.MaxUint64 {
+			snap := newRevokedSnapshotLocked(work.session)
+			snapshot = &snap
+		}
+		work.session.mu.Unlock()
+	}
+	work.session.sendMu.Unlock()
+
+	if snapshot != nil {
+		work.handler(work.reason, *snapshot)
+	}
+}
+
 // newRevokedSnapshotLocked captures everything needed for a best-effort
-// revocation notification. Callers must hold Session.mu. The SendSeq is
-// reserved here (before deletion) and, like public Send reservations, is
-// never rolled back. If the sequence is already exhausted, SendSeq is 0 and
-// the UDP server skips the notification.
+// revocation notification. Callers must hold Session.mu after sendMu has
+// drained. The SendSeq reservation is never rolled back.
 func newRevokedSnapshotLocked(s *Session) RevokedSessionSnapshot {
 	snap := RevokedSessionSnapshot{
 		ID:        s.ID,

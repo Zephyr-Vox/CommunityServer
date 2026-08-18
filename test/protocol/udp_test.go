@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,45 @@ type blockingPacketConn struct {
 	started   chan struct{}
 	release   chan struct{}
 	writes    [][]byte
+}
+
+type failingPacketConn struct {
+	err    error
+	mu     sync.Mutex
+	closes int
+	closed bool
+}
+
+func (c *failingPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, c.err
+}
+
+func (c *failingPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	return 0, nil
+}
+
+func (c *failingPacketConn) Close() error {
+	c.mu.Lock()
+	c.closes++
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *failingPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (c *failingPacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *failingPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *failingPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *failingPacketConn) CloseCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closes
 }
 
 func (c *blockingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
@@ -54,6 +94,7 @@ const (
 
 type udpEnv struct {
 	t        *testing.T
+	clock    *testClock
 	mgr      *protocol.Manager
 	srv      *protocol.UDPServer
 	pc       *net.UDPConn
@@ -105,7 +146,7 @@ func newUDPEnvWithHandler(t *testing.T, encrypted bool, onFrame protocol.FrameHa
 	}
 	t.Cleanup(func() { _ = client.Close() })
 
-	info, err := mgr.Create(42, "dev-udp", encrypted)
+	info, err := activateSession(t, mgr, 42, "dev-udp", encrypted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +159,7 @@ func newUDPEnvWithHandler(t *testing.T, encrypted bool, onFrame protocol.FrameHa
 	}
 	return &udpEnv{
 		t:      t,
+		clock:  clock,
 		mgr:    mgr,
 		srv:    srv,
 		pc:     pc,
@@ -277,7 +319,7 @@ func TestUDPHeartbeatSemantics(t *testing.T) {
 	e.sendC2S(2, protocol.ChannelHeader{}, []byte("non-empty"))
 	e.expectNoFrame(150 * time.Millisecond)
 
-	// seq=0 heartbeat is rejected by the replay window. EncodePacket refuses
+	// seq=0 is rejected with the outer-header checks. EncodePacket refuses
 	// seq=0 by design, so craft the raw plaintext datagram here.
 	raw := make([]byte, protocol.HeaderSize+protocol.ChannelHeaderSize)
 	copy(raw[:4], protocol.Magic)
@@ -297,7 +339,7 @@ func TestUDPRevocationNotifications(t *testing.T) {
 	e.sendC2S(1, protocol.ChannelHeader{}, nil)
 	e.waitRemote(2 * time.Second)
 
-	newInfo, err := e.mgr.Create(42, "new-device", true)
+	newInfo, err := activateSession(t, e.mgr, 42, "new-device", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,6 +434,237 @@ func TestUDPRateLimitDropsBurstOverflow(t *testing.T) {
 		}
 	}
 	e.expectNoFrame(200 * time.Millisecond)
+}
+
+func TestUDPReplayDoesNotConsumeSessionBudget(t *testing.T) {
+	e := newUDPEnv(t, false)
+	e.sendC2S(1, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("first"))
+	e.waitFrame(2 * time.Second)
+	for range protocol.SessionBurst + 10 {
+		e.sendC2S(1, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("replay"))
+	}
+	e.sendC2S(2, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("second"))
+	if frame := e.waitFrame(2 * time.Second); frame.TransportSeq != 2 {
+		t.Fatalf("frame after replay flood = %+v", frame)
+	}
+}
+
+func TestUDPEncryptedReplayDoesNotConsumeSessionBudget(t *testing.T) {
+	e := newUDPEnv(t, true)
+	e.sendC2S(1, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("first"))
+	e.waitFrame(2 * time.Second)
+	for range protocol.SessionBurst + 10 {
+		e.sendC2S(1, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("replay"))
+	}
+	e.sendC2S(2, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("second"))
+	if frame := e.waitFrame(2 * time.Second); frame.TransportSeq != 2 {
+		t.Fatalf("encrypted frame after replay flood = %+v", frame)
+	}
+}
+
+func TestUDPRateLimitedPacketDoesNotAdvanceReplayWindow(t *testing.T) {
+	e := newUDPEnv(t, false)
+	for seq := uint64(1); seq <= protocol.SessionBurst; seq++ {
+		e.sendC2S(seq, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("accepted"))
+	}
+	for range protocol.SessionBurst {
+		e.waitFrame(2 * time.Second)
+	}
+	const limitedSeq = protocol.SessionBurst + 1
+	e.sendC2S(limitedSeq, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("limited"))
+	e.expectNoFrame(150 * time.Millisecond)
+	e.clock.Advance(time.Second)
+	e.sendC2S(limitedSeq, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("retry"))
+	if frame := e.waitFrame(2 * time.Second); frame.TransportSeq != limitedSeq {
+		t.Fatalf("rate-limited sequence was marked replayed: %+v", frame)
+	}
+}
+
+func TestUDPForgedCiphertextDoesNotLearnRemote(t *testing.T) {
+	e := newUDPEnv(t, true)
+	packet, err := protocol.EncodePacket(e.info.ID, 1, true, e.c2s, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("forged"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet[protocol.HeaderSize] ^= 1
+	for range 16 {
+		if _, err := e.client.Write(packet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.expectNoFrame(150 * time.Millisecond)
+	if err := e.srv.Send(e.info.ID, testMicChannelType, 7, 0, nil); !errors.Is(err, protocol.ErrNoPeer) {
+		t.Fatalf("forged ciphertext learned a remote peer: %v", err)
+	}
+	e.sendC2S(1, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("valid"))
+	if frame := e.waitFrame(2 * time.Second); frame.TransportSeq != 1 {
+		t.Fatalf("valid packet after forged ciphertext = %+v", frame)
+	}
+}
+
+func TestUDPPlaintextForgedFreshSequenceAcceptedBoundary(t *testing.T) {
+	e := newUDPEnv(t, false)
+	attacker, err := net.DialUDP("udp4", nil, e.pc.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer attacker.Close()
+	forged, err := protocol.EncodePacket(e.info.ID, 1, false, nil, protocol.ChannelHeader{ChannelType: testMicChannelType, ChannelSeq: 9}, []byte("forged"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attacker.Write(forged); err != nil {
+		t.Fatal(err)
+	}
+	frame := e.waitFrame(2 * time.Second)
+	if frame.TransportSeq != 1 || frame.ChannelSeq != 9 || !bytes.Equal(frame.Payload, []byte("forged")) {
+		t.Fatalf("forged plaintext frame = %+v", frame)
+	}
+
+	// Plaintext deliberately has no authentication. A structurally valid fresh
+	// sequence is accepted, while the replay window still rejects repetition.
+	if _, err := attacker.Write(forged); err != nil {
+		t.Fatal(err)
+	}
+	e.expectNoFrame(150 * time.Millisecond)
+}
+
+func TestUDPForgedCiphertextCannotExhaustTinySessionBudget(t *testing.T) {
+	clock := &testClock{now: time.Unix(1_700_000_000, 0)}
+	mgr, err := protocol.NewManagerWithLimits(clock.Now, protocol.Limits{SessionPacketsPerSec: 1, SessionBurst: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := protocol.NewChannelTypeRegistry()
+	if err := registry.Register(testMicChannelType, protocol.Capabilities{Name: "mic"}); err != nil {
+		t.Fatal(err)
+	}
+	frames := make(chan protocol.InboundFrame, 2)
+	srv, err := protocol.NewUDPServer(mgr, registry, func(frame protocol.InboundFrame) { frames <- frame }, protocol.DefaultIngressLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.Start(pc); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	client, err := net.DialUDP("udp4", nil, pc.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	info, err := activateSession(t, mgr, 42, "encrypted", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2s, _, err := protocol.DeriveDirectionKeys(info.ID, info.MasterKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid, err := protocol.EncodePacket(info.ID, 1, true, c2s, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("valid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := append([]byte(nil), valid...)
+	forged[protocol.HeaderSize] ^= 1
+	for range 16 {
+		if _, err := client.Write(forged); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := client.Write(valid); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-frames:
+		if frame.TransportSeq != 1 || !bytes.Equal(frame.Payload, []byte("valid")) {
+			t.Fatalf("frame after forged flood = %+v", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("valid frame was rejected after forged flood")
+	}
+}
+
+func TestUDPIngressBoundsForgedCiphertextAuthenticationWork(t *testing.T) {
+	clock := &testClock{now: time.Unix(1_700_000_000, 0)}
+	mgr := protocol.NewManager(clock.Now)
+	registry := protocol.NewChannelTypeRegistry()
+	if err := registry.Register(testMicChannelType, protocol.Capabilities{Name: "mic"}); err != nil {
+		t.Fatal(err)
+	}
+	var received atomic.Int64
+	var authenticationDrops atomic.Int64
+	var ingressDrops atomic.Int64
+	limits := protocol.IngressLimits{
+		GlobalPacketsPerSec: 1,
+		GlobalBurst:         1,
+		SourcePacketsPerSec: 1,
+		SourceBurst:         1,
+		SourceEntryLimit:    1,
+		SourceEntryTTL:      time.Minute,
+	}
+	srv, err := protocol.NewUDPServer(mgr, registry, nil, limits, protocol.WithStatsHandler(func(sample protocol.StatsSample) {
+		switch sample.Kind {
+		case protocol.StatsPacketReceived:
+			received.Add(1)
+		case protocol.StatsDroppedAuthentication:
+			authenticationDrops.Add(1)
+		case protocol.StatsDroppedGlobalIngress, protocol.StatsDroppedSourceIngress:
+			ingressDrops.Add(1)
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.Start(pc); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	client, err := net.DialUDP("udp4", nil, pc.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	info, err := activateSession(t, mgr, 42, "encrypted", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2s, _, err := protocol.DeriveDirectionKeys(info.ID, info.MasterKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged, err := protocol.EncodePacket(info.ID, 1, true, c2s, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("forged"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged[protocol.HeaderSize] ^= 1
+	const packets = 16
+	for range packets {
+		if _, err := client.Write(forged); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for received.Load() < packets && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if received.Load() != packets {
+		t.Fatalf("received stats = %d, want %d", received.Load(), packets)
+	}
+	if authenticationDrops.Load() != 1 {
+		t.Fatalf("AEAD authentication attempts = %d, want 1", authenticationDrops.Load())
+	}
+	if ingressDrops.Load() != packets-1 {
+		t.Fatalf("ingress drops = %d, want %d", ingressDrops.Load(), packets-1)
+	}
 }
 
 func TestUDPSendValidation(t *testing.T) {
@@ -510,7 +783,7 @@ func TestUDPOnFramePayloadMustBeCopiedForAsyncUse(t *testing.T) {
 func TestPurgeLoopRunsOnInjectedTicks(t *testing.T) {
 	clock := &testClock{now: time.Unix(1_700_000_000, 0)}
 	mgr := protocol.NewManager(clock.Now)
-	if _, err := mgr.Create(1, "", false); err != nil {
+	if _, err := activateSession(t, mgr, 1, "", false); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := protocol.NewUDPServer(mgr, protocol.NewChannelTypeRegistry(), nil, protocol.DefaultIngressLimits())
@@ -566,6 +839,28 @@ func TestUDPStartThenImmediateCloseReleasesPort(t *testing.T) {
 	_ = probe.Close()
 }
 
+func TestUDPStartSynchronouslySealsRegistry(t *testing.T) {
+	registry := protocol.NewChannelTypeRegistry()
+	if err := registry.Register(testMicChannelType, protocol.Capabilities{Name: "mic"}); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := protocol.NewUDPServer(protocol.NewManager(time.Now), registry, nil, protocol.DefaultIngressLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.Start(pc); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	if err := registry.Register(testDesktopAudioChannelType, protocol.Capabilities{Name: "desktop"}); err == nil {
+		t.Fatal("registry accepted a registration after Start returned")
+	}
+}
+
 func TestUDPStartAfterCloseReleasesRejectedConn(t *testing.T) {
 	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
@@ -588,6 +883,57 @@ func TestUDPStartAfterCloseReleasesRejectedConn(t *testing.T) {
 		t.Fatalf("rejected conn was not closed: %v", err)
 	}
 	_ = probe.Close()
+}
+
+func TestUDPStartRejectsSecondConnAndClosesIt(t *testing.T) {
+	srv, err := protocol.NewUDPServer(protocol.NewManager(time.Now), protocol.NewChannelTypeRegistry(), nil, protocol.DefaultIngressLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.Start(first); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	second, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.Start(second); err == nil {
+		t.Fatal("second Start unexpectedly succeeded")
+	}
+	if _, err := second.WriteTo([]byte("x"), first.LocalAddr()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("rejected second conn remained open: %v", err)
+	}
+}
+
+func TestUDPReadFailureClosesConnAndPreventsRestart(t *testing.T) {
+	readErr := errors.New("read failed")
+	srv, err := protocol.NewUDPServer(protocol.NewManager(time.Now), protocol.NewChannelTypeRegistry(), nil, protocol.DefaultIngressLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := &failingPacketConn{err: readErr}
+	errCh, err := srv.Start(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; !errors.Is(err, readErr) {
+		t.Fatalf("read-loop error = %v, want %v", err, readErr)
+	}
+	if first.CloseCount() != 1 {
+		t.Fatalf("first conn close count = %d, want 1", first.CloseCount())
+	}
+	second := &failingPacketConn{err: readErr}
+	if _, err := srv.Start(second); err == nil {
+		t.Fatal("Start after read failure unexpectedly succeeded")
+	}
+	if second.CloseCount() != 1 {
+		t.Fatalf("rejected conn close count = %d, want 1", second.CloseCount())
+	}
 }
 
 func TestUDPStatsHandlerReceivesLifecycleSamples(t *testing.T) {
@@ -624,7 +970,7 @@ func TestUDPStatsHandlerReceivesLifecycleSamples(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Close() })
 
-	info, err := mgr.Create(42, "dev-stats", false)
+	info, err := activateSession(t, mgr, 42, "dev-stats", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -693,7 +1039,7 @@ func TestUDPServerHonorsCustomManagerLimits(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Close() })
 
-	info, err := mgr.Create(42, "dev-limit", false)
+	info, err := activateSession(t, mgr, 42, "dev-limit", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -749,7 +1095,7 @@ func TestUDPReplacementWaitsForSendAndDeactivatesOldSession(t *testing.T) {
 	}
 	defer client.Close()
 
-	old, err := mgr.Create(42, "old", false)
+	old, err := activateSession(t, mgr, 42, "old", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -778,12 +1124,12 @@ func TestUDPReplacementWaitsForSendAndDeactivatesOldSession(t *testing.T) {
 
 	replaceDone := make(chan error, 1)
 	go func() {
-		_, err := mgr.Create(42, "new", false)
+		_, err := activateSession(t, mgr, 42, "new", false)
 		replaceDone <- err
 	}()
 	select {
 	case err := <-replaceDone:
-		t.Fatalf("Create returned while Send was blocked: %v", err)
+		t.Fatalf("activation returned while Send was blocked: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 	close(pc.release)
@@ -791,7 +1137,7 @@ func TestUDPReplacementWaitsForSendAndDeactivatesOldSession(t *testing.T) {
 		t.Fatalf("blocked Send = %v", err)
 	}
 	if err := <-replaceDone; err != nil {
-		t.Fatalf("replacement Create = %v", err)
+		t.Fatalf("replacement activation = %v", err)
 	}
 
 	writes := pc.Writes()[baseline:]
@@ -823,5 +1169,319 @@ func TestUDPReplacementWaitsForSendAndDeactivatesOldSession(t *testing.T) {
 	case frame := <-frames:
 		t.Fatalf("replaced session delivered frame: %+v", frame)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestUDPExpiredInvalidateWaitsForSendWithoutRevocationHandler(t *testing.T) {
+	clock := &testClock{now: time.Unix(1_700_000_000, 0)}
+	mgr := protocol.NewManager(clock.Now)
+	registry := protocol.NewChannelTypeRegistry()
+	if err := registry.Register(testMicChannelType, protocol.Capabilities{Name: "mic"}); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := protocol.NewUDPServer(mgr, registry, nil, protocol.DefaultIngressLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	underlying, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc := &blockingPacketConn{PacketConn: underlying, started: make(chan struct{}), release: make(chan struct{})}
+	if _, err := srv.Start(pc); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	client, err := net.DialUDP("udp4", nil, underlying.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	info, err := activateSession(t, mgr, 42, "old", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeat, err := protocol.EncodePacket(info.ID, 1, false, nil, protocol.ChannelHeader{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if err := srv.Send(info.ID, testMicChannelType, 7, 0, nil); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server did not learn client address")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	pc.BlockNextWrite()
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- srv.Send(info.ID, testMicChannelType, 7, 1, []byte("audio")) }()
+	<-pc.started
+	clock.Advance(protocol.SessionTTL)
+
+	invalidateDone := make(chan int, 1)
+	go func() { invalidateDone <- mgr.InvalidateUser(42) }()
+	select {
+	case n := <-invalidateDone:
+		t.Fatalf("InvalidateUser returned before blocked Send drained: %d", n)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(pc.release)
+	if err := <-sendDone; err != nil {
+		t.Fatalf("blocked Send = %v", err)
+	}
+	if n := <-invalidateDone; n != 1 {
+		t.Fatalf("InvalidateUser = %d, want 1", n)
+	}
+	if err := srv.Send(info.ID, testMicChannelType, 7, 2, nil); !errors.Is(err, protocol.ErrSessionNotFound) {
+		t.Fatalf("Send after invalidation = %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestUDPActiveInvalidateWritesRevocationAfterAudio(t *testing.T) {
+	clock := &testClock{now: time.Unix(1_700_000_000, 0)}
+	mgr := protocol.NewManager(clock.Now)
+	registry := protocol.NewChannelTypeRegistry()
+	if err := registry.Register(testMicChannelType, protocol.Capabilities{Name: "mic"}); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := protocol.NewUDPServer(mgr, registry, nil, protocol.DefaultIngressLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.SetRevocationHandler(srv.HandleRevocation)
+	underlying, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc := &blockingPacketConn{PacketConn: underlying, started: make(chan struct{}), release: make(chan struct{})}
+	if _, err := srv.Start(pc); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	client, err := net.DialUDP("udp4", nil, underlying.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	info, err := activateSession(t, mgr, 42, "active", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeat, err := protocol.EncodePacket(info.ID, 1, false, nil, protocol.ChannelHeader{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if err := srv.Send(info.ID, testMicChannelType, 7, 0, nil); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server did not learn client address")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	baseline := len(pc.Writes())
+	pc.BlockNextWrite()
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- srv.Send(info.ID, testMicChannelType, 7, 1, []byte("audio")) }()
+	<-pc.started
+	invalidateDone := make(chan int, 1)
+	go func() { invalidateDone <- mgr.InvalidateUser(42) }()
+	select {
+	case n := <-invalidateDone:
+		t.Fatalf("active InvalidateUser returned early: %d", n)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(pc.release)
+	if err := <-sendDone; err != nil {
+		t.Fatalf("blocked Send = %v", err)
+	}
+	if n := <-invalidateDone; n != 1 {
+		t.Fatalf("InvalidateUser = %d, want 1", n)
+	}
+	writes := pc.Writes()[baseline:]
+	if len(writes) != 2 {
+		t.Fatalf("writes after active invalidation = %d, want audio+revocation", len(writes))
+	}
+	_, audioSeq, audioHeader, _, ok := protocol.DecodePacket(writes[0], false, nil)
+	if !ok || audioHeader.ChannelType != testMicChannelType {
+		t.Fatalf("first invalidation write = %+v", audioHeader)
+	}
+	_, revokeSeq, revokeHeader, payload, ok := protocol.DecodePacket(writes[1], false, nil)
+	if !ok || revokeHeader.ChannelType != protocol.HeartbeatChannelType || len(payload) != 1 || payload[0] != byte(protocol.RevocationRevoked) {
+		t.Fatalf("second invalidation write = header=%+v payload=%x", revokeHeader, payload)
+	}
+	if revokeSeq <= audioSeq {
+		t.Fatalf("revocation sequence %d did not follow audio %d", revokeSeq, audioSeq)
+	}
+	if err := srv.Send(info.ID, testMicChannelType, 7, 2, nil); !errors.Is(err, protocol.ErrSessionNotFound) {
+		t.Fatalf("Send after active invalidation = %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestUDPTeardownAfterGetSessionDropsInFlightFrame(t *testing.T) {
+	tests := []struct {
+		name     string
+		teardown func(*udpEnv)
+	}{
+		{
+			name: "invalidate",
+			teardown: func(e *udpEnv) {
+				if n := e.mgr.InvalidateUser(42); n != 1 {
+					e.t.Fatalf("InvalidateUser = %d, want 1", n)
+				}
+			},
+		},
+		{
+			name: "purge",
+			teardown: func(e *udpEnv) {
+				e.clock.Advance(protocol.SessionTTL)
+				if n := e.mgr.Purge(); n != 1 {
+					e.t.Fatalf("Purge = %d, want 1", n)
+				}
+			},
+		},
+		{
+			name: "activate_prepared",
+			teardown: func(e *udpEnv) {
+				prepared, err := e.mgr.Prepare(42, "replacement", false)
+				if err != nil {
+					e.t.Fatal(err)
+				}
+				info, err := e.mgr.ActivatePrepared(prepared, &e.info.ID)
+				if err != nil {
+					e.t.Fatal(err)
+				}
+				if !info.ReplacedPrevious {
+					e.t.Fatal("ActivatePrepared did not replace the parked session")
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			frames := make(chan protocol.InboundFrame, 1)
+			paused := make(chan struct{})
+			release := make(chan struct{})
+			var pausedOnce sync.Once
+			var releaseOnce sync.Once
+			releaseGate := func() { releaseOnce.Do(func() { close(release) }) }
+			defer releaseGate()
+			e := newUDPEnvWithHandler(t, false, func(frame protocol.InboundFrame) {
+				frames <- frame
+			}, protocol.WithReceiveGate(func() {
+				pausedOnce.Do(func() { close(paused) })
+				<-release
+			}))
+			e.frames = frames
+
+			e.sendC2S(1, protocol.ChannelHeader{ChannelType: testMicChannelType}, []byte("in-flight"))
+			select {
+			case <-paused:
+			case <-time.After(2 * time.Second):
+				t.Fatal("receive did not pause after getSession")
+			}
+			tc.teardown(e)
+			releaseGate()
+			e.expectNoFrame(100 * time.Millisecond)
+			if err := e.srv.Send(e.info.ID, testMicChannelType, 7, 0, nil); !errors.Is(err, protocol.ErrSessionNotFound) {
+				t.Fatalf("Send after %s = %v, want ErrSessionNotFound", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestUDPExpiredReplacementWaitsForSendWithoutNotification(t *testing.T) {
+	clock := &testClock{now: time.Unix(1_700_000_000, 0)}
+	mgr := protocol.NewManager(clock.Now)
+	registry := protocol.NewChannelTypeRegistry()
+	if err := registry.Register(testMicChannelType, protocol.Capabilities{Name: "mic"}); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := protocol.NewUDPServer(mgr, registry, nil, protocol.DefaultIngressLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.SetRevocationHandler(srv.HandleRevocation)
+	underlying, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc := &blockingPacketConn{PacketConn: underlying, started: make(chan struct{}), release: make(chan struct{})}
+	if _, err := srv.Start(pc); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	client, err := net.DialUDP("udp4", nil, underlying.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	old, err := activateSession(t, mgr, 42, "old", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeat, err := protocol.EncodePacket(old.ID, 1, false, nil, protocol.ChannelHeader{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if err := srv.Send(old.ID, testMicChannelType, 7, 0, nil); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server did not learn client address")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	baseline := len(pc.Writes())
+	pc.BlockNextWrite()
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- srv.Send(old.ID, testMicChannelType, 7, 1, []byte("audio")) }()
+	<-pc.started
+	clock.Advance(protocol.SessionTTL)
+	prepared, err := mgr.Prepare(42, "new", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaceDone := make(chan error, 1)
+	go func() {
+		_, err := mgr.ActivatePrepared(prepared, nil)
+		replaceDone <- err
+	}()
+	select {
+	case err := <-replaceDone:
+		t.Fatalf("expired replacement returned before blocked Send drained: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(pc.release)
+	if err := <-sendDone; err != nil {
+		t.Fatalf("blocked Send = %v", err)
+	}
+	if err := <-replaceDone; err != nil {
+		t.Fatalf("expired replacement = %v", err)
+	}
+	writes := pc.Writes()[baseline:]
+	if len(writes) != 1 {
+		t.Fatalf("writes after expired replacement = %d, want only audio", len(writes))
+	}
+	if _, _, ch, _, ok := protocol.DecodePacket(writes[0], false, nil); !ok || ch.ChannelType != testMicChannelType {
+		t.Fatalf("expired replacement write = %x", writes[0])
 	}
 }

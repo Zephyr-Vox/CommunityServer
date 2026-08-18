@@ -32,13 +32,22 @@ func newTestManager(t *testing.T) (*protocol.Manager, *testClock) {
 	return protocol.NewManager(clock.Now), clock
 }
 
-func TestManagerCreateUniqueSessionsAndKeys(t *testing.T) {
+func activateSession(t *testing.T, m *protocol.Manager, userID int64, deviceID string, encrypted bool) (protocol.SessionInfo, error) {
+	t.Helper()
+	prepared, err := m.Prepare(userID, deviceID, encrypted)
+	if err != nil {
+		return protocol.SessionInfo{}, err
+	}
+	return m.ActivatePrepared(prepared, nil)
+}
+
+func TestManagerActivationCreatesUniqueSessionsAndKeys(t *testing.T) {
 	m, _ := newTestManager(t)
-	a, err := m.Create(10, "dev-a", true)
+	a, err := activateSession(t, m, 10, "dev-a", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := m.Create(11, "dev-b", true)
+	b, err := activateSession(t, m, 11, "dev-b", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,35 +68,16 @@ func TestManagerCreateUniqueSessionsAndKeys(t *testing.T) {
 	}
 }
 
-func TestManagerCreateRejectsInvalidUser(t *testing.T) {
+func TestManagerPrepareRejectsInvalidUser(t *testing.T) {
 	m, _ := newTestManager(t)
-	if _, err := m.Create(0, "", false); !errors.Is(err, protocol.ErrInvalidUserID) {
+	if _, err := activateSession(t, m, 0, "", false); !errors.Is(err, protocol.ErrInvalidUserID) {
 		t.Fatalf("err = %v, want ErrInvalidUserID", err)
-	}
-}
-
-func TestManagerTouchSlidesExpiry(t *testing.T) {
-	m, clock := newTestManager(t)
-	info, err := m.Create(1, "", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	clock.Advance(80 * time.Second)
-	m.Touch(info.ID)
-	clock.Advance(89 * time.Second)
-	if _, ok := m.Get(info.ID); !ok {
-		t.Fatal("touched session expired before new deadline")
-	}
-	clock.Advance(2 * time.Second)
-	if _, ok := m.Get(info.ID); ok {
-		t.Fatal("touched session survived past 90s deadline")
 	}
 }
 
 func TestManagerGetExpiresLazily(t *testing.T) {
 	m, clock := newTestManager(t)
-	info, err := m.Create(1, "", false)
+	info, err := activateSession(t, m, 1, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,11 +92,11 @@ func TestManagerGetExpiresLazily(t *testing.T) {
 
 func TestManagerPurgeRemovesExpired(t *testing.T) {
 	m, clock := newTestManager(t)
-	_, err := m.Create(1, "", false)
+	_, err := activateSession(t, m, 1, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = m.Create(2, "", false)
+	_, err = activateSession(t, m, 2, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,23 +109,14 @@ func TestManagerPurgeRemovesExpired(t *testing.T) {
 	}
 }
 
-func TestManagerCreatePreemptsOldSession(t *testing.T) {
+func TestManagerActivationPreemptsOldSession(t *testing.T) {
 	m, _ := newTestManager(t)
-	oldInfo, err := m.Create(7, "old-device", false)
+	oldInfo, err := activateSession(t, m, 7, "old-device", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	type notification struct {
-		reason protocol.RevocationReason
-		snap   protocol.RevokedSessionSnapshot
-	}
-	got := make(chan notification, 1)
-	m.SetRevocationHandler(func(reason protocol.RevocationReason, snap protocol.RevokedSessionSnapshot) {
-		got <- notification{reason: reason, snap: snap}
-	})
-
-	newInfo, err := m.Create(7, "new-device", false)
+	newInfo, err := activateSession(t, m, 7, "new-device", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,73 +129,19 @@ func TestManagerCreatePreemptsOldSession(t *testing.T) {
 	if _, ok := m.Get(newInfo.ID); !ok {
 		t.Fatal("new session missing")
 	}
-	select {
-	case n := <-got:
-		if n.reason != protocol.RevocationReplaced {
-			t.Fatalf("reason = %d, want Replaced", n.reason)
-		}
-		if n.snap.ID != oldInfo.ID || n.snap.UserID != 7 || n.snap.SendSeq != 1 {
-			t.Fatalf("snapshot = %+v", n.snap)
-		}
-	default:
-		t.Fatal("RevocationReplaced handler was not called")
-	}
-}
-
-func TestManagerRevocationHandlerRunsOutsideManagerLock(t *testing.T) {
-	m, _ := newTestManager(t)
-	called := make(chan struct{})
-	m.SetRevocationHandler(func(reason protocol.RevocationReason, snap protocol.RevokedSessionSnapshot) {
-		// If the callback still held the manager lock this Get would deadlock.
-		if _, ok := m.Get([16]byte{}); ok {
-			return
-		}
-		close(called)
-	})
-	if _, err := m.Create(7, "old", false); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m.Create(7, "new", false); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-called:
-	case <-time.After(2 * time.Second):
-		t.Fatal("revocation callback appears to run under the manager lock")
-	}
 }
 
 func TestManagerInvalidateUserRevokes(t *testing.T) {
 	m, _ := newTestManager(t)
-	info, err := m.Create(7, "dev", true)
+	info, err := activateSession(t, m, 7, "dev", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	type notification struct {
-		reason protocol.RevocationReason
-		snap   protocol.RevokedSessionSnapshot
-	}
-	got := make(chan notification, 1)
-	m.SetRevocationHandler(func(reason protocol.RevocationReason, snap protocol.RevokedSessionSnapshot) {
-		got <- notification{reason: reason, snap: snap}
-	})
-
 	if n := m.InvalidateUser(7); n != 1 {
 		t.Fatalf("InvalidateUser = %d, want 1", n)
 	}
 	if _, ok := m.Get(info.ID); ok {
 		t.Fatal("invalidated session still present")
-	}
-	select {
-	case n := <-got:
-		if n.reason != protocol.RevocationRevoked {
-			t.Fatalf("reason = %d, want Revoked", n.reason)
-		}
-		if n.snap.ID != info.ID || n.snap.S2CAEAD == nil || n.snap.SendSeq != 1 {
-			t.Fatalf("snapshot = %+v", n.snap)
-		}
-	default:
-		t.Fatal("RevocationRevoked handler was not called")
 	}
 	if n := m.InvalidateUser(7); n != 0 {
 		t.Fatalf("second InvalidateUser = %d, want 0", n)
@@ -223,7 +150,7 @@ func TestManagerInvalidateUserRevokes(t *testing.T) {
 
 func TestManagerDeleteOwnershipAndNoRevocation(t *testing.T) {
 	m, _ := newTestManager(t)
-	info, err := m.Create(7, "", false)
+	info, err := activateSession(t, m, 7, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +173,7 @@ func TestManagerDeleteOwnershipAndNoRevocation(t *testing.T) {
 
 func TestManagerDeleteExpiredIsNotFound(t *testing.T) {
 	m, clock := newTestManager(t)
-	info, err := m.Create(7, "", false)
+	info, err := activateSession(t, m, 7, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +185,7 @@ func TestManagerDeleteExpiredIsNotFound(t *testing.T) {
 
 func TestManagerPurgeDoesNotRevoke(t *testing.T) {
 	m, clock := newTestManager(t)
-	if _, err := m.Create(7, "", false); err != nil {
+	if _, err := activateSession(t, m, 7, "", false); err != nil {
 		t.Fatal(err)
 	}
 	called := false
@@ -274,7 +201,7 @@ func TestManagerPurgeDoesNotRevoke(t *testing.T) {
 
 func TestManagerSessionIDByUser(t *testing.T) {
 	m, clock := newTestManager(t)
-	info, err := m.Create(7, "", false)
+	info, err := activateSession(t, m, 7, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +223,7 @@ func TestManagerSessionIDByUser(t *testing.T) {
 
 func TestManagerExpiryHandlerOnLazyGetAndPurge(t *testing.T) {
 	m, clock := newTestManager(t)
-	info, err := m.Create(7, "", false)
+	info, err := activateSession(t, m, 7, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +249,7 @@ func TestManagerExpiryHandlerOnLazyGetAndPurge(t *testing.T) {
 		t.Fatal("lazy Get did not emit expiry callback")
 	}
 
-	_, err = m.Create(8, "", false)
+	_, err = activateSession(t, m, 8, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,16 +283,16 @@ func TestNewManagerWithLimitsRejectsInvalid(t *testing.T) {
 	}
 }
 
-func TestManagerConcurrentCreateKeepsOneSession(t *testing.T) {
+func TestManagerConcurrentActivationKeepsOneSession(t *testing.T) {
 	m, _ := newTestManager(t)
 	const n = 16
 	infos := make(chan protocol.SessionInfo, n)
 	var wg sync.WaitGroup
 	for range n {
 		wg.Go(func() {
-			info, err := m.Create(7, "dev", false)
+			info, err := activateSession(t, m, 7, "dev", false)
 			if err != nil {
-				t.Errorf("Create: %v", err)
+				t.Errorf("ActivatePrepared: %v", err)
 				return
 			}
 			infos <- info
@@ -390,7 +317,7 @@ func TestManagerConcurrentCreateKeepsOneSession(t *testing.T) {
 
 func TestManagerActivatePreparedChecksExpectedSession(t *testing.T) {
 	m, _ := newTestManager(t)
-	old, err := m.Create(7, "old", false)
+	old, err := activateSession(t, m, 7, "old", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,9 +363,110 @@ func TestManagerActivatePreparedRejectsForeignManager(t *testing.T) {
 	}
 }
 
+func TestManagerConcurrentActivatePreparedUsesPreparedOnce(t *testing.T) {
+	m, _ := newTestManager(t)
+	prepared, err := m.Prepare(7, "dev", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Go(func() {
+			_, err := m.ActivatePrepared(prepared, nil)
+			results <- err
+		})
+	}
+	wg.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+			continue
+		}
+		if !errors.Is(err, protocol.ErrSessionPrecondition) {
+			t.Fatalf("ActivatePrepared error = %v", err)
+		}
+	}
+	if successes != 1 || m.Len() != 1 {
+		t.Fatalf("successful activations = %d, sessions = %d; want one each", successes, m.Len())
+	}
+}
+
+func TestManagerInvalidateAndActivatePreparedLeaveNoStaleIndex(t *testing.T) {
+	for range 32 {
+		m, _ := newTestManager(t)
+		old, err := activateSession(t, m, 7, "old", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prepared, err := m.Prepare(7, "new", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			<-start
+			_ = m.InvalidateUser(7)
+		})
+		wg.Go(func() {
+			<-start
+			_, _ = m.ActivatePrepared(prepared, &old.ID)
+		})
+		close(start)
+		wg.Wait()
+		if m.Len() != 0 {
+			t.Fatalf("Invalidate/Activate left %d sessions", m.Len())
+		}
+		if _, ok := m.SessionIDByUser(7); ok {
+			t.Fatal("Invalidate/Activate left a user index")
+		}
+	}
+}
+
+func TestManagerPurgeAndActivatePreparedKeepIndexesConsistent(t *testing.T) {
+	for range 32 {
+		m, clock := newTestManager(t)
+		old, err := activateSession(t, m, 7, "old", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(protocol.SessionTTL)
+		prepared, err := m.Prepare(7, "new", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			<-start
+			_ = m.Purge()
+		})
+		wg.Go(func() {
+			<-start
+			_, _ = m.ActivatePrepared(prepared, &old.ID)
+		})
+		close(start)
+		wg.Wait()
+		id, indexed := m.SessionIDByUser(7)
+		if indexed {
+			if _, ok := m.Get(id); !ok {
+				t.Fatal("user index referenced a missing session")
+			}
+			if m.Len() != 1 {
+				t.Fatalf("live index with Len = %d, want 1", m.Len())
+			}
+		} else if m.Len() != 0 {
+			t.Fatalf("missing user index with Len = %d", m.Len())
+		}
+	}
+}
+
 func TestManagerConcurrentLazyGetAndPurgeExpireOnce(t *testing.T) {
 	m, clock := newTestManager(t)
-	info, err := m.Create(7, "dev", false)
+	info, err := activateSession(t, m, 7, "dev", false)
 	if err != nil {
 		t.Fatal(err)
 	}

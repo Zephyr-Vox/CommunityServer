@@ -94,8 +94,8 @@ func putOuterHeader(dst []byte, sessionID [16]byte, seq uint64) {
 
 // parseOuterHeader validates the outer header and returns the session id and
 // sequence. Any invalid packet is reported as ok=false: unknown magic,
-// version, reserved flags, truncation and oversize datagrams are all dropped
-// silently by the UDP layer, never answered.
+// version, reserved flags, sequence zero, truncation and oversize datagrams
+// are all dropped silently by the UDP layer, never answered.
 func parseOuterHeader(p []byte) (sessionID [16]byte, seq uint64, ok bool) {
 	if len(p) < HeaderSize || len(p) > MaxPacketSize {
 		return sessionID, 0, false
@@ -105,6 +105,9 @@ func parseOuterHeader(p []byte) (sessionID [16]byte, seq uint64, ok bool) {
 	}
 	copy(sessionID[:], p[6:22])
 	seq = binary.BigEndian.Uint64(p[22:30])
+	if seq == 0 {
+		return sessionID, 0, false
+	}
 	return sessionID, seq, true
 }
 
@@ -158,7 +161,7 @@ func EncodePacket(sessionID [16]byte, seq uint64, encrypted bool, key []byte, ch
 // drop policy; wire garbage never produces an error.
 func DecodePacket(packet []byte, encrypted bool, key []byte) (sessionID [16]byte, seq uint64, ch ChannelHeader, payload []byte, ok bool) {
 	sessionID, seq, ok = parseOuterHeader(packet)
-	if !ok || seq == 0 {
+	if !ok {
 		return sessionID, seq, ch, nil, false
 	}
 	if encrypted {

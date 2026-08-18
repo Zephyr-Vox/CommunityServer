@@ -41,7 +41,6 @@ const (
 	StatsPacketReceived StatsKind = iota + 1
 	StatsDroppedMalformed
 	StatsDroppedUnknownSession
-	StatsDroppedRateLimit
 	StatsDroppedGlobalIngress
 	StatsDroppedSourceIngress
 	StatsDroppedSourceTableFull
@@ -81,10 +80,11 @@ type UDPServer struct {
 	onFrame      FrameHandler
 	statsHandler StatsHandler
 	ingress      *IngressLimiter
+	receiveGate  func()
 
 	connMu  sync.Mutex
 	conn    net.PacketConn
-	serving bool
+	started bool
 	closed  bool
 
 	wg sync.WaitGroup
@@ -100,9 +100,20 @@ func WithStatsHandler(handler StatsHandler) UDPOption {
 	}
 }
 
+// WithReceiveGate installs a test synchronization callback immediately after
+// session lookup and before any session state is read. It must be configured
+// before Start and return promptly outside tests; production callers should
+// leave it unset.
+func WithReceiveGate(gate func()) UDPOption {
+	return func(s *UDPServer) {
+		s.receiveGate = gate
+	}
+}
+
 // NewUDPServer returns a UDP server bound to manager and registry. ingress
 // limits are enforced before header parsing and AEAD work. onFrame may be nil,
-// in which case validated frames are counted nowhere and simply dropped.
+// in which case validated frames are still counted as delivered and their
+// callback payload is discarded.
 func NewUDPServer(manager *Manager, registry *ChannelTypeRegistry, onFrame FrameHandler, limits IngressLimits, opts ...UDPOption) (*UDPServer, error) {
 	if manager == nil || registry == nil {
 		return nil, errors.New("protocol: nil manager or registry")
@@ -129,8 +140,9 @@ func NewUDPServer(manager *Manager, registry *ChannelTypeRegistry, onFrame Frame
 // Blocking callers can simply read the returned channel.
 //
 // Registration happens before Start returns, so a subsequent Close can always
-// find and close pc. Start is the only way to begin serving: this removes the
-// "Close raced with an unregistered goroutine" failure mode by construction.
+// find and close pc. A UDPServer accepts exactly one Start call: this removes
+// both the "Close raced with an unregistered goroutine" and stale-restart
+// failure modes by construction.
 func (s *UDPServer) Start(pc net.PacketConn) (<-chan error, error) {
 	if pc == nil {
 		return nil, errors.New("protocol: nil packet conn")
@@ -146,15 +158,15 @@ func (s *UDPServer) Start(pc net.PacketConn) (<-chan error, error) {
 		_ = pc.Close()
 		return nil, net.ErrClosed
 	}
-	if s.serving {
+	if s.started {
 		s.connMu.Unlock()
 		_ = pc.Close()
-		return nil, errors.New("protocol: udp server already serving")
+		return nil, errors.New("protocol: udp server already started")
 	}
 	// Seal before publishing the serving state: callers that observe Start's
 	// successful return can no longer race a late channel registration.
 	s.registry.Seal()
-	s.serving = true
+	s.started = true
 	s.conn = pc
 	s.wg.Add(1)
 	s.connMu.Unlock()
@@ -169,11 +181,13 @@ func (s *UDPServer) Start(pc net.PacketConn) (<-chan error, error) {
 // serve owns the registered read loop and its defer cleanup.
 func (s *UDPServer) serve(pc net.PacketConn) error {
 	defer func() {
+		// Start transfers ownership of pc to the server. The read loop therefore
+		// closes it on every exit path, including an unexpected ReadFrom error.
+		_ = pc.Close()
 		s.connMu.Lock()
 		if s.conn == pc {
 			s.conn = nil
 		}
-		s.serving = false
 		s.connMu.Unlock()
 		s.wg.Done()
 	}()
@@ -366,7 +380,7 @@ func (s *UDPServer) StartPurge(interval time.Duration) (stop func()) {
 	}
 }
 
-// PurgeLoop consumes ticks until stop is closed. It is unexported so tests can
+// PurgeLoop consumes ticks until stop is closed. It is exported so tests can
 // inject a chan time.Time and drive expiry deterministically without a real
 // ticker.
 func (s *UDPServer) PurgeLoop(interval time.Duration, ticks <-chan time.Time, stop <-chan struct{}) {
@@ -390,9 +404,10 @@ func (s *UDPServer) packetConn() net.PacketConn {
 
 // handleDatagram implements the ordered read pipeline:
 //
-//	parse outer header -> manager.Get -> rate limit -> lock-free decrypt /
-//	plaintext parse -> channel semantics -> replay + touch + remote learning
-//	-> callback (audio) or consume (heartbeat).
+//	UDP address -> global/source ingress -> outer header/sequence -> session
+//	lookup -> AEAD authentication (when enabled) -> plaintext/channel parsing
+//	-> channel semantics -> replay precheck + authenticated session budget +
+//	touch/remote learning -> callback (audio) or consume (heartbeat).
 //
 // Encryption, parsing, WriteTo and callbacks all happen outside locks; the
 // session mutex is only used for short snapshots and state updates.
@@ -436,6 +451,9 @@ func (s *UDPServer) handleDatagram(p []byte, addr net.Addr) {
 			Bytes:     len(p),
 		})
 		return
+	}
+	if s.receiveGate != nil {
+		s.receiveGate()
 	}
 
 	encrypted, aead := sess.cryptoSnapshot()
@@ -520,6 +538,9 @@ func (s *UDPServer) handleDatagram(p []byte, addr net.Addr) {
 		s.reportStats(StatsSample{Kind: StatsDroppedSessionRateLimit, SessionID: sessionID, UserID: sess.UserID, ChannelType: ch.ChannelType, Bytes: len(p)})
 		return
 	case receiveDroppedInactive:
+		// A concurrent teardown won after getSession but before acceptPacket.
+		// The removal already owns lifecycle observability, so this packet stays
+		// silent rather than producing a second drop classification.
 		return
 	}
 	if ch.ChannelType == HeartbeatChannelType {

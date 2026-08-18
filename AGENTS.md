@@ -17,6 +17,7 @@ ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 - One process instance is exactly one community server. There is no tenant or multi-server concept; "creating a server" means first-time initialization/bootstrap of this backend process. Do not introduce a `servers` table or tenant scoping.
 - `internal/protocol` remains transport-only and has no Echo/HTTP/config/channel/realtime dependency. Application adapters own control-plane integration.
 - Until the channel/realtime migration lands, runtime `roles.yaml` and HTTP presence heartbeat remain transitional current behavior. Narrow hardening work must use that current model without expanding it; the migration removes both rather than adding compatibility paths.
+- Voice overload control has fixed hard upper bounds with safe defaults. Startup configuration may lower or override valid limits before they are passed to the protocol package.
 
 ## Target Invariants (Channel/Realtime Pending)
 
@@ -28,7 +29,7 @@ ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 - The server pushes every event for channels visible to a WS connection; there are no per-channel message subscriptions or server-side focus state. Clients decide locally which events affect their current UI focus.
 - Presence is server-global user status (`online` / `dnd` / `afk` / `offline` / `invisible`) plus optional user activity with user-controlled privacy. Channel membership is a separate event stream and is filtered by channel ACL visibility.
 - Replayable state events must be delivered immediately in `(stream_epoch, geid)` order. Message events are lower priority and may later be coalesced into batches; telemetry/transient events are droppable. None may delay state/control delivery.
-- Voice overload control uses fixed hard upper bounds as safety caps plus elastic soft limits adjusted by server load (fast decrease, slow recovery). Hard limits are startup configuration values with defaults and are optional to specify; the protocol package receives them from the application layer.
+- Future LoadController-based elastic soft limits adjust quickly downward and recover slowly, always below the current fixed voice hard caps.
 - Role definitions and role assignments live in the database; there is no runtime roles.yaml. On first initialization the built-in roles (`owner`, `admin`, `member`) are seeded into the database.
 - Roles are defined once at server scope. Every role has an immutable key and an editable display name; `owner` is mandatory, always grants `*`, and only its display name may change.
 - Group/channel permission configs either inherit the nearest non-inheriting parent config or store a local copied snapshot that can be customized. Once a local snapshot exists, parent changes no longer propagate. Permission edits must be validated so the owner can always reset/repair the permission system.

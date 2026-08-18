@@ -65,6 +65,28 @@ func TestReplayWindowOldSequenceRejected(t *testing.T) {
 	}
 }
 
+func TestReplayWindowWouldAcceptIsNonMutatingAtBoundary(t *testing.T) {
+	var w protocol.ReplayWindow
+	if accepted, advanced := w.Accept(200); !accepted || !advanced {
+		t.Fatalf("initial high = (%v,%v)", accepted, advanced)
+	}
+	if !w.WouldAccept(73) || !w.WouldAccept(73) {
+		t.Fatal("offset 127 must be accepted without mutation")
+	}
+	if accepted, advanced := w.Accept(73); !accepted || advanced {
+		t.Fatalf("Accept(73) = (%v,%v), want (true,false)", accepted, advanced)
+	}
+	if w.WouldAccept(73) {
+		t.Fatal("WouldAccept accepted a sequence committed by Accept")
+	}
+	if w.WouldAccept(72) {
+		t.Fatal("offset 128 must be outside the replay window")
+	}
+	if w.WouldAccept(0) {
+		t.Fatal("WouldAccept accepted sequence zero")
+	}
+}
+
 func TestReplayWindowJumpClearsWindow(t *testing.T) {
 	var w protocol.ReplayWindow
 	w.Accept(1)

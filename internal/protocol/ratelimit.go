@@ -7,8 +7,9 @@ import (
 
 const (
 	// SessionPacketsPerSec is the per-session token-bucket refill rate. It is
-	// checked before decryption because AEAD has real CPU cost and the check
-	// must be cheap enough to reject floods.
+	// checked after authentication, channel validation and replay precheck so
+	// forged ciphertext and captured replays cannot consume a valid session's
+	// budget. Global and source ingress limits bound pre-auth AEAD work.
 	//
 	// Packet rate is determined by frame length, not bitrate: worst case
 	// mic(10ms) + desktop_audio(10ms) = 200 pps, so 300 leaves 1.5x headroom.
