@@ -38,6 +38,12 @@ func (s *Stores) BeginTx(ctx context.Context) (*sql.Tx, error) {
 	return s.conn.BeginTx(ctx, nil)
 }
 
+// BeginReadTx starts a read-only transaction for snapshots that must observe
+// multiple related queries from one database view.
+func (s *Stores) BeginReadTx(ctx context.Context) (*sql.Tx, error) {
+	return s.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+}
+
 // WithTx returns stores bound to tx. Store methods that normally open their
 // own transaction (SetRoles) run directly on the caller-owned transaction
 // instead. The returned stores share idGen and clock but not the root conn.

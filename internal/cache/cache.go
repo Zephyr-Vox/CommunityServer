@@ -38,9 +38,10 @@ type entry[V any] struct {
 // inflight represents an in-flight loader call for one key. Waiters block on
 // ready; value and err are published before ready is closed.
 type inflight[V any] struct {
-	ready chan struct{}
-	value V
-	err   error
+	ready       chan struct{}
+	value       V
+	err         error
+	invalidated bool
 }
 
 // config carries the option values applied in New.
@@ -238,12 +239,16 @@ func (c *Cache[K, V]) Delete(key K) {
 }
 
 // Clear removes all entries and resets the FIFO order. In-flight loader
-// operations are unaffected: they may still populate the cache afterwards.
+// operations are invalidated and must retry before publishing a value.
 func (c *Cache[K, V]) Clear() {
+	c.inflightMu.Lock()
+	defer c.inflightMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	for key := range c.inflight {
+		c.tombstones[key]++
+	}
 	c.entries = make(map[K]entry[V])
-	c.tombstones = make(map[K]uint64)
 	c.order = nil
 }
 
@@ -352,90 +357,80 @@ func (c *Cache[K, V]) get(key K) (V, bool) {
 // written before ready is closed, establishing the happens-before edge that
 // makes them visible to waiters.
 func (c *Cache[K, V]) load(ctx context.Context, key K) (V, bool, error) {
+	for {
+		value, ok, err, retry := c.loadOnce(ctx, key)
+		if !retry {
+			return value, ok, err
+		}
+		if err := ctx.Err(); err != nil {
+			var zero V
+			return zero, false, err
+		}
+	}
+}
+
+func (c *Cache[K, V]) loadOnce(ctx context.Context, key K) (value V, ok bool, err error, retry bool) {
 	c.inflightMu.Lock()
 	if call, ok := c.inflight[key]; ok {
 		c.inflightMu.Unlock()
 		select {
 		case <-call.ready:
+			if call.invalidated {
+				return value, false, nil, true
+			}
 			if call.err != nil {
 				var zero V
-				return zero, false, call.err
+				return zero, false, call.err, false
 			}
-			return call.value, true, nil
+			return call.value, true, nil, false
 		case <-ctx.Done():
 			var zero V
-			return zero, false, ctx.Err()
+			return zero, false, ctx.Err(), false
 		}
 	}
-	// A loader may have completed between the initial miss and this point;
-	// the cache is authoritative, so re-check before registering a new load.
 	if value, ok := c.get(key); ok {
 		c.inflightMu.Unlock()
-		return value, true, nil
+		return value, true, nil, false
 	}
 
 	call := &inflight[V]{ready: make(chan struct{})}
 	c.inflight[key] = call
+	gen := c.tombstones[key]
 	c.inflightMu.Unlock()
 
-	gen := c.tombstoneVersion(key)
-	value, err := c.loader(ctx, key)
-	if err == nil {
-		c.storeIfNotInvalidated(key, value, gen)
-	}
-
-	call.value = value
-	call.err = err
-	close(call.ready) // publishes value/err to waiters
-
-	// Clear the tombstone and deregister under one inflightMu critical
-	// section: a new load can only register after both happen, so it always
-	// captures the fresh generation instead of an about-to-be-cleared one.
+	value, err = c.loader(ctx, key)
 	c.inflightMu.Lock()
-	c.clearTombstone(key)
+	c.mu.Lock()
+	if err == nil && c.tombstones[key] == gen {
+		c.storeLocked(key, value)
+		call.value = value
+	} else if err != nil {
+		call.err = err
+	} else {
+		call.invalidated = true
+	}
+	delete(c.tombstones, key)
 	delete(c.inflight, key)
+	close(call.ready)
+	c.mu.Unlock()
 	c.inflightMu.Unlock()
 
-	if err != nil {
-		var zero V
-		return zero, false, err
+	if call.invalidated {
+		return value, false, nil, true
 	}
-	return value, true, nil
+	if call.err != nil {
+		var zero V
+		return zero, false, call.err, false
+	}
+	return call.value, true, nil, false
 }
 
-// clearTombstone drops any invalidation marker for key. It must be called
-// while holding inflightMu (or when no loader can start), so a new load can
-// never capture a generation that is about to be cleared.
-func (c *Cache[K, V]) clearTombstone(key K) {
-	c.mu.Lock()
-	delete(c.tombstones, key)
-	c.mu.Unlock()
-}
-
-// tombstoneVersion returns the current invalidation generation for key.
-func (c *Cache[K, V]) tombstoneVersion(key K) uint64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.tombstones[key]
-}
-
-// storeIfNotInvalidated stores value only if key's invalidation generation
-// still matches gen, i.e. no Delete happened since the generation was read.
-// The check and the store happen under the same lock as Delete, closing the
-// race between "check then set" and a concurrent invalidation.
-func (c *Cache[K, V]) storeIfNotInvalidated(key K, value V, gen uint64) bool {
+// storeLocked stores value and refreshes its TTL. Callers hold c.mu.
+func (c *Cache[K, V]) storeLocked(key K, value V) {
 	var expiresAt time.Time
 	if c.ttl > 0 {
 		expiresAt = c.now().Add(c.ttl)
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.tombstones[key] != gen {
-		return false
-	}
-	delete(c.tombstones, key)
-
 	if _, exists := c.entries[key]; !exists {
 		c.order = append(c.order, key)
 		if c.maxSize > 0 && len(c.order) > c.maxSize {
@@ -445,5 +440,4 @@ func (c *Cache[K, V]) storeIfNotInvalidated(key K, value V, gen uint64) bool {
 		}
 	}
 	c.entries[key] = entry[V]{value: value, expiresAt: expiresAt}
-	return true
 }

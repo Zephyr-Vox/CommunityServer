@@ -158,6 +158,8 @@ func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 // principal cache. After it returns, every previously issued access and
 // refresh token is dead.
 func (s *AuthService) ChangePassword(ctx context.Context, userID int64, newPasswordHash string) error {
+	unlock := s.principals.LockMutation(userID)
+	defer unlock()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if err := tx.Users.SetPasswordHash(ctx, userID, newPasswordHash); err != nil {
 			return err

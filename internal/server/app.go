@@ -72,7 +72,7 @@ func New(cfg *config.App, roles *config.Roles, logger *slog.Logger) (*App, error
 	now := func() int64 { return time.Now().UnixMilli() }
 	stores := store.New(conn, idGen, now)
 
-	principals := auth.NewPrincipalCache(stores.Users, time.Minute)
+	principals := auth.NewPrincipalCache(stores, time.Minute)
 	secret := []byte(cfg.JWTSecret)
 	authSvc := auth.NewAuthService(stores, principals, secret, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, now)
 	register := auth.NewRegisterService(stores, roles, auth.RegistrationMode(cfg.RegistrationMode))

@@ -55,7 +55,7 @@ func newEnv(t *testing.T, cfg config.AvatarConfig) *env {
 		t.Fatal(err)
 	}
 	secret := []byte("test-secret-0123456789abcdef0123456789abcdef")
-	principals := auth.NewPrincipalCache(stores.Users, time.Minute)
+	principals := auth.NewPrincipalCache(stores, time.Minute)
 	authSvc := auth.NewAuthService(stores, principals, secret, 15*time.Minute, 30*24*time.Hour, now)
 	return &env{
 		stores:     stores,

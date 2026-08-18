@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"zephyr.vox/server/ce/internal/cache"
@@ -21,18 +22,28 @@ type PrincipalSnapshot struct {
 // snapshots. Its loader resolves roles and ban state from the user store;
 // concurrent misses for the same user are coalesced by the underlying cache.
 type PrincipalCache struct {
-	c *cache.Cache[int64, PrincipalSnapshot]
+	c     *cache.Cache[int64, PrincipalSnapshot]
+	locks *principalLocks
 }
 
 // NewPrincipalCache builds a principal cache with the given TTL.
-func NewPrincipalCache(users *store.UserStore, ttl time.Duration) *PrincipalCache {
+func NewPrincipalCache(stores *store.Stores, ttl time.Duration) *PrincipalCache {
 	loader := func(ctx context.Context, userID int64) (PrincipalSnapshot, error) {
-		user, err := users.GetUserByID(ctx, userID)
+		tx, err := stores.BeginReadTx(ctx)
 		if err != nil {
 			return PrincipalSnapshot{}, err
 		}
-		roles, err := users.GetRoles(ctx, userID)
+		defer tx.Rollback()
+		txStores := stores.WithTx(tx)
+		user, err := txStores.Users.GetUserByID(ctx, userID)
 		if err != nil {
+			return PrincipalSnapshot{}, err
+		}
+		roles, err := txStores.Users.GetRoles(ctx, userID)
+		if err != nil {
+			return PrincipalSnapshot{}, err
+		}
+		if err := tx.Commit(); err != nil {
 			return PrincipalSnapshot{}, err
 		}
 		return PrincipalSnapshot{Roles: roles, Banned: user.BannedAt.Valid, AuthVersion: user.AuthVersion}, nil
@@ -42,11 +53,14 @@ func NewPrincipalCache(users *store.UserStore, ttl time.Duration) *PrincipalCach
 			cache.WithTTL[int64, PrincipalSnapshot](ttl),
 			cache.WithLoader[int64, PrincipalSnapshot](loader),
 		),
+		locks: newPrincipalLocks(),
 	}
 }
 
 // Get returns the cached snapshot, resolving it from the store on a miss.
 func (p *PrincipalCache) Get(ctx context.Context, userID int64) (PrincipalSnapshot, error) {
+	unlock := p.locks.rLock(userID)
+	defer unlock()
 	snap, ok, err := p.c.Get(ctx, userID)
 	if err != nil {
 		return PrincipalSnapshot{}, err
@@ -54,7 +68,14 @@ func (p *PrincipalCache) Get(ctx context.Context, userID int64) (PrincipalSnapsh
 	if !ok {
 		return PrincipalSnapshot{}, store.ErrNotFound
 	}
+	snap.Roles = slices.Clone(snap.Roles)
 	return snap, nil
+}
+
+// LockMutation blocks principal reads for the given users until the caller has
+// committed its mutation and invalidated their cache entries.
+func (p *PrincipalCache) LockMutation(userIDs ...int64) func() {
+	return p.locks.lockMutation(userIDs...)
 }
 
 // Invalidate removes a user from the cache; the next Get re-resolves from the

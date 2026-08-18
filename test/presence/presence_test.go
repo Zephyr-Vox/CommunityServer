@@ -199,7 +199,7 @@ func newEnv(t *testing.T) *env {
 	secret := []byte("test-secret-0123456789abcdef0123456789abcdef")
 	return &env{
 		stores:     stores,
-		principals: auth.NewPrincipalCache(stores.Users, time.Minute),
+		principals: auth.NewPrincipalCache(stores, time.Minute),
 		secret:     secret,
 	}
 }

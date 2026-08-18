@@ -125,6 +125,8 @@ func (s *UserService) SetRoles(ctx context.Context, userID int64, roles []string
 			return ErrUnknownRole
 		}
 	}
+	unlock := s.principals.LockMutation(userID)
+	defer unlock()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if _, err := tx.Users.GetUserByID(ctx, userID); err != nil {
 			return err
@@ -186,6 +188,8 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 	if _, err := s.users.GetUserByID(ctx, userID); err != nil {
 		return err
 	}
+	unlock := s.principals.LockMutation(userID)
+	defer unlock()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if err := tx.Users.BumpAuthVersion(ctx, userID); err != nil {
 			return err
@@ -205,6 +209,8 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
 	}
+	unlock := s.principals.LockMutation(userID)
+	defer unlock()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if _, err := tx.Users.GetUserByID(ctx, userID); err != nil {
 			return err
@@ -230,6 +236,8 @@ func (s *UserService) Unban(ctx context.Context, userID int64) error {
 	if _, err := s.users.GetUserByID(ctx, userID); err != nil {
 		return err
 	}
+	unlock := s.principals.LockMutation(userID)
+	defer unlock()
 	if err := s.users.Unban(ctx, userID); err != nil {
 		return err
 	}
@@ -258,6 +266,8 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	if s.avatarCleaner != nil && user.Avatar.Valid {
 		_ = s.avatarCleaner.DeleteAvatar(ctx, user.Avatar.String) // best-effort
 	}
+	unlock := s.principals.LockMutation(userID)
+	defer unlock()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		last, err := isLastAdmin(ctx, tx.Users, userID)
 		if err != nil {

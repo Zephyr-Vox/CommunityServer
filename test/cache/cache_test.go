@@ -243,13 +243,12 @@ func TestDeleteDuringLoadPreventsStaleSet(t *testing.T) {
 	close(release)
 	<-done
 
-	if c.Len() != 0 {
-		t.Fatalf("stale loader result must not be cached, len = %d", c.Len())
-	}
-
 	got, ok, err := c.Get(ctx, "a")
 	if err != nil || !ok || got != "fresh" {
-		t.Fatalf("reload = (%q, %v, %v), want (fresh, true, nil)", got, ok, err)
+		t.Fatalf("get after invalidated load = (%q, %v, %v), want (fresh, true, nil)", got, ok, err)
+	}
+	if c.Len() != 1 {
+		t.Fatalf("fresh retry must be cached, len = %d", c.Len())
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("loader calls = %d, want 2", calls.Load())
@@ -299,6 +298,40 @@ func TestClear(t *testing.T) {
 	}
 	if _, ok, _ := c.Get(context.Background(), "a"); ok {
 		t.Fatal("cleared entry must miss")
+	}
+}
+
+func TestClearDuringLoadRetriesWithoutPublishingStaleValue(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int64
+	c := cache.New[string, string](cache.WithLoader[string, string](func(_ context.Context, key string) (string, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			return "stale", nil
+		}
+		return "fresh-" + key, nil
+	}))
+
+	done := make(chan struct{})
+	go func() {
+		got, ok, err := c.Get(context.Background(), "a")
+		if err != nil || !ok || got != "fresh-a" {
+			t.Errorf("get = (%q, %v, %v), want (fresh-a, true, nil)", got, ok, err)
+		}
+		close(done)
+	}()
+	<-started
+	c.Clear()
+	close(release)
+	<-done
+
+	if calls.Load() != 2 {
+		t.Fatalf("loader calls = %d, want 2", calls.Load())
+	}
+	if got, ok, _ := c.Get(context.Background(), "a"); !ok || got != "fresh-a" {
+		t.Fatalf("cached value = (%q, %v), want (fresh-a, true)", got, ok)
 	}
 }
 

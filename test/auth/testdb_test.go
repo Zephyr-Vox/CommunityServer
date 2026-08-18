@@ -75,7 +75,7 @@ func newEnv(t *testing.T) *env {
 	stores := store.New(conn, idGen, clock.get)
 
 	secret := []byte("test-secret-0123456789abcdef0123456789abcdef")
-	principals := auth.NewPrincipalCache(stores.Users, time.Minute)
+	principals := auth.NewPrincipalCache(stores, time.Minute)
 	svc := auth.NewAuthService(stores, principals, secret, 15*time.Minute, 30*24*time.Hour, clock.get)
 	return &env{
 		conn:       conn,
