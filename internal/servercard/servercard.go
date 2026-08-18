@@ -118,6 +118,7 @@ func (c Card) TLS() bool {
 	return c.Scheme == SchemeTLS
 }
 
+// validateFingerprint rejects non-canonical SPKI SHA-256 fingerprint strings.
 func validateFingerprint(fp string) error {
 	if len(fp) != 64 {
 		return errors.New("servercard: fp must be 64 hex characters")

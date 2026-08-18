@@ -15,6 +15,7 @@ func NewError(code, httpCode int, message string) *Error {
 	return &Error{Code: code, HTTPCode: httpCode, Message: message}
 }
 
+// Error returns the client message, appending an underlying cause when present.
 func (e *Error) Error() string {
 	if e.err != nil {
 		return e.Message + ": " + e.err.Error()

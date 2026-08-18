@@ -216,6 +216,7 @@ func runTx(ctx context.Context, stores *store.Stores, fn func(*store.Stores) err
 	return tx.Commit()
 }
 
+// issue creates and persists a refresh token with its matching access token.
 func (s *AuthService) issue(ctx context.Context, userID, authVersion int64, deviceID string) (*TokenPair, error) {
 	refresh, err := randomHex(32)
 	if err != nil {
@@ -237,6 +238,7 @@ func (s *AuthService) issue(ctx context.Context, userID, authVersion int64, devi
 	}, nil
 }
 
+// cleanupExpired removes expired refresh-token sessions on a best-effort basis.
 func (s *AuthService) cleanupExpired(ctx context.Context, now int64) {
 	_, _ = s.sessions.DeleteExpired(ctx, now)
 }

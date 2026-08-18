@@ -23,6 +23,7 @@ var (
 // SQLite extended result code for SQLITE_CONSTRAINT_UNIQUE.
 const sqliteConstraintUnique = 2067
 
+// mapError translates database sentinel errors into store-level errors.
 func mapError(err error) error {
 	if err == nil {
 		return nil
@@ -36,6 +37,7 @@ func mapError(err error) error {
 	return err
 }
 
+// isUniqueConstraint reports whether err represents SQLite's unique constraint.
 func isUniqueConstraint(err error) bool {
 	if sqliteErr, ok := errors.AsType[*sqlite.Error](err); ok {
 		if sqliteErr.Code() == sqliteConstraintUnique {
@@ -46,6 +48,7 @@ func isUniqueConstraint(err error) bool {
 	return false
 }
 
+// nullString converts an optional string to its SQL representation.
 func nullString(v *string) sql.NullString {
 	if v == nil {
 		return sql.NullString{}
@@ -53,6 +56,7 @@ func nullString(v *string) sql.NullString {
 	return sql.NullString{String: *v, Valid: true}
 }
 
+// nullInt64 converts an optional integer to its SQL representation.
 func nullInt64(v *int64) sql.NullInt64 {
 	if v == nil {
 		return sql.NullInt64{}

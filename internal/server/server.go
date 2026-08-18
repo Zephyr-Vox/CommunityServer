@@ -121,12 +121,16 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 	return a.serve(ctx, ln, tlsInfo)
 }
 
+// isWildcardHost reports whether host is a non-routable wildcard bind address.
 func isWildcardHost(host string) bool {
 	// A wildcard bind (0.0.0.0 or ::) is a listen address, not something a
 	// client can connect to, so it must never be embedded in a join URL.
 	return host == "0.0.0.0" || host == "::" || host == "[::]"
 }
 
+// serve publishes readiness, runs the HTTP server, and coordinates shutdown.
+// The serve goroutine owns ln until it returns; the buffered channel lets the
+// select receive an immediate listen failure or wait for context cancellation.
 func (a *App) serve(ctx context.Context, ln net.Listener, tlsInfo func()) error {
 	log := a.logger.With("module", "server")
 	addr := ln.Addr().String()

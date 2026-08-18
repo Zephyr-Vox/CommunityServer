@@ -67,6 +67,7 @@ func (a *Authorizer) Permissions(ctx context.Context, p Principal) ([]Permission
 	return a.effectivePermissions(ctx, p)
 }
 
+// effectivePermissions returns the deduplicated grants from a principal's roles.
 func (a *Authorizer) effectivePermissions(ctx context.Context, p Principal) ([]Permission, error) {
 	seen := make(map[Permission]struct{})
 	var permissions []Permission

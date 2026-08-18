@@ -197,12 +197,14 @@ func (s *UDPServer) Close() error {
 	return nil
 }
 
+// isClosed reports whether Close has made the server terminal.
 func (s *UDPServer) isClosed() bool {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 	return s.closed
 }
 
+// reportStats delivers a transport sample when observability is configured.
 func (s *UDPServer) reportStats(sample StatsSample) {
 	if s.statsHandler != nil {
 		s.statsHandler(sample)
@@ -362,6 +364,7 @@ func (s *UDPServer) PurgeLoop(interval time.Duration, ticks <-chan time.Time, st
 	}
 }
 
+// packetConn snapshots the currently served connection under connMu.
 func (s *UDPServer) packetConn() net.PacketConn {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()

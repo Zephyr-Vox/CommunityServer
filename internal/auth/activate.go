@@ -129,6 +129,7 @@ func (m *ActivationManager) Activate(ctx context.Context, code, username, passwo
 	return user, nil
 }
 
+// generateActivationCode returns a random 16-character unpadded base32 code.
 func generateActivationCode() (string, error) {
 	b := make([]byte, 10) // 80 bits -> 16 base32 characters, no padding
 	if _, err := rand.Read(b); err != nil {

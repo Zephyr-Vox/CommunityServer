@@ -76,6 +76,7 @@ func (s *InviteService) Create(ctx context.Context, createdBy int64, role string
 	return code, inv, nil
 }
 
+// generateInviteCode returns a random invite code suitable for hashing.
 func generateInviteCode() (string, error) {
 	alphabetLen := big.NewInt(int64(len(inviteAlphabet)))
 	b := make([]byte, 8)

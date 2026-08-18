@@ -193,6 +193,7 @@ func (m *Manager) SetExpiryHandler(handler ExpiryHandler) {
 	m.mu.Unlock()
 }
 
+// nowMillis samples the manager clock as a Unix millisecond timestamp.
 func (m *Manager) nowMillis() int64 {
 	return m.now().UnixMilli()
 }
@@ -276,6 +277,7 @@ func (m *Manager) Create(userID int64, deviceID string, encrypted bool) (Session
 	}, nil
 }
 
+// newSession initializes a session with a fresh replay window and rate budget.
 func newSession(id [16]byte, userID int64, deviceID string, encrypted bool, nowMS int64, c2sAEAD, s2cAEAD cipher.AEAD, limits Limits, now func() time.Time) *Session {
 	return &Session{
 		ID:        id,
@@ -567,6 +569,7 @@ func newRevokedSnapshotLocked(s *Session) RevokedSessionSnapshot {
 	return snap
 }
 
+// randomSessionID returns a cryptographically random protocol session ID.
 func randomSessionID() ([16]byte, error) {
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {

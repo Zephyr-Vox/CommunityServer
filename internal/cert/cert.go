@@ -103,10 +103,12 @@ type BackupError struct {
 	Err       error
 }
 
+// Error describes the failed regeneration and the recoverable backup path.
 func (e *BackupError) Error() string {
 	return fmt.Sprintf("cert: forced regeneration failed after backing up old identity to %s: %v", e.BackupDir, e.Err)
 }
 
+// Unwrap returns the error that interrupted forced regeneration.
 func (e *BackupError) Unwrap() error {
 	return e.Err
 }
@@ -178,6 +180,7 @@ func loadFile(certPath, keyPath string, now time.Time) (*Bundle, error) {
 	}, nil
 }
 
+// loadAuto loads, repairs, renews, or creates the managed certificate store.
 func loadAuto(cfg Config, regenerate bool, now time.Time) (*Bundle, error) {
 	storePath := cfg.StorePath
 	// Create before touching anything else so the identity has a home, but
@@ -338,6 +341,7 @@ func generateNewPair(cfg Config, certPath, keyPath, fpPath string, action Action
 	return bundle, nil
 }
 
+// buildAutoBundle writes derived fingerprint metadata and returns one bundle.
 func buildAutoBundle(certPEM, keyPEM []byte, certPath, keyPath, fpPath string, action Action) (*Bundle, error) {
 	// One shared construction path for every auto action keeps the bundle,
 	// fingerprint.txt and the tls.Certificate consistent; callers should not
@@ -365,6 +369,7 @@ func buildAutoBundle(certPEM, keyPEM []byte, certPath, keyPath, fpPath string, a
 	}, nil
 }
 
+// issueCertificate creates a PEM-encoded self-signed server certificate.
 func issueCertificate(signer crypto.Signer, cfg Config, now time.Time) ([]byte, error) {
 	// Self-signed: the template is its own issuer. There is intentionally no
 	// CA chain because clients never validate a chain—they pin the SPKI
@@ -380,6 +385,7 @@ func issueCertificate(signer crypto.Signer, cfg Config, now time.Time) ([]byte, 
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), nil
 }
 
+// newCertificateTemplate builds the self-signed server certificate template.
 func newCertificateTemplate(cfg Config, now time.Time) (*x509.Certificate, error) {
 	years := cfg.ValidYears
 	if years <= 0 {
@@ -434,6 +440,7 @@ func newCertificateTemplate(cfg Config, now time.Time) (*x509.Certificate, error
 	}, nil
 }
 
+// parsePair validates PEM inputs and verifies that their public keys match.
 func parsePair(certPEM, keyPEM []byte) (*x509.Certificate, crypto.Signer, error) {
 	leaf, err := parseCertificatePEM(certPEM)
 	if err != nil {
@@ -464,6 +471,7 @@ func parsePair(certPEM, keyPEM []byte) (*x509.Certificate, crypto.Signer, error)
 	return leaf, signer, nil
 }
 
+// parseCertificatePEM decodes and parses the first CERTIFICATE PEM block.
 func parseCertificatePEM(certPEM []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil || block.Type != "CERTIFICATE" {
@@ -476,6 +484,7 @@ func parseCertificatePEM(certPEM []byte) (*x509.Certificate, error) {
 	return leaf, nil
 }
 
+// parsePrivateKey parses a supported private key PEM block.
 func parsePrivateKey(keyPEM []byte) (crypto.PrivateKey, error) {
 	// OpenSSL commonly writes EC PARAMETERS before EC PRIVATE KEY, and the
 	// standard library's tls.X509KeyPair skips every block whose type does
@@ -506,6 +515,7 @@ func parsePrivateKey(keyPEM []byte) (crypto.PrivateKey, error) {
 	}
 }
 
+// marshalPrivateKey encodes an ECDSA private key as PKCS#8 PEM.
 func marshalPrivateKey(key *ecdsa.PrivateKey) ([]byte, error) {
 	// PKCS#8 is the modern container: algorithm-agnostic, supported by Go's
 	// TLS stack, and avoids the curve-identification ambiguity of SEC1.
@@ -516,10 +526,12 @@ func marshalPrivateKey(key *ecdsa.PrivateKey) ([]byte, error) {
 	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 }
 
+// validAt reports whether cert is valid at now, including both endpoints.
 func validAt(cert *x509.Certificate, now time.Time) bool {
 	return !now.Before(cert.NotBefore) && !now.After(cert.NotAfter)
 }
 
+// readOptionalFile reads path and reports its absence without returning an error.
 func readOptionalFile(path string) ([]byte, bool, error) {
 	// os.ErrNotExist is a normal "not created yet" signal; any other read
 	// error is a real fault and must stop startup.
@@ -533,6 +545,7 @@ func readOptionalFile(path string) ([]byte, bool, error) {
 	return data, true, nil
 }
 
+// rejectWorldAccessibleKey rejects private keys readable by other users.
 func rejectWorldAccessibleKey(path string) error {
 	// Auto mode enforces 0600 on the private key; file mode must not silently
 	// accept a world-readable key, or the fail-closed posture is bypassed.
@@ -552,6 +565,7 @@ func rejectWorldAccessibleKey(path string) error {
 	return nil
 }
 
+// ensureFingerprintFile writes fingerprint metadata only when it has changed.
 func ensureFingerprintFile(path, fingerprint string) error {
 	// fingerprint.txt is derived data that admins copy into join URLs. Keep
 	// it byte-identical when nothing changed so an ordinary restart does not
@@ -570,6 +584,7 @@ func ensureFingerprintFile(path, fingerprint string) error {
 	return nil
 }
 
+// writePEMAtomic atomically replaces path and persists the parent directory.
 func writePEMAtomic(path string, data []byte, mode os.FileMode) error {
 	// A crash mid-write must never leave a truncated server.key or server.crt:
 	// the next startup would misdiagnose a healthy store. Temp file + fsync +
@@ -608,6 +623,7 @@ func writePEMAtomic(path string, data []byte, mode os.FileMode) error {
 	return syncDir(filepath.Dir(path))
 }
 
+// syncDir persists directory entries when the platform supports it.
 func syncDir(path string) error {
 	if runtime.GOOS == "windows" {
 		// FlushFileBuffers does not support directory handles on Windows, so
@@ -630,6 +646,7 @@ func syncDir(path string) error {
 	return nil
 }
 
+// backupExisting moves active identity files into a timestamped backup directory.
 func backupExisting(storePath string, now time.Time) (string, error) {
 	// Forced regeneration destroys the active trust anchor, so the old files
 	// are moved aside (not deleted): operators can roll back, and an

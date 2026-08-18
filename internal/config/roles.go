@@ -73,6 +73,7 @@ func (r *Roles) PermissionsForRole(_ context.Context, role string) ([]rbac.Permi
 	return perms, ok, nil
 }
 
+// newRoles validates parsed roles and builds the immutable lookup table.
 func newRoles(cfg rolesConfig) (*Roles, error) {
 	if cfg.DefaultRole == "" {
 		return nil, errors.New("config: default_role is required")
@@ -106,6 +107,7 @@ func newRoles(cfg rolesConfig) (*Roles, error) {
 	return &Roles{defaultRole: cfg.DefaultRole, permissions: permissions}, nil
 }
 
+// expandPermissions validates permissions and expands the wildcard grant.
 func expandPermissions(perms []rbac.Permission) ([]rbac.Permission, error) {
 	for _, p := range perms {
 		if p != rbac.Wildcard && !rbac.IsKnown(p) {
@@ -118,6 +120,7 @@ func expandPermissions(perms []rbac.Permission) ([]rbac.Permission, error) {
 	return append([]rbac.Permission(nil), perms...), nil
 }
 
+// ensureDefaultFile writes the embedded role configuration when path is absent.
 func ensureDefaultFile(path string) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil

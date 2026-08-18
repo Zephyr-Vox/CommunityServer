@@ -256,6 +256,7 @@ func (s *LocalObjectStorage) filePath(bucket, name string) (string, error) {
 	return full, nil
 }
 
+// objectFromRow converts persisted metadata into the storage API model.
 func objectFromRow(row db.Object) Object {
 	return Object{
 		Bucket:       row.Bucket,

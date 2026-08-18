@@ -57,6 +57,7 @@ func NewErrorHandler(logger *slog.Logger) echo.HTTPErrorHandler {
 	}
 }
 
+// codeForStatus maps an HTTP status to its shared API error code.
 func codeForStatus(status int) int {
 	switch status {
 	case http.StatusBadRequest:

@@ -71,6 +71,7 @@ func DeriveDirectionKeys(sessionID [16]byte, masterKey []byte) (c2s, s2c []byte,
 	return c2s, s2c, nil
 }
 
+// deriveKey derives one AES-256 direction key with the given HKDF label.
 func deriveKey(sessionID [16]byte, masterKey, info []byte) ([]byte, error) {
 	key := make([]byte, masterKeySize)
 	r := hkdf.New(sha256.New, masterKey, sessionID[:], info)
@@ -90,6 +91,7 @@ func NonceFor(seq uint64) [nonceSize]byte {
 	return nonce
 }
 
+// newGCM constructs an AES-256-GCM instance for a valid direction key.
 func newGCM(key []byte) (cipher.AEAD, error) {
 	if len(key) != masterKeySize {
 		return nil, ErrInvalidKey

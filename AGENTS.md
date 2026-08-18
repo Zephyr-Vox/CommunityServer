@@ -57,6 +57,8 @@ ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 - Every application log call carries a `module` attr (or derives from a logger that sets one). Domain packages do not log directly: they return errors, and boundary layers (`cmd`, the HTTP request logger, the API error handler) record them.
 - All IDs are 63-bit snowflake IDs; timestamps are Unix milliseconds (UTC); SQL comments are English.
 - Group helpers by what they serve (e.g., `token.go`, `middleware.go`); no generic `utils` packages.
+- Every production function must have a doc comment. Production code excludes `*_test.go` files and generated files. Internal helpers may be brief but must state their purpose and important behavior. Exported functions and APIs require standard-library-quality documentation covering their contract, errors, side effects, and concurrency semantics where relevant.
+- Long production functions and implementations involving races, concurrency, resource ownership, state transitions, or otherwise non-obvious control flow must include process-oriented comments explaining the design and each non-obvious step. Do not leave complex behavior implicit in code alone.
 - Request/response DTOs go in `request.go` / `response.go`; request-shape validation uses struct tags through `internal/validation`.
 - HTTP handlers all live in the package's `handlers.go`; services/managers stay in their feature files. Handlers that need identity receive the principal via `rbacecho.WithPrincipal`; never re-check auth inside a handler.
 

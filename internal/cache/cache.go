@@ -369,6 +369,12 @@ func (c *Cache[K, V]) load(ctx context.Context, key K) (V, bool, error) {
 	}
 }
 
+// loadOnce joins an existing load or starts one and publishes its result.
+//
+// inflightMu serializes singleflight registration; c.mu protects values and
+// tombstones. The function always acquires them in that order. An invalidated
+// result asks the caller to retry so a Delete, Set, or Clear cannot be undone
+// by an older loader snapshot.
 func (c *Cache[K, V]) loadOnce(ctx context.Context, key K) (value V, ok bool, err error, retry bool) {
 	c.inflightMu.Lock()
 	if call, ok := c.inflight[key]; ok {
@@ -398,6 +404,9 @@ func (c *Cache[K, V]) loadOnce(ctx context.Context, key K) (value V, ok bool, er
 	gen := c.tombstones[key]
 	c.inflightMu.Unlock()
 
+	// Run user code outside every cache lock. Completion rechecks the captured
+	// generation before publishing, then closes ready as the waiter visibility
+	// barrier.
 	value, err = c.loader(ctx, key)
 	c.inflightMu.Lock()
 	c.mu.Lock()

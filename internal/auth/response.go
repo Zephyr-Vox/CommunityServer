@@ -57,6 +57,7 @@ type userDetailResponse struct {
 	CreatedAt   int64    `json:"created_at"`
 }
 
+// newUserDetailResponse converts a user and its roles into the admin response.
 func newUserDetailResponse(u *UserWithRoles) userDetailResponse {
 	var lastLoginAt *int64
 	if u.User.LastLoginAt.Valid {
@@ -72,6 +73,7 @@ func newUserDetailResponse(u *UserWithRoles) userDetailResponse {
 	}
 }
 
+// newUserResponse converts a database user into its public response shape.
 func newUserResponse(u *db.User) userResponse {
 	avatar := ""
 	if u.Avatar.Valid {
@@ -85,6 +87,7 @@ func newUserResponse(u *db.User) userResponse {
 	}
 }
 
+// newInviteResponse converts a database invite into its response shape.
 func newInviteResponse(inv *db.Invite) inviteResponse {
 	var expiresAt *int64
 	if inv.ExpiresAt.Valid {
@@ -100,6 +103,7 @@ func newInviteResponse(inv *db.Invite) inviteResponse {
 	}
 }
 
+// optionalInt64 returns nil for zero and a pointer for every other value.
 func optionalInt64(v int64) *int64 {
 	if v == 0 {
 		return nil

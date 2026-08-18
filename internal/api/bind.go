@@ -15,6 +15,7 @@ type ValidationError struct {
 	Fields map[string]string
 }
 
+// Error returns the uniform client-facing validation message.
 func (e *ValidationError) Error() string {
 	return MessageInvalidRequest
 }

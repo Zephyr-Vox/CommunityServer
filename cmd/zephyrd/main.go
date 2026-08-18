@@ -15,6 +15,7 @@ import (
 	"zephyr.vox/server/ce/internal/server"
 )
 
+// main exits with the status selected by run.
 func main() {
 	printBanner()
 	if err := run(); err != nil {
@@ -23,6 +24,7 @@ func main() {
 	}
 }
 
+// run loads configuration and starts the server process.
 func run() error {
 	appConfigPath := flag.String("config", "config/zephyr.toml", "path to zephyr.toml (generated on first start)")
 	rolesPath := flag.String("roles", "config/roles.yaml", "path to roles.yaml (generated on first start)")

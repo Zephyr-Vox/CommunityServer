@@ -85,6 +85,7 @@ func (b *TokenBucket) TakeAt(now time.Time) bool {
 	return true
 }
 
+// refillLocked adds elapsed tokens up to burst. Callers must hold b.mu.
 func (b *TokenBucket) refillLocked(now time.Time) {
 	if now.Before(b.last) || now.Equal(b.last) {
 		return

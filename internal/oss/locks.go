@@ -15,6 +15,7 @@ type refLock struct {
 	refs int
 }
 
+// newKeyLocks returns an empty per-object lock registry.
 func newKeyLocks() *keyLocks {
 	return &keyLocks{locks: make(map[string]*refLock)}
 }
