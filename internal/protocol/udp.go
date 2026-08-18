@@ -259,7 +259,7 @@ func (s *UDPServer) Send(id [16]byte, channelType uint8, speakerID int64, channe
 		return fail(ErrChannelNotRegistered)
 	}
 
-	sess, ok := s.manager.Get(id)
+	sess, ok := s.manager.getSession(id)
 	if !ok {
 		return fail(ErrSessionNotFound)
 	}
@@ -428,7 +428,7 @@ func (s *UDPServer) handleDatagram(p []byte, addr net.Addr) {
 		return
 	}
 
-	sess, ok := s.manager.Get(sessionID)
+	sess, ok := s.manager.getSession(sessionID)
 	if !ok {
 		s.reportStats(StatsSample{
 			Kind:      StatsDroppedUnknownSession,

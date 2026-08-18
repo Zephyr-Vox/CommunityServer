@@ -53,6 +53,9 @@ var (
 	// ErrPayloadTooLarge is returned by Send when audio data exceeds the
 	// negotiated per-packet maximum for the session's mode.
 	ErrPayloadTooLarge = errors.New("protocol: payload exceeds maximum packet size")
+	// ErrSessionPrecondition is returned when activation's expected old session
+	// does not match the user's current session.
+	ErrSessionPrecondition = errors.New("protocol: session activation precondition failed")
 )
 
 // Limits controls per-session transport budgets. SessionPacketsPerSec is the
@@ -116,6 +119,30 @@ type SessionInfo struct {
 	MasterKey        []byte // nil in plaintext mode
 	ExpiresAt        int64  // Unix milliseconds at creation time; slides with traffic
 	ReplacedPrevious bool   // whether Create preempted an active session
+}
+
+// SessionSnapshot is immutable diagnostic state for one session. It never
+// exposes transport keys, budgets, replay state, mutexes, or a live Session.
+type SessionSnapshot struct {
+	ID            [16]byte
+	UserID        int64
+	DeviceID      string
+	CreatedAt     int64
+	ExpiresAt     int64
+	Encrypted     bool
+	RemotePresent bool
+}
+
+// PreparedSession owns a fully allocated but unpublished session for exactly
+// one Manager. It is safe to discard on any control-plane failure because it
+// has not changed indexes; successful ActivatePrepared consumes it, and a
+// different Manager always rejects it to preserve clock and limit ownership.
+type PreparedSession struct {
+	mu      sync.Mutex
+	owner   *Manager
+	session *Session
+	info    SessionInfo
+	used    bool
 }
 
 // Session is one user's active voice session. Mutable state (ExpiresAt,
@@ -207,13 +234,23 @@ func (m *Manager) nowMillis() int64 {
 // "replaced". The returned master key (encrypted mode only) is a one-time
 // secret and is not stored in the Manager.
 func (m *Manager) Create(userID int64, deviceID string, encrypted bool) (SessionInfo, error) {
+	prepared, err := m.Prepare(userID, deviceID, encrypted)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	return m.ActivatePrepared(prepared, nil)
+}
+
+// Prepare performs every fallible session allocation without publishing it to
+// the Manager. The caller must later pass the result to ActivatePrepared.
+func (m *Manager) Prepare(userID int64, deviceID string, encrypted bool) (*PreparedSession, error) {
 	if userID <= 0 {
-		return SessionInfo{}, ErrInvalidUserID
+		return nil, ErrInvalidUserID
 	}
 
 	id, err := randomSessionID()
 	if err != nil {
-		return SessionInfo{}, err
+		return nil, err
 	}
 
 	var masterKey, c2s, s2c []byte
@@ -221,17 +258,17 @@ func (m *Manager) Create(userID int64, deviceID string, encrypted bool) (Session
 	if encrypted {
 		masterKey, err = GenerateMasterKey()
 		if err != nil {
-			return SessionInfo{}, err
+			return nil, err
 		}
 		c2s, s2c, err = DeriveDirectionKeys(id, masterKey)
 		if err != nil {
-			return SessionInfo{}, err
+			return nil, err
 		}
 		if c2sAEAD, err = newGCM(c2s); err != nil {
-			return SessionInfo{}, err
+			return nil, err
 		}
 		if s2cAEAD, err = newGCM(s2c); err != nil {
-			return SessionInfo{}, err
+			return nil, err
 		}
 	}
 
@@ -244,7 +281,33 @@ func (m *Manager) Create(userID int64, deviceID string, encrypted bool) (Session
 	expiresAt := sess.ExpiresAt
 	sess.mu.Unlock()
 
+	return &PreparedSession{owner: m, session: sess, info: SessionInfo{ID: id, Encrypted: encrypted, MasterKey: masterKey, ExpiresAt: expiresAt}}, nil
+}
+
+// ActivatePrepared publishes prepared when the user's current session matches
+// expectedOldID. A nil expectation permits Create's unconditional preemption.
+func (m *Manager) ActivatePrepared(prepared *PreparedSession, expectedOldID *[16]byte) (SessionInfo, error) {
+	if prepared == nil || prepared.session == nil || prepared.owner != m {
+		return SessionInfo{}, ErrSessionPrecondition
+	}
+	prepared.mu.Lock()
+	if prepared.used {
+		prepared.mu.Unlock()
+		return SessionInfo{}, ErrSessionPrecondition
+	}
+	userID := prepared.session.UserID
+	nowMS := m.nowMillis()
 	m.mu.Lock()
+	currentID, exists := m.byUser[userID]
+	if expectedOldID != nil && (!exists || currentID != *expectedOldID) {
+		m.mu.Unlock()
+		prepared.mu.Unlock()
+		return SessionInfo{}, ErrSessionPrecondition
+	}
+	// Mark used before publishing indexes. Every successful activation has one
+	// linearization point, so a repeated call cannot deactivate and reinsert the
+	// same live session.
+	prepared.used = true
 	replaced := false
 	var snapshot *RevokedSessionSnapshot
 	var replacedSession *Session
@@ -264,10 +327,11 @@ func (m *Manager) Create(userID int64, deviceID string, encrypted bool) (Session
 		}
 		delete(m.byUser, userID)
 	}
-	m.sessions[id] = sess
-	m.byUser[userID] = id
+	m.sessions[prepared.session.ID] = prepared.session
+	m.byUser[userID] = prepared.session.ID
 	revokeHandler = m.onRevoke
 	m.mu.Unlock()
+	prepared.mu.Unlock()
 	if replacedSession != nil {
 		// The table swap is complete before waiting for Send, so another Create
 		// cannot observe a partially removed old session under Manager.mu.
@@ -283,13 +347,9 @@ func (m *Manager) Create(userID int64, deviceID string, encrypted bool) (Session
 		revokeHandler(RevocationReplaced, *snapshot)
 	}
 
-	return SessionInfo{
-		ID:               id,
-		Encrypted:        encrypted,
-		MasterKey:        masterKey,
-		ExpiresAt:        expiresAt,
-		ReplacedPrevious: replaced,
-	}, nil
+	info := prepared.info
+	info.ReplacedPrevious = replaced
+	return info, nil
 }
 
 // newSession initializes a session with a fresh replay window and rate budget.
@@ -309,10 +369,23 @@ func newSession(id [16]byte, userID int64, deviceID string, encrypted bool, nowM
 	}
 }
 
-// Get returns the session with exactly this id, or false if it is unknown or
-// already expired. Expired entries are deleted lazily here; the UDP hot path
-// must never run a full table scan, so it only calls Get.
-func (m *Manager) Get(id [16]byte) (*Session, bool) {
+// Get returns an immutable snapshot for id, or false if it is unknown or
+// expired. It never exposes a live Session to callers outside this package.
+func (m *Manager) Get(id [16]byte) (SessionSnapshot, bool) {
+	sess, ok := m.getSession(id)
+	if !ok {
+		return SessionSnapshot{}, false
+	}
+	sess.mu.Lock()
+	snap := SessionSnapshot{ID: sess.ID, UserID: sess.UserID, DeviceID: sess.DeviceID, CreatedAt: sess.CreatedAt, ExpiresAt: sess.ExpiresAt, Encrypted: sess.encrypted, RemotePresent: sess.remote != nil}
+	sess.mu.Unlock()
+	return snap, true
+}
+
+// getSession returns the live internal session for UDP operations. Expired
+// entries are removed lazily; callers must not retain the result across an
+// operation without checking Session.active under Session.mu.
+func (m *Manager) getSession(id [16]byte) (*Session, bool) {
 	m.mu.Lock()
 
 	sess, ok := m.sessions[id]
@@ -384,7 +457,7 @@ func (m *Manager) SessionIDByUser(userID int64) ([16]byte, bool) {
 // this (via Session.acceptPacket) for every packet that passes decryption and
 // replay, audio and heartbeat alike.
 func (m *Manager) Touch(id [16]byte) {
-	sess, ok := m.Get(id)
+	sess, ok := m.getSession(id)
 	if !ok {
 		return
 	}

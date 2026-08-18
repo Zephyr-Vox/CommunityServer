@@ -387,3 +387,76 @@ func TestManagerConcurrentCreateKeepsOneSession(t *testing.T) {
 		t.Fatalf("live sessions = %d, want 1", live)
 	}
 }
+
+func TestManagerActivatePreparedChecksExpectedSession(t *testing.T) {
+	m, _ := newTestManager(t)
+	old, err := m.Create(7, "old", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := m.Prepare(7, "new", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := [16]byte{1}
+	if _, err := m.ActivatePrepared(prepared, &wrong); !errors.Is(err, protocol.ErrSessionPrecondition) {
+		t.Fatalf("wrong activation precondition = %v", err)
+	}
+	info, err := m.ActivatePrepared(prepared, &old.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ReplacedPrevious || !info.Encrypted || info.MasterKey == nil {
+		t.Fatalf("activation info = %+v", info)
+	}
+	if _, ok := m.Get(old.ID); ok {
+		t.Fatal("old session remained active after prepared activation")
+	}
+	if _, err := m.ActivatePrepared(prepared, &old.ID); !errors.Is(err, protocol.ErrSessionPrecondition) {
+		t.Fatalf("repeated activation = %v, want ErrSessionPrecondition", err)
+	}
+	snap, ok := m.Get(info.ID)
+	if !ok || snap.ID != info.ID {
+		t.Fatalf("active snapshot after repeated activation = (%+v, %v)", snap, ok)
+	}
+}
+
+func TestManagerActivatePreparedRejectsForeignManager(t *testing.T) {
+	owner, _ := newTestManager(t)
+	other, _ := newTestManager(t)
+	prepared, err := owner.Prepare(7, "dev", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.ActivatePrepared(prepared, nil); !errors.Is(err, protocol.ErrSessionPrecondition) {
+		t.Fatalf("foreign activation = %v, want ErrSessionPrecondition", err)
+	}
+	if _, err := owner.ActivatePrepared(prepared, nil); err != nil {
+		t.Fatalf("owner activation after foreign rejection = %v", err)
+	}
+}
+
+func TestManagerConcurrentLazyGetAndPurgeExpireOnce(t *testing.T) {
+	m, clock := newTestManager(t)
+	info, err := m.Create(7, "dev", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(protocol.SessionTTL)
+	called := make(chan struct{}, 2)
+	m.SetExpiryHandler(func(int64, [16]byte) { called <- struct{}{} })
+	var wg sync.WaitGroup
+	wg.Go(func() { _, _ = m.Get(info.ID) })
+	wg.Go(func() { _ = m.Purge() })
+	wg.Wait()
+	select {
+	case <-called:
+	default:
+		t.Fatal("expired session did not invoke handler")
+	}
+	select {
+	case <-called:
+		t.Fatal("expired session invoked handler more than once")
+	default:
+	}
+}
