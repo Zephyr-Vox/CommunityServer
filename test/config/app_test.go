@@ -50,6 +50,9 @@ func TestLoadAppGeneratesDefault(t *testing.T) {
 	if app.Avatar.MaxUploadSize != 10<<20 || app.Avatar.MaxDimension != 2048 || app.Avatar.TargetSize != 256 || app.Avatar.Quality != 85 || app.Avatar.MaxConcurrentTranscodes != 2 {
 		t.Fatalf("avatar = %+v, want 10 MiB / 2048 / 256 / 85 / 2", app.Avatar)
 	}
+	if limits := app.Voice.Limits; limits.GlobalIngressPacketsPerSec != 20_000 || limits.GlobalIngressBurst != 40_000 || limits.SourcePacketsPerSec != 1_200 || limits.SourceBurst != 2_400 || limits.SourceEntryLimit != 4_096 || limits.SourceEntryTTL != 2*time.Minute || limits.SessionPacketsPerSec != 300 || limits.SessionBurst != 600 {
+		t.Fatalf("voice limits = %+v, want protocol defaults", limits)
+	}
 	if app.Server.Host != "0.0.0.0" || app.Server.HTTPPort != 8745 || app.Server.VoicePort != 8746 || app.Server.DBPath != "./data/zephyr.db" {
 		t.Fatalf("server = %+v, want 0.0.0.0:8745 voice 8746 db ./data/zephyr.db", app.Server)
 	}
@@ -67,6 +70,64 @@ func TestLoadAppGeneratesDefault(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("config file mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestLoadAppVoiceLimitOverrides(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[voice.limits]
+source_packets_per_sec = 99
+source_entry_ttl = "45s"
+`)
+	app, err := config.LoadApp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits := app.Voice.Limits; limits.SourcePacketsPerSec != 99 || limits.SourceEntryTTL != 45*time.Second || limits.SessionBurst != 600 {
+		t.Fatalf("voice limits = %+v, want partial overrides with defaults", limits)
+	}
+}
+
+func TestLoadAppRejectsInvalidVoiceLimit(t *testing.T) {
+	path := writeApp(t, `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[voice.limits]
+source_burst = 0
+`)
+	_, err := config.LoadApp(path)
+	if err == nil || !strings.Contains(err.Error(), "voice.limits.source_burst") {
+		t.Fatalf("error = %v, want source burst validation error", err)
 	}
 }
 

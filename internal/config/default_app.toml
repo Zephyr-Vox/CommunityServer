@@ -30,6 +30,16 @@ target_size = 256           # output avatar side in pixels (square)
 quality = 85                # JPEG quality, 0-100
 max_concurrent_transcodes = 2 # concurrent decode/encode pipelines
 
+[voice.limits]
+global_ingress_packets_per_sec = 20000
+global_ingress_burst = 40000
+source_packets_per_sec = 1200
+source_burst = 2400
+source_entry_limit = 4096
+source_entry_ttl = "2m"
+session_packets_per_sec = 300
+session_burst = 600
+
 [log]
 level = "info"
 path = "./data/logs"

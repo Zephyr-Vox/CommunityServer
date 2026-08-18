@@ -29,6 +29,7 @@ type App struct {
 	Server           ServerConfig
 	Storage          StorageConfig
 	Avatar           AvatarConfig
+	Voice            VoiceConfig
 	Log              LogConfig
 }
 
@@ -77,6 +78,24 @@ type AvatarConfig struct {
 	MaxConcurrentTranscodes int   // concurrent decode/encode pipelines; default 2
 }
 
+// VoiceConfig configures protocol transport limits without importing the
+// transport package. Server assembly converts these values into protocol DTOs.
+type VoiceConfig struct {
+	Limits VoiceLimitsConfig
+}
+
+// VoiceLimitsConfig contains validated hard ingress and per-session budgets.
+type VoiceLimitsConfig struct {
+	GlobalIngressPacketsPerSec int
+	GlobalIngressBurst         int
+	SourcePacketsPerSec        int
+	SourceBurst                int
+	SourceEntryLimit           int
+	SourceEntryTTL             time.Duration
+	SessionPacketsPerSec       int
+	SessionBurst               int
+}
+
 // LogConfig configures the human-readable log pipeline. Path empty means
 // console-only output (no file persistence).
 type LogConfig struct {
@@ -109,6 +128,18 @@ type appConfig struct {
 		Quality                 *int   `mapstructure:"quality"`
 		MaxConcurrentTranscodes *int   `mapstructure:"max_concurrent_transcodes"`
 	} `mapstructure:"avatar"`
+	Voice struct {
+		Limits struct {
+			GlobalIngressPacketsPerSec *int    `mapstructure:"global_ingress_packets_per_sec"`
+			GlobalIngressBurst         *int    `mapstructure:"global_ingress_burst"`
+			SourcePacketsPerSec        *int    `mapstructure:"source_packets_per_sec"`
+			SourceBurst                *int    `mapstructure:"source_burst"`
+			SourceEntryLimit           *int    `mapstructure:"source_entry_limit"`
+			SourceEntryTTL             *string `mapstructure:"source_entry_ttl"`
+			SessionPacketsPerSec       *int    `mapstructure:"session_packets_per_sec"`
+			SessionBurst               *int    `mapstructure:"session_burst"`
+		} `mapstructure:"limits"`
+	} `mapstructure:"voice"`
 	Auth struct {
 		AccessTokenTTL   string  `mapstructure:"access_token_ttl"`
 		RefreshTokenTTL  string  `mapstructure:"refresh_token_ttl"`
@@ -157,6 +188,10 @@ func newApp(cfg appConfig) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	voice, err := validateVoice(cfg)
+	if err != nil {
+		return nil, err
+	}
 	serverCfg, err := validateServerTLS(cfg)
 	if err != nil {
 		return nil, err
@@ -174,12 +209,64 @@ func newApp(cfg appConfig) (*App, error) {
 		Server:           serverCfg,
 		Storage:          StorageConfig{BaseDir: cfg.Storage.BaseDir},
 		Avatar:           avatar,
+		Voice:            voice,
 		Log: LogConfig{
 			Level:       logLevel,
 			Path:        logPath,
 			ArchiveKeep: logKeep,
 		},
 	}, nil
+}
+
+// validateVoice applies hard transport defaults and rejects any explicit
+// non-positive limit. It remains transport-agnostic by using config DTOs.
+func validateVoice(cfg appConfig) (VoiceConfig, error) {
+	limits := VoiceLimitsConfig{
+		GlobalIngressPacketsPerSec: 20_000,
+		GlobalIngressBurst:         40_000,
+		SourcePacketsPerSec:        1_200,
+		SourceBurst:                2_400,
+		SourceEntryLimit:           4_096,
+		SourceEntryTTL:             2 * time.Minute,
+		SessionPacketsPerSec:       300,
+		SessionBurst:               600,
+	}
+	assign := func(name string, source *int, target *int) error {
+		if source == nil {
+			return nil
+		}
+		if *source <= 0 {
+			return fmt.Errorf("config: voice.limits.%s must be positive", name)
+		}
+		*target = *source
+		return nil
+	}
+	raw := cfg.Voice.Limits
+	for _, field := range []struct {
+		name   string
+		source *int
+		target *int
+	}{
+		{"global_ingress_packets_per_sec", raw.GlobalIngressPacketsPerSec, &limits.GlobalIngressPacketsPerSec},
+		{"global_ingress_burst", raw.GlobalIngressBurst, &limits.GlobalIngressBurst},
+		{"source_packets_per_sec", raw.SourcePacketsPerSec, &limits.SourcePacketsPerSec},
+		{"source_burst", raw.SourceBurst, &limits.SourceBurst},
+		{"source_entry_limit", raw.SourceEntryLimit, &limits.SourceEntryLimit},
+		{"session_packets_per_sec", raw.SessionPacketsPerSec, &limits.SessionPacketsPerSec},
+		{"session_burst", raw.SessionBurst, &limits.SessionBurst},
+	} {
+		if err := assign(field.name, field.source, field.target); err != nil {
+			return VoiceConfig{}, err
+		}
+	}
+	if raw.SourceEntryTTL != nil {
+		ttl, err := time.ParseDuration(*raw.SourceEntryTTL)
+		if err != nil || ttl <= 0 {
+			return VoiceConfig{}, fmt.Errorf("config: voice.limits.source_entry_ttl must be a positive duration")
+		}
+		limits.SourceEntryTTL = ttl
+	}
+	return VoiceConfig{Limits: limits}, nil
 }
 
 // validateServerTLS fills TLS defaults and validates the [server] TLS block.
