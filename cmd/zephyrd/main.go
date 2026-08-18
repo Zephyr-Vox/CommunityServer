@@ -88,14 +88,13 @@ func newLogger(cfg config.LogConfig) (*slog.Logger, func(), error) {
 	cleanup := func() {}
 
 	if cfg.Path != "" {
-		rot, err := logging.NewRotatingWriter(cfg.Path, logging.RotatingWriterConfig{Keep: cfg.ArchiveKeep})
+		rot, err := logging.NewRotatingWriter(cfg.Path, logging.RotatingWriterConfig{
+			Keep:    cfg.ArchiveKeep,
+			OnError: logging.ReportTo(console),
+		})
 		if err != nil {
 			return nil, nil, err
 		}
-		// File failures go straight to the console handler, never through
-		// the combined logger, so a broken file sink cannot recurse into
-		// itself.
-		rot.OnError = logging.ReportTo(console)
 		cleanup = func() { rot.Close() }
 		// The rotating writer is not an *os.File, so TTY detection disables
 		// colors automatically; ANSI escapes never reach the archive.

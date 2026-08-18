@@ -3,6 +3,8 @@ package logging
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +30,7 @@ const (
 	pendingPrefix        = ".zephyr-pending-"
 	pendingSuffix        = ".log"
 	pendingArchiveSuffix = ".archive"
+	freshPrefix          = ".zephyr-fresh-"
 
 	// rotateDayCount mirrors MCDReforged's ROTATE_DAY_COUNT: the live log is
 	// merged into an archive every 7 days. It is intentionally a constant:
@@ -50,6 +53,10 @@ type RotatingWriterConfig struct {
 	ArchivePending func(path, base string) error
 	// RetryTicks drives worker retries in deterministic tests; nil uses 1m.
 	RetryTicks <-chan time.Time
+	// OnError receives runtime failures. Supplying it here ensures it is set
+	// before the archive worker starts; it must return promptly and must not
+	// write through this RotatingWriter.
+	OnError func(error)
 }
 
 // RotatingWriter is an io.Writer that appends to liveLogName inside dir and,
@@ -74,6 +81,7 @@ type RotatingWriter struct {
 	archivePending func(path, base string) error
 	retryTicks     <-chan time.Time
 	pruneRequested bool
+	onError        func(error)
 
 	// lastRotateDate is the calendar day of the most recent rotation; the
 	// next rotation is due when dayDiff(now, lastRotateDate) >= rotateDayCount.
@@ -81,13 +89,6 @@ type RotatingWriter struct {
 	// lastRecordDate is the calendar day of the most recent Write and is
 	// used as the archive base name (the logs really end that day).
 	lastRecordDate time.Time
-
-	// OnError, when set, receives runtime failures (rotation, archive, prune).
-	// Write and the archive worker may invoke it concurrently and neither holds
-	// the writer mutex while calling it. It must return promptly, be safe for
-	// concurrent calls, and must not write through this RotatingWriter; wire it
-	// to the console handler rather than the combined logger to avoid recursion.
-	OnError func(error)
 }
 
 // NewRotatingWriter creates dir (0700), archives whatever the previous run
@@ -107,8 +108,11 @@ func NewRotatingWriter(dir string, cfg RotatingWriterConfig) (*RotatingWriter, e
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("logging: create log dir %s: %w", dir, err)
 	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("logging: secure log dir %s: %w", dir, err)
+	}
 
-	w := &RotatingWriter{dir: dir, keep: cfg.Keep, now: cfg.Now, wake: make(chan struct{}, 1), workerDone: make(chan struct{}), stop: make(chan struct{}), retryTicks: cfg.RetryTicks}
+	w := &RotatingWriter{dir: dir, keep: cfg.Keep, now: cfg.Now, wake: make(chan struct{}, 1), workerDone: make(chan struct{}), stop: make(chan struct{}), retryTicks: cfg.RetryTicks, onError: cfg.OnError}
 	w.archivePending = w.archivePendingFile
 	if cfg.ArchivePending != nil {
 		w.archivePending = cfg.ArchivePending
@@ -117,7 +121,7 @@ func NewRotatingWriter(dir string, cfg RotatingWriterConfig) (*RotatingWriter, e
 		return nil, err
 	}
 	live := w.livePath()
-	f, err := os.OpenFile(live, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	f, err := openPrivateAppend(live)
 	if err != nil {
 		return nil, fmt.Errorf("logging: open live log %s: %w", live, err)
 	}
@@ -224,12 +228,29 @@ func (w *RotatingWriter) rotate() error {
 		w.notifyWorker()
 		return nil
 	}
+	// Create and secure the replacement before disturbing the current live
+	// path. A creation failure therefore leaves the existing writer intact.
+	fresh, err := os.CreateTemp(w.dir, freshPrefix+"*"+pendingSuffix)
+	if err != nil {
+		return fmt.Errorf("logging: create fresh live log: %w", err)
+	}
+	freshPath := fresh.Name()
+	keepFresh := false
+	defer func() {
+		if !keepFresh {
+			_ = fresh.Close()
+			_ = os.Remove(freshPath)
+		}
+	}()
+	if err := fresh.Chmod(0o600); err != nil {
+		return fmt.Errorf("logging: secure fresh live log: %w", err)
+	}
 	if err := w.file.Close(); err != nil {
 		return fmt.Errorf("logging: close live log: %w", err)
 	}
 	w.file = nil
 	reopenLive := func() error {
-		f, err := os.OpenFile(w.livePath(), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		f, err := openPrivateAppend(w.livePath())
 		if err != nil {
 			return err
 		}
@@ -247,12 +268,12 @@ func (w *RotatingWriter) rotate() error {
 			return errors.Join(fmt.Errorf("logging: timestamp pending log: %w", err), reopenLive())
 		}
 	}
-	f, err := os.OpenFile(w.livePath(), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
-	if err != nil {
+	if err := os.Rename(freshPath, w.livePath()); err != nil {
 		_ = os.Rename(pending, w.livePath())
-		return errors.Join(fmt.Errorf("logging: open fresh live log: %w", err), reopenLive())
+		return errors.Join(fmt.Errorf("logging: publish fresh live log: %w", err), reopenLive())
 	}
-	w.file = f
+	keepFresh = true
+	w.file = fresh
 	w.pruneRequested = true
 	w.notifyWorker()
 	return nil
@@ -268,48 +289,107 @@ func (w *RotatingWriter) archive(base string) error {
 // archivePendingFile compresses one staged pending log with its original date.
 func (w *RotatingWriter) archivePendingFile(path, base string) error {
 	marker := path + pendingArchiveSuffix
-	targetName, err := os.ReadFile(marker)
+	markerData, err := os.ReadFile(marker)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("logging: read pending archive marker: %w", err)
 	}
 	var target string
 	if errors.Is(err, os.ErrNotExist) {
-		target, err = w.nextArchivePath(base)
+		target, err = w.reservePendingArchive(marker, path, base)
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(marker, []byte(filepath.Base(target)), 0o600); err != nil {
-			return fmt.Errorf("logging: write pending archive marker: %w", err)
-		}
 	} else {
-		target = filepath.Join(w.dir, string(targetName))
-		if filepath.Base(target) != string(targetName) {
-			return errors.New("logging: invalid pending archive marker")
+		targetName, digest, ok, parseErr := parsePendingMarker(markerData, path)
+		if parseErr != nil {
+			return parseErr
 		}
-	}
-	if _, err := os.Stat(target); err == nil {
-		valid, validateErr := validArchive(target)
-		if validateErr != nil {
-			return validateErr
+		if ok {
+			target = filepath.Join(w.dir, targetName)
+			if _, err := os.Stat(target); err == nil {
+				matches, err := archiveMatchesDigest(target, digest)
+				if err != nil {
+					return err
+				}
+				if matches {
+					// The archive committed before a prior pending-file cleanup failed
+					// or the process crashed. The digest binds this marker to this
+					// pending file, so cleanup cannot discard unarchived data.
+					return nil
+				}
+				ok = false
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("logging: stat pending archive target: %w", err)
+			}
 		}
-		if valid {
-			// The archive committed before a prior pending-file cleanup failed or
-			// the process crashed. Returning success makes the caller retry only
-			// cleanup, never compression into a second zip.
-			return nil
+		if !ok {
+			// A torn, foreign, or mismatched marker never identifies an archive.
+			// Remove only the marker and reserve a new target; an existing archive
+			// with the same name is preserved for manual inspection and pruning.
+			if err := os.Remove(marker); err != nil {
+				return fmt.Errorf("logging: remove invalid pending archive marker: %w", err)
+			}
+			target, err = w.reservePendingArchive(marker, path, base)
+			if err != nil {
+				return err
+			}
 		}
-		if err := os.Remove(target); err != nil {
-			return fmt.Errorf("logging: remove incomplete pending archive: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("logging: stat pending archive target: %w", err)
 	}
 	return w.archiveFileTo(path, target)
 }
 
-// validArchive verifies that target is a complete one-entry log archive before
-// pending cleanup can trust a marker left by a previous process.
-func validArchive(target string) (bool, error) {
+// reservePendingArchive assigns marker a new valid archive name for base and
+// returns its full path. Markers only ever persist archive basenames, never
+// arbitrary paths, so recovery cannot redirect file operations elsewhere.
+func (w *RotatingWriter) reservePendingArchive(marker, pending, base string) (string, error) {
+	target, err := w.nextArchivePath(base)
+	if err != nil {
+		return "", err
+	}
+	digest, err := fileDigest(pending)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(marker, []byte(filepath.Base(target)+"\n"+digest), 0o600); err != nil {
+		return "", fmt.Errorf("logging: write pending archive marker: %w", err)
+	}
+	return target, nil
+}
+
+// parsePendingMarker validates marker's archive name and binds its digest to
+// pending. A false result means recovery must reserve a new archive target.
+func parsePendingMarker(marker []byte, pending string) (name, digest string, ok bool, err error) {
+	parts := strings.Split(string(marker), "\n")
+	if len(parts) != 2 || !validArchiveName(parts[0]) || len(parts[1]) != sha256.Size*2 {
+		return "", "", false, nil
+	}
+	if _, err := hex.DecodeString(parts[1]); err != nil {
+		return "", "", false, nil
+	}
+	actual, err := fileDigest(pending)
+	if err != nil {
+		return "", "", false, err
+	}
+	return parts[0], parts[1], actual == parts[1], nil
+}
+
+// fileDigest returns the SHA-256 digest of one pending log as lowercase hex.
+func fileDigest(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("logging: open pending log for digest: %w", err)
+	}
+	defer f.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, f); err != nil {
+		return "", fmt.Errorf("logging: digest pending log: %w", err)
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// archiveMatchesDigest reports whether target is a complete one-entry archive
+// whose zephyr.log content matches the digest stored for its pending source.
+func archiveMatchesDigest(target, want string) (bool, error) {
 	zr, err := zip.OpenReader(target)
 	if err != nil {
 		return false, nil
@@ -322,12 +402,96 @@ func validArchive(target string) (bool, error) {
 	if err != nil {
 		return false, nil
 	}
-	_, copyErr := io.Copy(io.Discard, rc)
+	hash := sha256.New()
+	_, copyErr := io.Copy(hash, rc)
 	closeErr := rc.Close()
 	if copyErr != nil || closeErr != nil {
 		return false, nil
 	}
-	return true, nil
+	return hex.EncodeToString(hash.Sum(nil)) == want, nil
+}
+
+// validArchiveName reports whether name is an archive basename emitted by
+// nextArchivePath. Pending markers must pass this check before their target is
+// inspected or removed, preventing corrupt marker content from naming a live
+// log or unrelated file in the logging directory.
+func validArchiveName(name string) bool {
+	prefix := archivePrefix + "-"
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, archiveExt) {
+		return false
+	}
+	rest := strings.TrimSuffix(strings.TrimPrefix(name, prefix), archiveExt)
+	if len(rest) < len("2006-01-02-01") || rest[10] != '-' {
+		return false
+	}
+	date := rest[:10]
+	if parsed, err := time.Parse(dateFormat, date); err != nil || parsed.Format(dateFormat) != date {
+		return false
+	}
+	sequence := rest[11:]
+	if len(sequence) < 2 || len(sequence) > 4 {
+		return false
+	}
+	value := 0
+	for _, r := range sequence {
+		if r < '0' || r > '9' {
+			return false
+		}
+		value = value*10 + int(r-'0')
+	}
+	return value >= 1 && value <= 9999
+}
+
+// removeOrphanedMarkers deletes marker files whose pending log has already
+// disappeared. They are crash leftovers from the small window after pending
+// removal and before marker cleanup, and cannot represent recoverable work.
+func (w *RotatingWriter) removeOrphanedMarkers() error {
+	entries, err := os.ReadDir(w.dir)
+	if err != nil {
+		return fmt.Errorf("logging: read pending markers: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.Type().IsRegular() || !strings.HasPrefix(name, pendingPrefix) || !strings.HasSuffix(name, pendingSuffix+pendingArchiveSuffix) {
+			continue
+		}
+		pendingName := strings.TrimSuffix(name, pendingArchiveSuffix)
+		if _, err := os.Stat(filepath.Join(w.dir, pendingName)); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("logging: stat pending log for marker: %w", err)
+		}
+		if err := os.Remove(filepath.Join(w.dir, name)); err != nil {
+			return fmt.Errorf("logging: remove orphaned pending archive marker: %w", err)
+		}
+	}
+	return nil
+}
+
+// removeOrphanedFreshFiles removes empty replacement files left if a process
+// stopped between pre-creating a fresh live file and publishing it.
+func (w *RotatingWriter) removeOrphanedFreshFiles() error {
+	entries, err := os.ReadDir(w.dir)
+	if err != nil {
+		return fmt.Errorf("logging: read fresh live files: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.Type().IsRegular() || !strings.HasPrefix(name, freshPrefix) || !strings.HasSuffix(name, pendingSuffix) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("logging: stat orphaned fresh live file: %w", err)
+		}
+		if info.Size() != 0 {
+			continue
+		}
+		if err := os.Remove(filepath.Join(w.dir, name)); err != nil {
+			return fmt.Errorf("logging: remove orphaned fresh live file: %w", err)
+		}
+	}
+	return nil
 }
 
 // archiveFile merges path into the next dated archive without mutating path.
@@ -436,6 +600,10 @@ func (w *RotatingWriter) archiveWorker() {
 // only when a rotation requested it. It never holds the Write mutex while zip
 // compression or directory I/O runs.
 func (w *RotatingWriter) processPending() {
+	if err := w.removeOrphanedMarkers(); err != nil {
+		w.report(err)
+		return
+	}
 	entries, err := os.ReadDir(w.dir)
 	if err != nil {
 		w.report(fmt.Errorf("logging: read pending logs: %w", err))
@@ -453,6 +621,10 @@ func (w *RotatingWriter) processPending() {
 		if w.keep == 0 {
 			if err := os.Remove(path); err != nil {
 				w.report(fmt.Errorf("logging: remove pending log: %w", err))
+				return
+			}
+			if err := os.Remove(path + pendingArchiveSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+				w.report(fmt.Errorf("logging: remove pending archive marker: %w", err))
 				return
 			}
 			continue
@@ -489,6 +661,12 @@ func (w *RotatingWriter) processPending() {
 // recoverPending synchronously finishes files staged by a previous process.
 // Startup has no request hot path, so a failure remains fail-fast.
 func (w *RotatingWriter) recoverPending() error {
+	if err := w.removeOrphanedFreshFiles(); err != nil {
+		return err
+	}
+	if err := w.removeOrphanedMarkers(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(w.dir)
 	if err != nil {
 		return fmt.Errorf("logging: read pending logs: %w", err)
@@ -505,6 +683,9 @@ func (w *RotatingWriter) recoverPending() error {
 		if w.keep == 0 {
 			if err := os.Remove(path); err != nil {
 				return fmt.Errorf("logging: remove pending log: %w", err)
+			}
+			if err := os.Remove(path + pendingArchiveSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("logging: remove pending archive marker: %w", err)
 			}
 			continue
 		}
@@ -576,17 +757,31 @@ func (w *RotatingWriter) livePath() string {
 	return filepath.Join(w.dir, liveLogName)
 }
 
-// report forwards a runtime failure to OnError without the writer mutex. The
-// callback may run concurrently from Write and archiveWorker.
+// openPrivateAppend opens path for append and tightens existing files to 0600.
+func openPrivateAppend(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// report forwards a runtime failure to the constructor-supplied callback
+// without the writer mutex. The callback may run concurrently from Write and
+// archiveWorker.
 func (w *RotatingWriter) report(err error) {
-	if w.OnError != nil {
-		w.OnError(err)
+	if w.onError != nil {
+		w.onError(err)
 	}
 }
 
-// ReportTo returns a callback suitable for RotatingWriter.OnError that routes
-// log-file failures to handler h. Wire it to the console handler: using the
-// combined logger there would recurse through the file writer that just
+// ReportTo returns a callback suitable for RotatingWriterConfig.OnError that
+// routes log-file failures to handler h. Wire it to the console handler: using
+// the combined logger there would recurse through the file writer that just
 // failed.
 func ReportTo(h slog.Handler) func(error) {
 	return func(err error) {
