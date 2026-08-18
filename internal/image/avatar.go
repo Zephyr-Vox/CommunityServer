@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/oss"
@@ -32,6 +33,7 @@ type AvatarService struct {
 	transcode      func(src io.Reader, conv ImageConverter, size, maxDim int) ([]byte, error)
 	transcodeSlots chan struct{}
 	userLocks      *avatarUserLocks
+	afterMetadata  func()
 }
 
 var ErrTranscodeBusy = errors.New("image: transcode capacity exhausted")
@@ -49,6 +51,14 @@ func WithConverter(conv ImageConverter) AvatarOption {
 // WithTranscode replaces the default Transcode pipeline.
 func WithTranscode(fn func(src io.Reader, conv ImageConverter, size, maxDim int) ([]byte, error)) AvatarOption {
 	return func(s *AvatarService) { s.transcode = fn }
+}
+
+// WithAfterMetadataCommit installs a callback invoked after SetAvatar commits
+// and before Upload performs stale-object cleanup. It is intended for
+// integration tests that need to hold the metadata-committed, upload-in-flight
+// window; normal callers should leave it unset.
+func WithAfterMetadataCommit(fn func()) AvatarOption {
+	return func(s *AvatarService) { s.afterMetadata = fn }
 }
 
 // NewAvatarService returns an AvatarService using JPEGConverter at the
@@ -81,9 +91,18 @@ func NewAvatarService(users *store.UserStore, objects *oss.LocalObjectStorage, i
 //
 // A per-user lock covers the read, storage write, metadata update, and stale
 // cleanup, so concurrent upload/reset operations cannot delete a newly
-// committed avatar. The bounded slot is acquired after that lock and released
-// on return; distinct users can transcode concurrently without queueing.
+// committed avatar. The bounded slot is acquired after that lock and covers
+// only content sniffing, reads, decoding and transcoding; storage and metadata
+// work immediately release it so slow I/O cannot exhaust transcode capacity.
 func (s *AvatarService) Upload(ctx context.Context, userID int64, src io.Reader) (string, error) {
+	return s.upload(ctx, userID, src, nil)
+}
+
+// upload performs Upload and calls beforeCommit after the bounded transcode
+// finishes but before object or user metadata is changed. The HTTP adapter uses
+// this gate to finish validating the multipart request body without buffering
+// the selected file in memory.
+func (s *AvatarService) upload(ctx context.Context, userID int64, src io.Reader, beforeCommit func() error) (string, error) {
 	unlock := s.userLocks.lock(userID)
 	defer unlock()
 	user, err := s.users.GetUserByID(ctx, userID)
@@ -92,16 +111,33 @@ func (s *AvatarService) Upload(ctx context.Context, userID int64, src io.Reader)
 	}
 	select {
 	case s.transcodeSlots <- struct{}{}:
-		defer func() { <-s.transcodeSlots }()
 	default:
 		return "", ErrTranscodeBusy
 	}
-
-	id, err := s.idGen.Next()
+	data, err := func() ([]byte, error) {
+		// The slot bounds only the memory-heavy input and image pipeline. A
+		// deferred release preserves that bound even if a decoder or converter
+		// panics and the HTTP boundary recovers the request.
+		defer func() { <-s.transcodeSlots }()
+		contentType, reader, err := oss.DetectContentType(src)
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(contentType, "image/") {
+			return nil, ErrNotAnImage
+		}
+		return s.transcode(reader, s.conv, s.cfg.TargetSize, s.cfg.MaxDimension)
+	}()
+	if beforeCommit != nil {
+		if commitErr := beforeCommit(); commitErr != nil {
+			return "", commitErr
+		}
+	}
 	if err != nil {
 		return "", err
 	}
-	data, err := s.transcode(src, s.conv, s.cfg.TargetSize, s.cfg.MaxDimension)
+
+	id, err := s.idGen.Next()
 	if err != nil {
 		return "", err
 	}
@@ -116,6 +152,9 @@ func (s *AvatarService) Upload(ctx context.Context, userID int64, src io.Reader)
 	if _, err := s.users.SetAvatar(ctx, userID, &name); err != nil {
 		_ = s.objects.Delete(ctx, AvatarBucket, name) // best-effort: no orphan objects
 		return "", err
+	}
+	if s.afterMetadata != nil {
+		s.afterMetadata()
 	}
 
 	if user.Avatar.Valid && user.Avatar.String != name {

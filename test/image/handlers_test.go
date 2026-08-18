@@ -10,7 +10,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 
@@ -152,6 +151,15 @@ func TestUploadAvatarHandlerNotImage(t *testing.T) {
 	if rec.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
+	var response struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != api.CodeUnsupportedMedia {
+		t.Fatalf("code = %d, want %d", response.Code, api.CodeUnsupportedMedia)
+	}
 }
 
 func TestUploadAvatarHandlerPayloadTooLarge(t *testing.T) {
@@ -167,9 +175,18 @@ func TestUploadAvatarHandlerPayloadTooLarge(t *testing.T) {
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
+	var response struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != api.CodePayloadTooLarge {
+		t.Fatalf("code = %d, want %d", response.Code, api.CodePayloadTooLarge)
+	}
 }
 
-func TestUploadAvatarHandlerRejectsOversizedTrailingPart(t *testing.T) {
+func TestUploadAvatarHandlerRejectsOversizedTrailingPartBeforeCommit(t *testing.T) {
 	cfg := defaultCfg()
 	cfg.MaxUploadSize = 1024
 	e := newEnv(t, cfg)
@@ -186,7 +203,7 @@ func TestUploadAvatarHandlerRejectsOversizedTrailingPart(t *testing.T) {
 	if _, err := file.Write(pngBytes(t, 8, 8, nrgba(1, 2, 3))); err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.WriteField("trailing", strings.Repeat("x", 2048)); err != nil {
+	if err := writer.WriteField("trailing", string(bytes.Repeat([]byte{'x'}, 2048))); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
@@ -211,7 +228,7 @@ func TestUploadAvatarHandlerRejectsOversizedTrailingPart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if user.Avatar.Valid {
-		t.Fatalf("rejected upload changed avatar to %q", user.Avatar.String)
+		t.Fatalf("oversized request committed avatar %q", user.Avatar.String)
 	}
 }
 

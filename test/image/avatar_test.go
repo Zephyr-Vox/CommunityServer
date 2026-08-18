@@ -8,9 +8,9 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,6 +23,7 @@ import (
 	"zephyr.vox/server/ce/internal/db"
 	img "zephyr.vox/server/ce/internal/image"
 	"zephyr.vox/server/ce/internal/oss"
+	"zephyr.vox/server/ce/internal/presence"
 	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/store"
 )
@@ -30,6 +31,7 @@ import (
 type env struct {
 	stores     *store.Stores
 	objects    *oss.LocalObjectStorage
+	root       string
 	svc        *img.AvatarService
 	authSvc    *auth.AuthService
 	principals *auth.PrincipalCache
@@ -52,7 +54,8 @@ func newEnv(t *testing.T, cfg config.AvatarConfig) *env {
 	}
 	now := func() int64 { return time.Now().UnixMilli() }
 	stores := store.New(conn, idGen, now)
-	objects, err := oss.NewLocalObjectStorage(t.TempDir(), conn, now)
+	root := t.TempDir()
+	objects, err := oss.NewLocalObjectStorage(root, conn, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +65,7 @@ func newEnv(t *testing.T, cfg config.AvatarConfig) *env {
 	return &env{
 		stores:     stores,
 		objects:    objects,
+		root:       root,
 		svc:        img.NewAvatarService(stores.Users, objects, idGen, cfg),
 		authSvc:    authSvc,
 		principals: principals,
@@ -326,6 +330,20 @@ func TestAvatarUploadRejectsOversizedSource(t *testing.T) {
 	}
 }
 
+func TestAvatarUploadDimensionBoundary(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.MaxDimension = 2048
+	e := newEnv(t, cfg)
+	acceptedUser := createUser(t, e, "accepted")
+	rejectedUser := createUser(t, e, "rejected")
+	if _, err := e.svc.Upload(context.Background(), acceptedUser, bytes.NewReader(pngBytes(t, 2048, 2048, color.NRGBA{R: 1, A: 255}))); err != nil {
+		t.Fatalf("2048px upload = %v", err)
+	}
+	if _, err := e.svc.Upload(context.Background(), rejectedUser, bytes.NewReader(pngBytes(t, 2049, 2049, color.NRGBA{R: 1, A: 255}))); !errors.Is(err, img.ErrImageTooLarge) {
+		t.Fatalf("2049px upload = %v, want ErrImageTooLarge", err)
+	}
+}
+
 func TestAvatarUploadRejectsNonImage(t *testing.T) {
 	e := newEnv(t, defaultCfg())
 	userID := createUser(t, e, "alice")
@@ -378,7 +396,7 @@ func TestAvatarServiceWithInjectedTranscode(t *testing.T) {
 			return []byte("fake-jpeg-bytes"), nil
 		}))
 
-	name, err := svc.Upload(ctx, userID, strings.NewReader("ignored by injected transcode"))
+	name, err := svc.Upload(ctx, userID, bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,14 +447,14 @@ func TestAvatarTranscodeSlotsRejectWhenFull(t *testing.T) {
 	var wg sync.WaitGroup
 	for _, userID := range users[:2] {
 		wg.Go(func() {
-			_, err := svc.Upload(ctx, userID, strings.NewReader("ignored"))
+			_, err := svc.Upload(ctx, userID, bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255})))
 			results <- err
 		})
 	}
 	for range 2 {
 		<-started
 	}
-	if _, err := svc.Upload(ctx, users[2], strings.NewReader("ignored")); !errors.Is(err, img.ErrTranscodeBusy) {
+	if _, err := svc.Upload(ctx, users[2], bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255}))); !errors.Is(err, img.ErrTranscodeBusy) {
 		t.Fatalf("third upload error = %v, want ErrTranscodeBusy", err)
 	}
 	close(release)
@@ -449,4 +467,326 @@ func TestAvatarTranscodeSlotsRejectWhenFull(t *testing.T) {
 	if calls.Load() != 2 {
 		t.Fatalf("transcode calls = %d, want 2", calls.Load())
 	}
+}
+
+func TestAvatarSameUserUploadAndResetSerialize(t *testing.T) {
+	e := newEnv(t, defaultCfg())
+	userID := createUser(t, e, "alice")
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	svc := img.NewAvatarService(e.stores.Users, e.objects, idGen, defaultCfg(), img.WithTranscode(
+		func(io.Reader, img.ImageConverter, int, int) ([]byte, error) {
+			close(started)
+			<-release
+			return []byte("fake-jpeg"), nil
+		},
+	))
+	type uploadResult struct {
+		name string
+		err  error
+	}
+	uploadDone := make(chan uploadResult, 1)
+	go func() {
+		name, err := svc.Upload(context.Background(), userID, bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255})))
+		uploadDone <- uploadResult{name: name, err: err}
+	}()
+	<-started
+	resetDone := make(chan error, 1)
+	go func() { resetDone <- svc.Reset(context.Background(), userID) }()
+	select {
+	case err := <-resetDone:
+		t.Fatalf("Reset completed before Upload released the user lock: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	upload := <-uploadDone
+	if upload.err != nil {
+		t.Fatalf("Upload = %v", upload.err)
+	}
+	if err := <-resetDone; err != nil {
+		t.Fatalf("Reset = %v", err)
+	}
+	user, err := e.stores.Users.GetUserByID(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Avatar.Valid {
+		t.Fatalf("avatar after serialized Upload+Reset = %q", user.Avatar.String)
+	}
+	if _, _, err := e.objects.Open(context.Background(), img.AvatarBucket, upload.name); !errors.Is(err, oss.ErrNotFound) {
+		t.Fatalf("reset left uploaded object %q behind: %v", upload.name, err)
+	}
+}
+
+type readerError struct{ err error }
+
+func (r readerError) Read([]byte) (int, error) { return 0, r.err }
+
+func TestAvatarUploadFailureReleasesTranscodeSlot(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.MaxConcurrentTranscodes = 1
+	e := newEnv(t, cfg)
+	firstUser := createUser(t, e, "alice")
+	secondUser := createUser(t, e, "bob")
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	svc := img.NewAvatarService(e.stores.Users, e.objects, idGen, cfg, img.WithTranscode(
+		func(io.Reader, img.ImageConverter, int, int) ([]byte, error) {
+			if calls.Add(1) == 1 {
+				return nil, context.Canceled
+			}
+			return []byte("fake-jpeg"), nil
+		},
+	))
+	source := bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255}))
+	if _, err := svc.Upload(context.Background(), firstUser, source); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Upload = %v, want context.Canceled", err)
+	}
+	if _, err := svc.Upload(context.Background(), secondUser, bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 2, A: 255}))); err != nil {
+		t.Fatalf("Upload after failed transcode = %v", err)
+	}
+	if _, err := svc.Upload(context.Background(), firstUser, readerError{err: context.Canceled}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled source = %v, want context.Canceled", err)
+	}
+	if _, err := svc.Upload(context.Background(), firstUser, bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 3, A: 255}))); err != nil {
+		t.Fatalf("Upload after cancelled read = %v", err)
+	}
+}
+
+func TestAvatarTranscodePanicReleasesSlot(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.MaxConcurrentTranscodes = 1
+	e := newEnv(t, cfg)
+	firstUser := createUser(t, e, "alice")
+	secondUser := createUser(t, e, "bob")
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	svc := img.NewAvatarService(e.stores.Users, e.objects, idGen, cfg, img.WithTranscode(
+		func(io.Reader, img.ImageConverter, int, int) ([]byte, error) {
+			if calls.Add(1) == 1 {
+				panic("transcode panic")
+			}
+			return []byte("fake-jpeg"), nil
+		},
+	))
+	source := pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255})
+	panicDone := make(chan struct{})
+	go func() {
+		defer close(panicDone)
+		defer func() { _ = recover() }()
+		_, _ = svc.Upload(context.Background(), firstUser, bytes.NewReader(source))
+	}()
+	<-panicDone
+	if _, err := svc.Upload(context.Background(), secondUser, bytes.NewReader(source)); err != nil {
+		t.Fatalf("Upload after transcode panic = %v", err)
+	}
+}
+
+func TestAvatarSameUserUploadsSerializeAndCleanReplacedObject(t *testing.T) {
+	e := newEnv(t, defaultCfg())
+	userID := createUser(t, e, "alice")
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int64
+	svc := img.NewAvatarService(e.stores.Users, e.objects, idGen, defaultCfg(), img.WithTranscode(
+		func(io.Reader, img.ImageConverter, int, int) ([]byte, error) {
+			if calls.Add(1) == 1 {
+				close(started)
+				<-release
+			}
+			return []byte("fake-jpeg"), nil
+		},
+	))
+	source := pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255})
+	firstDone := make(chan struct {
+		name string
+		err  error
+	}, 1)
+	go func() {
+		name, err := svc.Upload(context.Background(), userID, bytes.NewReader(source))
+		firstDone <- struct {
+			name string
+			err  error
+		}{name, err}
+	}()
+	<-started
+	secondDone := make(chan struct {
+		name string
+		err  error
+	}, 1)
+	go func() {
+		name, err := svc.Upload(context.Background(), userID, bytes.NewReader(source))
+		secondDone <- struct {
+			name string
+			err  error
+		}{name, err}
+	}()
+	select {
+	case result := <-secondDone:
+		t.Fatalf("second Upload finished before first released user lock: %+v", result)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	first := <-firstDone
+	second := <-secondDone
+	if first.err != nil || second.err != nil {
+		t.Fatalf("uploads = (%v, %v)", first.err, second.err)
+	}
+	user, err := e.stores.Users.GetUserByID(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !user.Avatar.Valid || user.Avatar.String != second.name {
+		t.Fatalf("avatar after two uploads = %+v, want %q", user.Avatar, second.name)
+	}
+	if _, _, err := e.objects.Open(context.Background(), img.AvatarBucket, first.name); !errors.Is(err, oss.ErrNotFound) {
+		t.Fatalf("first upload object remained: %v", err)
+	}
+}
+
+func TestDeleteUserDuringUploadCleansUncommittedAvatar(t *testing.T) {
+	e := newEnv(t, defaultCfg())
+	bossID := createUser(t, e, "boss")
+	aliceID := createUser(t, e, "alice")
+	if err := e.stores.Users.SetRoles(context.Background(), bossID, []string{"admin"}); err != nil {
+		t.Fatal(err)
+	}
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	avatarSvc := img.NewAvatarService(e.stores.Users, e.objects, idGen, defaultCfg(), img.WithTranscode(
+		func(io.Reader, img.ImageConverter, int, int) ([]byte, error) {
+			close(started)
+			<-release
+			return []byte("fake-jpeg"), nil
+		},
+	))
+	userSvc := auth.NewUserService(e.stores, nil, e.principals, presence.New(time.Now), avatarSvc)
+	uploadDone := make(chan error, 1)
+	go func() {
+		_, err := avatarSvc.Upload(context.Background(), aliceID, bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255})))
+		uploadDone <- err
+	}()
+	<-started
+	if err := userSvc.Delete(context.Background(), bossID, aliceID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-uploadDone; !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Upload after deletion = %v, want ErrNotFound", err)
+	}
+	if _, err := e.stores.Users.GetUserByID(context.Background(), aliceID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted user lookup = %v, want ErrNotFound", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(e.root, img.AvatarBucket))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Type().IsRegular() {
+			t.Fatalf("uncommitted upload left object %q", entry.Name())
+		}
+	}
+}
+
+func TestDeleteAfterUploadCleansCommittedAvatar(t *testing.T) {
+	e := newEnv(t, defaultCfg())
+	bossID := createUser(t, e, "boss")
+	userID := createUser(t, e, "alice")
+	if err := e.stores.Users.SetRoles(context.Background(), bossID, []string{"admin"}); err != nil {
+		t.Fatal(err)
+	}
+	avatar, err := e.svc.Upload(context.Background(), userID, bytes.NewReader(pngBytes(t, 32, 32, color.NRGBA{R: 1, A: 255})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	userSvc := auth.NewUserService(e.stores, nil, e.principals, presence.New(time.Now), e.svc)
+	if err := userSvc.Delete(context.Background(), bossID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := e.objects.Open(context.Background(), img.AvatarBucket, avatar); !errors.Is(err, oss.ErrNotFound) {
+		t.Fatalf("committed avatar remained after delete: %v", err)
+	}
+}
+
+func TestDeleteAfterAvatarMetadataCommitBeforeUploadReturns(t *testing.T) {
+	e := newEnv(t, defaultCfg())
+	bossID := createUser(t, e, "boss")
+	userID := createUser(t, e, "alice")
+	if err := e.stores.Users.SetRoles(context.Background(), bossID, []string{"admin"}); err != nil {
+		t.Fatal(err)
+	}
+	committed := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	e.svc = img.NewAvatarService(e.stores.Users, e.objects, mustIDGenerator(t), defaultCfg(), img.WithAfterMetadataCommit(func() {
+		once.Do(func() { close(committed) })
+		<-release
+	}))
+	userSvc := auth.NewUserService(e.stores, nil, e.principals, presence.New(time.Now), e.svc)
+
+	uploadDone := make(chan struct {
+		name string
+		err  error
+	}, 1)
+	go func() {
+		name, err := e.svc.Upload(context.Background(), userID, bytes.NewReader(pngBytes(t, 32, 32, color.NRGBA{R: 7, A: 255})))
+		uploadDone <- struct {
+			name string
+			err  error
+		}{name: name, err: err}
+	}()
+	select {
+	case <-committed:
+	case <-time.After(time.Second):
+		t.Fatal("Upload did not reach the metadata-committed gate")
+	}
+
+	deleteDone := make(chan error, 1)
+	go func() { deleteDone <- userSvc.Delete(context.Background(), bossID, userID) }()
+	select {
+	case err := <-deleteDone:
+		if err != nil {
+			t.Fatalf("Delete after avatar metadata commit = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Delete did not commit while Upload was still in flight")
+	}
+	close(release)
+	upload := <-uploadDone
+	if upload.err != nil {
+		t.Fatalf("Upload after concurrent Delete = %v", upload.err)
+	}
+	if _, err := e.stores.Users.GetUserByID(context.Background(), userID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted user lookup = %v, want ErrNotFound", err)
+	}
+	if _, _, err := e.objects.Open(context.Background(), img.AvatarBucket, upload.name); !errors.Is(err, oss.ErrNotFound) {
+		t.Fatalf("avatar object remained after committed Delete: %v", err)
+	}
+}
+
+func mustIDGenerator(t *testing.T) *snowflake.IDGenerator {
+	t.Helper()
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return idGen
 }

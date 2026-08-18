@@ -5,13 +5,10 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"os"
-	"strings"
 
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/api"
-	"zephyr.vox/server/ce/internal/oss"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
 	"zephyr.vox/server/ce/internal/store"
@@ -39,24 +36,15 @@ func UploadAvatarHandler(svc *AvatarService) echo.HandlerFunc {
 		codeImageTooLarge = 3
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
-		// The limit applies to every multipart part, including fields after file.
-		// Read them all before Upload so a rejected request cannot mutate state.
+		// The selected part is passed straight into Upload. Before storage or
+		// metadata commit, Upload drains the remainder through the same bounded
+		// reader so trailing multipart data cannot bypass the request hard cap.
 		c.Request().Body = http.MaxBytesReader(c.Response(), c.Request().Body, svc.cfg.MaxUploadSize)
 
 		multipartReader, err := c.Request().MultipartReader()
 		if err != nil {
 			return api.NewError(codeMissingFile, http.StatusBadRequest, "missing file")
 		}
-		var file *os.File
-		var filePath string
-		defer func() {
-			if file != nil {
-				_ = file.Close()
-			}
-			if filePath != "" {
-				_ = os.Remove(filePath)
-			}
-		}()
 		for {
 			part, nextErr := multipartReader.NextPart()
 			if errors.Is(nextErr, io.EOF) {
@@ -69,66 +57,70 @@ func UploadAvatarHandler(svc *AvatarService) echo.HandlerFunc {
 				return api.NewError(codeMissingFile, http.StatusBadRequest, "missing file")
 			}
 			if part.FormName() == "file" {
-				// Stage only the selected file on disk. This keeps multipart input out
-				// of memory while allowing the remaining request body to be verified.
-				file, err = os.CreateTemp("", "zephyr-avatar-*")
+				defer part.Close()
+				name, err := svc.upload(c.Request().Context(), p.UserID, part, func() error {
+					return drainMultipart(multipartReader, part)
+				})
 				if err != nil {
-					_ = part.Close()
-					return err
+					switch {
+					case errors.Is(err, store.ErrNotFound):
+						return api.NewError(codeUserNotFound, http.StatusUnauthorized, "user not found")
+					case errors.Is(err, ErrImageTooLarge):
+						return api.NewError(codeImageTooLarge, http.StatusBadRequest, "image too large")
+					case errors.Is(err, ErrTranscodeBusy):
+						return api.NewError(api.CodeRateLimited, http.StatusTooManyRequests, "rate limited")
+					case isMaxBytesError(err):
+						return api.NewError(api.CodePayloadTooLarge, http.StatusRequestEntityTooLarge, "payload too large")
+					case errors.Is(err, errUnreadableMultipart):
+						return api.NewError(codeMissingFile, http.StatusBadRequest, "missing file")
+					case errors.Is(err, ErrNotAnImage):
+						return api.NewError(api.CodeUnsupportedMedia, http.StatusUnsupportedMediaType, "unsupported media type")
+					default:
+						return err
+					}
 				}
-				filePath = file.Name()
-				_, copyErr := io.Copy(file, part)
-				closeErr := part.Close()
-				if copyErr != nil {
-					return uploadReadError(copyErr, codeMissingFile)
-				}
-				if closeErr != nil {
-					return uploadReadError(closeErr, codeMissingFile)
-				}
-				break
+				return api.OK(c, http.StatusOK, uploadResponse{Avatar: name})
 			}
 			_ = part.Close()
 		}
-		if file == nil {
-			return api.NewError(codeMissingFile, http.StatusBadRequest, "missing file")
-		}
-		// Consume every trailing part before touching object storage or metadata.
-		if err := drainMultipart(multipartReader); err != nil {
-			return uploadReadError(err, codeMissingFile)
-		}
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return api.NewError(codeMissingFile, http.StatusBadRequest, "missing file")
+	})
+}
+
+var errUnreadableMultipart = errors.New("image: unreadable multipart body")
+
+// drainMultipart consumes the selected part and every following part so the
+// MaxBytesReader limit applies to the complete request before avatar commit.
+func drainMultipart(reader *multipart.Reader, selected *multipart.Part) error {
+	if _, err := io.Copy(io.Discard, selected); err != nil {
+		if isMaxBytesError(err) {
 			return err
 		}
-
-		// Sniff first as a cheap gate; the authoritative check is the decode
-		// inside Transcode. The multipart header is never trusted.
-		contentType, rest, err := oss.DetectContentType(file)
-		if err != nil {
-			return err
+		return errors.Join(errUnreadableMultipart, err)
+	}
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			return nil
 		}
-		if !strings.HasPrefix(contentType, "image/") {
-			return api.NewError(api.CodeUnsupportedMedia, http.StatusUnsupportedMediaType, "unsupported media type")
-		}
-
-		name, err := svc.Upload(c.Request().Context(), p.UserID, rest)
 		if err != nil {
-			switch {
-			case errors.Is(err, store.ErrNotFound):
-				return api.NewError(codeUserNotFound, http.StatusUnauthorized, "user not found")
-			case errors.Is(err, ErrImageTooLarge):
-				return api.NewError(codeImageTooLarge, http.StatusBadRequest, "image too large")
-			case errors.Is(err, ErrTranscodeBusy):
-				return api.NewError(api.CodeRateLimited, http.StatusTooManyRequests, "rate limited")
-			case isMaxBytesError(err):
-				return api.NewError(api.CodePayloadTooLarge, http.StatusRequestEntityTooLarge, "payload too large")
-			case errors.Is(err, ErrNotAnImage):
-				return api.NewError(api.CodeUnsupportedMedia, http.StatusUnsupportedMediaType, "unsupported media type")
-			default:
+			if isMaxBytesError(err) {
 				return err
 			}
+			return errors.Join(errUnreadableMultipart, err)
 		}
-		return api.OK(c, http.StatusOK, uploadResponse{Avatar: name})
-	})
+		_, copyErr := io.Copy(io.Discard, part)
+		closeErr := part.Close()
+		if copyErr != nil {
+			if isMaxBytesError(copyErr) {
+				return copyErr
+			}
+			return errors.Join(errUnreadableMultipart, copyErr)
+		}
+		if closeErr != nil {
+			return errors.Join(errUnreadableMultipart, closeErr)
+		}
+	}
 }
 
 // isMaxBytesError reports whether reading the bounded request body exceeded
@@ -136,37 +128,6 @@ func UploadAvatarHandler(svc *AvatarService) echo.HandlerFunc {
 func isMaxBytesError(err error) bool {
 	_, ok := errors.AsType[*http.MaxBytesError](err)
 	return ok
-}
-
-// uploadReadError preserves the avatar endpoint's response contract for body
-// read failures while distinguishing an exceeded body limit.
-func uploadReadError(err error, missingFileCode int) error {
-	if isMaxBytesError(err) {
-		return api.NewError(api.CodePayloadTooLarge, http.StatusRequestEntityTooLarge, "payload too large")
-	}
-	return api.NewError(missingFileCode, http.StatusBadRequest, "missing file")
-}
-
-// drainMultipart consumes all remaining parts so MaxBytesReader observes the
-// complete request before avatar storage or metadata can be changed.
-func drainMultipart(reader *multipart.Reader) error {
-	for {
-		part, err := reader.NextPart()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		_, copyErr := io.Copy(io.Discard, part)
-		closeErr := part.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-	}
 }
 
 // DeleteAvatarHandler handles DELETE /api/v0/me/avatar. The route must be
