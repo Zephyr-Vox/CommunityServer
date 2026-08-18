@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +31,25 @@ func newUserService(t *testing.T, e *env) (*auth.UserService, *presence.Presence
 	pres := presence.New(time.Now)
 	svc := auth.NewUserService(e.stores, newRoles(t), e.principals, pres, nil)
 	return svc, pres
+}
+
+type recordingAvatarCleaner struct {
+	mu    sync.Mutex
+	names []string
+	err   error
+}
+
+func (c *recordingAvatarCleaner) DeleteAvatar(_ context.Context, name string) error {
+	c.mu.Lock()
+	c.names = append(c.names, name)
+	c.mu.Unlock()
+	return c.err
+}
+
+func (c *recordingAvatarCleaner) Names() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.names...)
 }
 
 func TestUserServiceListAndGet(t *testing.T) {
@@ -82,6 +102,166 @@ func TestUserServiceUpdateProfile(t *testing.T) {
 	}
 	if _, err := svc.UpdateProfile(ctx, 12345, "X"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("want ErrNotFound for unknown user, got %v", err)
+	}
+}
+
+func TestUserServiceEmptyProfilePatchDoesNotWrite(t *testing.T) {
+	e := newEnv(t)
+	svc, _ := newUserService(t, e)
+	ctx := context.Background()
+	u := e.createUser(t, "alice", "secret123", "member")
+	if _, err := e.conn.Exec(`CREATE TRIGGER reject_nickname_update BEFORE UPDATE OF nickname ON users BEGIN SELECT RAISE(FAIL, 'unexpected nickname update'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svc.UpdateProfile(ctx, u.ID, "")
+	if err != nil {
+		t.Fatalf("empty patch performed an UPDATE: %v", err)
+	}
+	if got.Nickname != u.Nickname {
+		t.Fatalf("nickname = %q, want %q", got.Nickname, u.Nickname)
+	}
+}
+
+func TestUserServiceEmptyProfilePatchConcurrentWithNicknameUpdate(t *testing.T) {
+	e := newEnv(t)
+	svc, _ := newUserService(t, e)
+	ctx := context.Background()
+	u := e.createUser(t, "alice", "secret123", "member")
+	if _, err := svc.UpdateProfile(ctx, u.ID, "Ali"); err != nil {
+		t.Fatal(err)
+	}
+	barrier, err := e.conn.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Close()
+	if _, err := barrier.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	barrierActive := true
+	defer func() {
+		if barrierActive {
+			_, _ = barrier.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+
+	type updateResult struct {
+		nickname string
+		err      error
+	}
+	realUpdate := make(chan updateResult, 1)
+	go func() {
+		user, err := svc.UpdateProfile(ctx, u.ID, "Bob")
+		if err != nil {
+			realUpdate <- updateResult{err: err}
+			return
+		}
+		realUpdate <- updateResult{nickname: user.Nickname}
+	}()
+	waitForDBConnections(t, e, 2)
+
+	emptyPatch := make(chan updateResult, 1)
+	go func() {
+		user, err := svc.UpdateProfile(ctx, u.ID, "")
+		if err != nil {
+			emptyPatch <- updateResult{err: err}
+			return
+		}
+		emptyPatch <- updateResult{nickname: user.Nickname}
+	}()
+	select {
+	case got := <-emptyPatch:
+		if got.err != nil || got.nickname != "Ali" {
+			t.Fatalf("empty patch during pending update = %+v, want current nickname Ali", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("empty profile patch attempted a blocked nickname write")
+	}
+
+	if _, err := barrier.ExecContext(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	barrierActive = false
+	if got := <-realUpdate; got.err != nil || got.nickname != "Bob" {
+		t.Fatalf("real nickname update = %+v, want Bob", got)
+	}
+	user, err := e.stores.Users.GetUserByID(ctx, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Nickname != "Bob" {
+		t.Fatalf("persisted nickname = %q, want Bob", user.Nickname)
+	}
+}
+
+func TestUserServiceDeleteCleansAvatarOnlyAfterCommit(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	cleaner := &recordingAvatarCleaner{}
+	svc := auth.NewUserService(e.stores, newRoles(t), e.principals, presence.New(time.Now), cleaner)
+	boss := e.createUser(t, "boss", "secret123", "admin")
+	alice := e.createUser(t, "alice", "secret123", "member")
+	avatar := "alice.jpg"
+	if _, err := e.stores.Users.SetAvatar(ctx, alice.ID, &avatar); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Delete(ctx, boss.ID, alice.ID); err != nil {
+		t.Fatal(err)
+	}
+	if names := cleaner.Names(); !slices.Equal(names, []string{avatar}) {
+		t.Fatalf("cleaned names = %v, want [%s]", names, avatar)
+	}
+
+	blocked := e.createUser(t, "blocked", "secret123", "member")
+	blockedAvatar := "blocked.jpg"
+	if _, err := e.stores.Users.SetAvatar(ctx, boss.ID, &blockedAvatar); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Delete(ctx, blocked.ID, boss.ID); !errors.Is(err, auth.ErrLastAdmin) {
+		t.Fatalf("delete last admin = %v, want ErrLastAdmin", err)
+	}
+	if names := cleaner.Names(); !slices.Equal(names, []string{avatar}) {
+		t.Fatalf("failed deletion called cleaner: %v", names)
+	}
+
+	cleaner.err = errors.New("object storage unavailable")
+	bob := e.createUser(t, "bob", "secret123", "member")
+	bobAvatar := "bob.jpg"
+	if _, err := e.stores.Users.SetAvatar(ctx, bob.ID, &bobAvatar); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Delete(ctx, boss.ID, bob.ID); err != nil {
+		t.Fatalf("delete with cleaner failure = %v", err)
+	}
+	if names := cleaner.Names(); !slices.Equal(names, []string{avatar, bobAvatar}) {
+		t.Fatalf("cleaned names after failure = %v", names)
+	}
+}
+
+func TestUserServiceDeleteTransactionFailureDoesNotCleanAvatar(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	cleaner := &recordingAvatarCleaner{}
+	svc := auth.NewUserService(e.stores, newRoles(t), e.principals, presence.New(time.Now), cleaner)
+	boss := e.createUser(t, "boss", "secret123", "admin")
+	alice := e.createUser(t, "alice", "secret123", "member")
+	avatar := "alice.jpg"
+	if _, err := e.stores.Users.SetAvatar(ctx, alice.ID, &avatar); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.conn.Exec(`CREATE TRIGGER reject_user_delete BEFORE DELETE ON users BEGIN SELECT RAISE(FAIL, 'delete rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Delete(ctx, boss.ID, alice.ID); err == nil {
+		t.Fatal("Delete unexpectedly succeeded")
+	}
+	if names := cleaner.Names(); len(names) != 0 {
+		t.Fatalf("failed transaction called cleaner: %v", names)
+	}
+	user, err := e.stores.Users.GetUserByID(ctx, alice.ID)
+	if err != nil || !user.Avatar.Valid || user.Avatar.String != avatar {
+		t.Fatalf("failed deletion changed user/avatar: user=%+v err=%v", user, err)
 	}
 }
 

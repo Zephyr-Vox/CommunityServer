@@ -109,7 +109,9 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 		return nil, err
 	}
 	if nickname == "" {
-		nickname = user.Nickname
+		// An omitted patch field is not a write. Reusing the value read above
+		// would overwrite a nickname committed concurrently by another request.
+		return user, nil
 	}
 	return s.users.UpdateNickname(ctx, userID, nickname)
 }

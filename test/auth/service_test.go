@@ -230,3 +230,22 @@ func TestRefreshRejectsBannedUser(t *testing.T) {
 		t.Fatalf("session should be revoked, got %d", len(sessions))
 	}
 }
+
+func TestResetMissingUserDoesNotRevokeOtherSessions(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	u := e.createUser(t, "alice", "secret123", "member")
+	if _, err := e.svc.Login(ctx, "alice", "secret123", "dev-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.ResetPassword(ctx, 999999, "newsecret"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("ResetPassword missing user = %v, want ErrNotFound", err)
+	}
+	sessions, err := e.stores.Sessions.ListByUser(ctx, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("unrelated sessions after failed reset = %d, want 1", len(sessions))
+	}
+}
