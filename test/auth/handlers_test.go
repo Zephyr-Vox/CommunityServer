@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/labstack/echo/v5"
@@ -103,6 +104,26 @@ func TestLoginHandlerRateLimit(t *testing.T) {
 	second := postJSON(t, app, "/api/v0/auth/login", loginBody("alice", "wrong", "dev-1"))
 	if second.Code != http.StatusTooManyRequests {
 		t.Fatalf("second status = %d, want 429", second.Code)
+	}
+}
+
+func TestIPRateLimitDoesNotInvokeRejectedRequest(t *testing.T) {
+	app := echo.New()
+	var calls atomic.Int64
+	app.GET("/limited", func(c *echo.Context) error {
+		calls.Add(1)
+		return c.NoContent(http.StatusNoContent)
+	}, auth.IPRateLimit(1))
+	for _, want := range []int{http.StatusNoContent, http.StatusTooManyRequests} {
+		req := httptest.NewRequest(http.MethodGet, "/limited", nil)
+		rec := httptest.NewRecorder()
+		app.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Fatalf("request %d status = %d, want %d", calls.Load(), rec.Code, want)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("next handler calls = %d, want 1", calls.Load())
 	}
 }
 

@@ -320,6 +320,48 @@ func TestRateLimitEnvelope(t *testing.T) {
 	}
 }
 
+func TestPublicRateLimitsAreEndpointIsolated(t *testing.T) {
+	app := newTestAppWith(t, t.TempDir(), "open", 1)
+
+	for range 2 {
+		_ = postJSON(t, app, "/api/v0/auth/login", `{"username":"nobody","password":"wrong123","device_id":"dev-1"}`)
+	}
+	if rec := postJSON(t, app, "/api/v0/auth/login", `{"username":"nobody","password":"wrong123","device_id":"dev-1"}`); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("login status = %d, want 429", rec.Code)
+	}
+
+	if rec := postJSON(t, app, "/api/v0/auth/register", `{"username":"alice","password":"secret123"}`); rec.Code != http.StatusCreated {
+		t.Fatalf("register consumed login budget: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := postJSON(t, app, "/api/v0/auth/register", `{"username":"bob","password":"secret123"}`); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second register status = %d, want 429", rec.Code)
+	} else if resp := decode(t, rec); resp["code"] != float64(1008) {
+		t.Fatalf("second register code = %v, want 1008", resp["code"])
+	}
+
+	if rec := postJSON(t, app, "/api/v0/admin/activate", `{"code":"wrong","username":"boss","password":"secret123"}`); rec.Code == http.StatusTooManyRequests {
+		t.Fatal("activate consumed login or register budget")
+	}
+	if rec := postJSON(t, app, "/api/v0/admin/activate", `{"code":"wrong","username":"boss","password":"secret123"}`); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second activate status = %d, want 429", rec.Code)
+	} else if resp := decode(t, rec); resp["code"] != float64(1008) {
+		t.Fatalf("second activate code = %v, want 1008", resp["code"])
+	}
+}
+
+func TestInviteRegistrationIsRateLimited(t *testing.T) {
+	app := newTestAppWith(t, t.TempDir(), "invite", 1)
+	request := `{"username":"alice","password":"secret123","invite":"invalid"}`
+	if rec := postJSON(t, app, "/api/v0/auth/register", request); rec.Code == http.StatusTooManyRequests {
+		t.Fatalf("first invite registration unexpectedly limited: %s", rec.Body.String())
+	}
+	if rec := postJSON(t, app, "/api/v0/auth/register", request); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second invite registration status = %d, want 429", rec.Code)
+	} else if resp := decode(t, rec); resp["code"] != float64(1008) {
+		t.Fatalf("second invite registration code = %v, want 1008", resp["code"])
+	}
+}
+
 func itoa(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
