@@ -41,6 +41,7 @@ type inflight[V any] struct {
 	ready       chan struct{}
 	value       V
 	err         error
+	generation  uint64
 	invalidated bool
 }
 
@@ -66,10 +67,9 @@ func WithTTL[K comparable, V any](ttl time.Duration) Option[K, V] {
 // WithLoader sets the function used to populate a missing entry. The loader
 // receives the context of the first caller that caused the miss.
 //
-// Concurrent misses for the same key are coalesced: the loader runs exactly
-// once and every waiting caller receives the same result, either the loaded
-// value or the loader's error. An error is never stored, so the next Get
-// retries the loader instead of serving a stale failure.
+// Concurrent misses for the same key are coalesced until an explicit
+// invalidation detaches the active call. An error is never stored, so the next
+// Get retries the loader instead of serving a stale failure.
 func WithLoader[K comparable, V any](fn func(context.Context, K) (V, error)) Option[K, V] {
 	return func(c *config[K, V]) { c.loader = fn }
 }
@@ -96,13 +96,9 @@ func WithClock[K comparable, V any](now func() time.Time) Option[K, V] {
 type Cache[K comparable, V any] struct {
 	mu      sync.RWMutex
 	entries map[K]entry[V]
-	// tombstones records, per key, how many times Delete or Set has
-	// invalidated it while a loader was in flight. Loader results are only
-	// stored if the generation captured before the load still matches, so an
-	// invalidation during an in-flight load can never resurrect the stale
-	// value. Tombstones exist only while a load can still write back: Delete
-	// without an in-flight load leaves none, and every load removes its key's
-	// tombstone when it finishes.
+	// tombstones holds the current invalidation generation while a detached or
+	// active loader may still complete. A loader may publish only when its
+	// captured generation still matches.
 	tombstones map[K]uint64
 	// order is the FIFO insertion order used by max-size eviction. A key is
 	// appended when first inserted and keeps its position across overwrites.
@@ -178,16 +174,13 @@ func (c *Cache[K, V]) Set(key K, value V) {
 	}
 
 	c.inflightMu.Lock()
-	_, inflight := c.inflight[key]
-
 	c.mu.Lock()
-	if inflight {
-		// Invalidate the in-flight loader so it cannot overwrite this fresh
-		// value with a stale result; the load's completion cleanup removes
-		// the tombstone afterwards.
+	if call, ok := c.inflight[key]; ok {
+		// Remove the old call before publishing the new value. A later Get
+		// must register a fresh loader instead of waiting for this call.
+		call.invalidated = true
 		c.tombstones[key]++
-	} else {
-		delete(c.tombstones, key)
+		delete(c.inflight, key)
 	}
 	if _, exists := c.entries[key]; !exists {
 		c.order = append(c.order, key)
@@ -204,26 +197,17 @@ func (c *Cache[K, V]) Set(key K, value V) {
 
 // Delete removes key immediately, invalidating it for all subsequent Gets.
 // It is the event-driven invalidation hook used by write paths (for example,
-// clearing a cached principal after a password change). When a loader is in
-// flight the invalidation is remembered so it cannot re-populate the stale
-// value; without an in-flight loader no tombstone is kept, keeping the map
-// bounded.
+// clearing a cached principal after a password change). An in-flight loader
+// is detached so it cannot re-populate the stale value or delay a new load.
 func (c *Cache[K, V]) Delete(key K) {
-	// Entry removal and the tombstone decision must be one critical section:
-	// if an in-flight load writes just before us, the entry deletion removes
-	// its stale result; if we win the lock first, the tombstone makes the
-	// load's storeIfNotInvalidated reject it. Splitting the two would let a
-	// stale snapshot slip in between and survive until TTL expiry.
+	// Entry removal and in-flight isolation share one lock order. Removing the
+	// call here ensures that Gets after Delete cannot join its stale loader.
 	c.inflightMu.Lock()
-	_, inflight := c.inflight[key]
-
 	c.mu.Lock()
-	if inflight {
-		// A loader is running and could still write back a stale snapshot;
-		// remember the invalidation until that load finishes.
+	if call, ok := c.inflight[key]; ok {
+		call.invalidated = true
 		c.tombstones[key]++
-	} else {
-		delete(c.tombstones, key)
+		delete(c.inflight, key)
 	}
 	if _, ok := c.entries[key]; ok {
 		delete(c.entries, key)
@@ -239,14 +223,17 @@ func (c *Cache[K, V]) Delete(key K) {
 }
 
 // Clear removes all entries and resets the FIFO order. In-flight loader
-// operations are invalidated and must retry before publishing a value.
+// operations are detached, so later Gets start independent loads while stale
+// calls retry only after their original loader returns.
 func (c *Cache[K, V]) Clear() {
 	c.inflightMu.Lock()
 	defer c.inflightMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for key := range c.inflight {
+	for key, call := range c.inflight {
+		call.invalidated = true
 		c.tombstones[key]++
+		delete(c.inflight, key)
 	}
 	c.entries = make(map[K]entry[V])
 	c.order = nil
@@ -330,8 +317,8 @@ func (c *Cache[K, V]) get(key K) (V, bool) {
 	if !e.expiresAt.IsZero() && !c.now().Before(e.expiresAt) {
 		c.mu.Lock()
 		// Re-check under the write lock: another goroutine may have refreshed
-		// the entry since the read lock was released. TTL expiry is not an
-		// invalidation, so no tombstone is recorded.
+		// the entry since the read lock was released. TTL expiry does not
+		// affect in-flight loads.
 		if cur, ok := c.entries[key]; ok && !cur.expiresAt.IsZero() && !c.now().Before(cur.expiresAt) {
 			delete(c.entries, key)
 			for i, k := range c.order {
@@ -351,11 +338,9 @@ func (c *Cache[K, V]) get(key K) (V, bool) {
 // load runs the loader for key, coalescing concurrent misses (singleflight).
 //
 // The first caller to miss registers an inflight entry and runs the loader;
-// later callers wait on its ready channel. On success the value is stored
-// before the inflight entry is removed, so callers arriving after completion
-// hit the cache instead of re-running the loader. call.value and call.err are
-// written before ready is closed, establishing the happens-before edge that
-// makes them visible to waiters.
+// later callers wait on its ready channel. Invalidating a call removes it from
+// the table immediately, so later callers start a new loader. Completion only
+// publishes when the same call still owns the key.
 func (c *Cache[K, V]) load(ctx context.Context, key K) (V, bool, error) {
 	for {
 		value, ok, err, retry := c.loadOnce(ctx, key)
@@ -371,10 +356,10 @@ func (c *Cache[K, V]) load(ctx context.Context, key K) (V, bool, error) {
 
 // loadOnce joins an existing load or starts one and publishes its result.
 //
-// inflightMu serializes singleflight registration; c.mu protects values and
-// tombstones. The function always acquires them in that order. An invalidated
-// result asks the caller to retry so a Delete, Set, or Clear cannot be undone
-// by an older loader snapshot.
+// inflightMu serializes singleflight registration; c.mu protects values. The
+// function always acquires them in that order. An invalidated result asks the
+// caller to retry so a Delete, Set, or Clear cannot be undone by an older
+// loader snapshot.
 func (c *Cache[K, V]) loadOnce(ctx context.Context, key K) (value V, ok bool, err error, retry bool) {
 	c.inflightMu.Lock()
 	if call, ok := c.inflight[key]; ok {
@@ -399,27 +384,35 @@ func (c *Cache[K, V]) loadOnce(ctx context.Context, key K) (value V, ok bool, er
 		return value, true, nil, false
 	}
 
-	call := &inflight[V]{ready: make(chan struct{})}
+	call := &inflight[V]{ready: make(chan struct{}), generation: c.tombstones[key]}
 	c.inflight[key] = call
-	gen := c.tombstones[key]
 	c.inflightMu.Unlock()
 
-	// Run user code outside every cache lock. Completion rechecks the captured
-	// generation before publishing, then closes ready as the waiter visibility
-	// barrier.
+	// Run user code outside every cache lock. Completion verifies that this call
+	// still owns the key before publishing, then closes ready as the waiter
+	// visibility barrier.
 	value, err = c.loader(ctx, key)
 	c.inflightMu.Lock()
 	c.mu.Lock()
-	if err == nil && c.tombstones[key] == gen {
-		c.storeLocked(key, value)
-		call.value = value
-	} else if err != nil {
-		call.err = err
+	current, currentOK := c.inflight[key]
+	if currentOK && current == call && !call.invalidated && c.tombstones[key] == call.generation {
+		if err == nil {
+			c.storeLocked(key, value)
+			call.value = value
+		} else {
+			call.err = err
+		}
+		delete(c.inflight, key)
+		delete(c.tombstones, key)
 	} else {
 		call.invalidated = true
+		// A later call owns the key's generation. Its completion, not this old
+		// loader, clears the tombstone. Without this identity check an old call
+		// could erase the generation that protects a newer call.
+		if !currentOK {
+			delete(c.tombstones, key)
+		}
 	}
-	delete(c.tombstones, key)
-	delete(c.inflight, key)
 	close(call.ready)
 	c.mu.Unlock()
 	c.inflightMu.Unlock()

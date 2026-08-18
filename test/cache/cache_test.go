@@ -16,6 +16,23 @@ type fakeClock struct {
 	now time.Time
 }
 
+type waitingContext struct {
+	context.Context
+	entered chan struct{}
+	once    sync.Once
+}
+
+func newWaitingContext() *waitingContext {
+	return &waitingContext{Context: context.Background(), entered: make(chan struct{})}
+}
+
+func (c *waitingContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return nil
+}
+
+func (c *waitingContext) Err() error { return nil }
+
 func (c *fakeClock) get() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -255,6 +272,197 @@ func TestDeleteDuringLoadPreventsStaleSet(t *testing.T) {
 	}
 }
 
+func TestDeleteDuringLoadStartsIndependentReplacement(t *testing.T) {
+	firstStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	secondStarted := make(chan struct{})
+	var calls atomic.Int64
+	c := cache.New[string, string](cache.WithLoader[string, string](func(_ context.Context, key string) (string, error) {
+		if calls.Add(1) == 1 {
+			close(firstStarted)
+			<-firstRelease
+			return "stale", nil
+		}
+		close(secondStarted)
+		return "fresh-" + key, nil
+	}))
+
+	firstDone := make(chan struct{})
+	go func() {
+		_, _, _ = c.Get(context.Background(), "a")
+		close(firstDone)
+	}()
+	<-firstStarted
+	c.Delete("a")
+
+	secondDone := make(chan struct{})
+	go func() {
+		value, ok, err := c.Get(context.Background(), "a")
+		if err != nil || !ok || value != "fresh-a" {
+			t.Errorf("replacement get = (%q, %v, %v)", value, ok, err)
+		}
+		close(secondDone)
+	}()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Get after Delete waited for the invalidated loader")
+	}
+	<-secondDone
+	close(firstRelease)
+	<-firstDone
+	if calls.Load() != 2 {
+		t.Fatalf("loader calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestClearDuringLoadStartsIndependentReplacement(t *testing.T) {
+	firstStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	secondStarted := make(chan struct{})
+	var calls atomic.Int64
+	c := cache.New[string, string](cache.WithLoader[string, string](func(_ context.Context, key string) (string, error) {
+		if calls.Add(1) == 1 {
+			close(firstStarted)
+			<-firstRelease
+			return "stale", nil
+		}
+		close(secondStarted)
+		return "fresh-" + key, nil
+	}))
+
+	firstDone := make(chan struct{})
+	go func() {
+		_, _, _ = c.Get(context.Background(), "a")
+		close(firstDone)
+	}()
+	<-firstStarted
+	c.Clear()
+	secondDone := make(chan struct{})
+	go func() {
+		value, ok, err := c.Get(context.Background(), "a")
+		if err != nil || !ok || value != "fresh-a" {
+			t.Errorf("replacement get = (%q, %v, %v)", value, ok, err)
+		}
+		close(secondDone)
+	}()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Get after Clear waited for the invalidated loader")
+	}
+	<-secondDone
+	close(firstRelease)
+	<-firstDone
+	if calls.Load() != 2 {
+		t.Fatalf("loader calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestStaleCompletionsCannotDisturbNewerInflightOwner(t *testing.T) {
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	thirdStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	secondRelease := make(chan struct{})
+	thirdRelease := make(chan struct{})
+	var calls atomic.Int64
+	c := cache.New[string, string](cache.WithLoader[string, string](func(_ context.Context, key string) (string, error) {
+		switch calls.Add(1) {
+		case 1:
+			close(firstStarted)
+			<-firstRelease
+			return "stale-a", nil
+		case 2:
+			close(secondStarted)
+			<-secondRelease
+			return "stale-b", nil
+		case 3:
+			close(thirdStarted)
+			<-thirdRelease
+			return "fresh-" + key, nil
+		default:
+			return "unexpected", errors.New("unexpected replacement loader")
+		}
+	}))
+
+	type result struct {
+		value string
+		ok    bool
+		err   error
+	}
+	get := func(ctx context.Context) <-chan result {
+		done := make(chan result, 1)
+		go func() {
+			value, ok, err := c.Get(ctx, "a")
+			done <- result{value: value, ok: ok, err: err}
+		}()
+		return done
+	}
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	originA := get(ctxA)
+	<-firstStarted
+	waiterAContext := newWaitingContext()
+	waiterA := get(waiterAContext)
+	<-waiterAContext.entered
+	if calls.Load() != 1 {
+		t.Fatalf("A waiter attachment started loader call %d, want 1", calls.Load())
+	}
+	c.Delete("a")
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	originB := get(ctxB)
+	<-secondStarted
+	waiterBContext := newWaitingContext()
+	waiterB := get(waiterBContext)
+	<-waiterBContext.entered
+	if calls.Load() != 2 {
+		t.Fatalf("B waiter attachment started loader call %d, want 2", calls.Load())
+	}
+	c.Delete("a")
+	originC := get(context.Background())
+	<-thirdStarted
+
+	// Cancellation makes each stale origin return only after its loader has
+	// completed the invalidated-call path. C remains blocked and owns inflight
+	// throughout both completions.
+	cancelA()
+	close(firstRelease)
+	if got := <-originA; !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("origin A = %+v, want context cancellation after stale completion", got)
+	}
+	cancelB()
+	close(secondRelease)
+	if got := <-originB; !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("origin B = %+v, want context cancellation after stale completion", got)
+	}
+
+	// A canceled probe joins C and returns without running user code. If either
+	// stale completion deleted C or its generation, this would start call 4.
+	probeCtx, stopProbe := context.WithCancel(context.Background())
+	stopProbe()
+	if _, _, err := c.Get(probeCtx, "a"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("probe while C owns inflight = %v, want context.Canceled", err)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("loader calls before C release = %d, want 3", calls.Load())
+	}
+
+	close(thirdRelease)
+	if got := <-originC; got.err != nil || !got.ok || got.value != "fresh-a" {
+		t.Fatalf("origin C = %+v, want fresh-a", got)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("loader calls = %d, want 3", calls.Load())
+	}
+	for name, done := range map[string]<-chan result{"waiter A": waiterA, "waiter B": waiterB} {
+		if got := <-done; got.err != nil || !got.ok || got.value != "fresh-a" {
+			t.Fatalf("%s = %+v, want fresh-a after stale retry", name, got)
+		}
+	}
+}
+
 func TestSetDuringLoadPreventsStaleOverwrite(t *testing.T) {
 	var calls atomic.Int64
 	started := make(chan struct{})
@@ -269,15 +477,26 @@ func TestSetDuringLoadPreventsStaleOverwrite(t *testing.T) {
 	)
 	ctx := context.Background()
 
-	done := make(chan struct{})
+	type result struct {
+		value string
+		ok    bool
+		err   error
+	}
+	done := make(chan result, 1)
 	go func() {
-		c.Get(ctx, "a")
-		close(done)
+		value, ok, err := c.Get(ctx, "a")
+		done <- result{value: value, ok: ok, err: err}
 	}()
 	<-started
 	c.Set("a", "fresh")
+	waiterValue, waiterOK, waiterErr := c.Get(ctx, "a")
+	if waiterErr != nil || !waiterOK || waiterValue != "fresh" {
+		t.Fatalf("Get synchronized after Set = (%q, %v, %v), want (fresh, true, nil)", waiterValue, waiterOK, waiterErr)
+	}
 	close(release)
-	<-done
+	if origin := <-done; origin.err != nil || !origin.ok || origin.value != "fresh" {
+		t.Fatalf("invalidated origin = %+v, want fresh Set value", origin)
+	}
 
 	got, ok, err := c.Get(ctx, "a")
 	if err != nil || !ok || got != "fresh" {
