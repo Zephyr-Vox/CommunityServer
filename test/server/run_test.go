@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -102,6 +104,108 @@ func insecureHTTPSClient(timeout time.Duration) *http.Client {
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
 		},
+	}
+}
+
+func TestDefaultHTTPTimeouts(t *testing.T) {
+	timeouts := server.DefaultHTTPTimeouts()
+	if timeouts.ReadHeader != 10*time.Second || timeouts.Read != 60*time.Second || timeouts.Write != 120*time.Second || timeouts.Idle != 60*time.Second {
+		t.Fatalf("timeouts = %+v, want 10s/60s/120s/60s", timeouts)
+	}
+}
+
+func TestRunRejectsInvalidHTTPTimeoutsBeforeListen(t *testing.T) {
+	dir := t.TempDir()
+	port := freePort(t)
+	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := server.New(testConfig(dir, port), roles, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	err = app.Run(context.Background(), server.RunOptions{HTTPTimeouts: &server.HTTPTimeouts{ReadHeader: time.Second, Read: time.Second, Write: 0, Idle: time.Second}})
+	if err == nil || !strings.Contains(err.Error(), "all HTTP timeouts must be positive") {
+		t.Fatalf("Run error = %v, want invalid timeout error", err)
+	}
+}
+
+func TestRunReadTimeoutClosesSlowBody(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir, freePort(t))
+	timeouts := server.HTTPTimeouts{ReadHeader: time.Second, Read: 100 * time.Millisecond, Write: time.Second, Idle: time.Second}
+	addr, cancel, done := startRunWithOptions(t, cfg, server.RunOptions{HTTPTimeouts: &timeouts})
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("Run after cancel = %v", err)
+		}
+	}()
+	waitReady(t, http.DefaultClient, "http://"+addr)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "POST /api/v0/auth/register HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"username\":\"alice\"", addr); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(2 * timeouts.Read)
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	_, err = conn.Read(buf)
+	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+		t.Fatal("slow-body connection remained open after ReadTimeout")
+	}
+}
+
+func TestRunForceClosesConnectionAfterShutdownDeadline(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir, freePort(t))
+	// Keep the request body alive longer than graceful shutdown so Close is the
+	// only mechanism that can release the connection after the 10-second drain.
+	timeouts := server.HTTPTimeouts{ReadHeader: time.Second, Read: time.Minute, Write: time.Minute, Idle: time.Minute}
+	addr, cancel, done := startRunWithOptions(t, cfg, server.RunOptions{HTTPTimeouts: &timeouts})
+	waitReady(t, http.DefaultClient, "http://"+addr)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "POST /api/v0/auth/register HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"username\":\"alice\"", addr); err != nil {
+		cancel()
+		<-done
+		t.Fatal(err)
+	}
+	// Let net/http dispatch the request into the handler, which then blocks
+	// reading the remaining body bytes.
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Run error = %v, want shutdown deadline error", err)
+		}
+	case <-time.After(12 * time.Second):
+		t.Fatal("Run did not force-close the active HTTP connection")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = conn.Read(make([]byte, 1))
+	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+		t.Fatal("active connection remained open after forced shutdown")
 	}
 }
 
