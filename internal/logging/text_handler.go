@@ -66,11 +66,11 @@ var attrColors = map[string]string{
 // absent. Only the level tag is colored; the rest of the line stays plain so
 // it remains easy to grep even with colors enabled.
 type TextHandler struct {
-	mu     sync.Mutex // slog handlers must be safe for concurrent use
-	w      io.Writer
-	level  slog.Leveler
-	attrs  []slog.Attr // accumulated by WithAttrs
-	colors bool        // render ANSI colors around the [LEVEL] tag
+	writeMu *sync.Mutex // shared by derived handlers writing the same target
+	w       io.Writer
+	level   slog.Leveler
+	attrs   []slog.Attr // accumulated by WithAttrs
+	colors  bool        // render ANSI colors around the [LEVEL] tag
 }
 
 // NewTextHandler returns a handler writing to w. level controls the minimum
@@ -89,7 +89,7 @@ func NewTextHandlerWithColors(w io.Writer, level slog.Leveler, colors bool) *Tex
 		// which is Info.
 		level = slog.LevelInfo
 	}
-	return &TextHandler{w: w, level: level, colors: colors}
+	return &TextHandler{writeMu: &sync.Mutex{}, w: w, level: level, colors: colors}
 }
 
 // Enabled reports whether level passes the configured minimum.
@@ -98,13 +98,15 @@ func (h *TextHandler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 // WithAttrs returns a copy of the handler carrying extra attrs. The copy is
-// shallow on purpose (the handler struct is immutable after construction);
-// a fresh mutex is allocated instead of copying the original one.
+// shallow on purpose (the handler struct is immutable after construction).
+// Derived handlers share the same write lock because their writer may not be
+// concurrency-safe.
 func (h *TextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	cp := &TextHandler{
-		w:      h.w,
-		level:  h.level,
-		colors: h.colors,
+		writeMu: h.writeMu,
+		w:       h.w,
+		level:   h.level,
+		colors:  h.colors,
 	}
 	cp.attrs = append(append([]slog.Attr(nil), h.attrs...), attrs...)
 	return cp
@@ -169,8 +171,8 @@ func (h *TextHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 	buf.WriteByte('\n')
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
 	_, err := h.w.Write(buf.Bytes())
 	return err
 }

@@ -194,6 +194,38 @@ func TestTextHandlerConcurrentWrites(t *testing.T) {
 	}
 }
 
+func TestTextHandlerDerivedHandlersShareWriteLock(t *testing.T) {
+	var buf bytes.Buffer
+	base := logging.NewTextHandler(&buf, nil)
+	handlers := []slog.Handler{
+		base.WithAttrs([]slog.Attr{slog.String("module", "auth")}),
+		base.WithAttrs([]slog.Attr{slog.String("module", "server")}),
+		base.WithAttrs([]slog.Attr{slog.String("module", "voice")}),
+	}
+	const writesPerHandler = 100
+	var wg sync.WaitGroup
+	for _, handler := range handlers {
+		for range writesPerHandler {
+			wg.Go(func() {
+				if err := handler.Handle(context.Background(), fixedRecord(slog.LevelInfo, "derived")); err != nil {
+					t.Errorf("Handle = %v", err)
+				}
+			})
+		}
+	}
+	wg.Wait()
+
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != len(handlers)*writesPerHandler {
+		t.Fatalf("line count = %d, want %d", len(lines), len(handlers)*writesPerHandler)
+	}
+	for _, line := range lines {
+		if !strings.Contains(line, " derived") {
+			t.Fatalf("malformed or interleaved derived line: %q", line)
+		}
+	}
+}
+
 func TestTextHandlerWithGroupPassthrough(t *testing.T) {
 	var buf bytes.Buffer
 	h := logging.NewTextHandler(&buf, nil).WithGroup("ignored")
