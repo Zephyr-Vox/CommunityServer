@@ -3,6 +3,7 @@ package image
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 
 	"zephyr.vox/server/ce/internal/config"
@@ -23,13 +24,17 @@ const AvatarBucket = "avatars"
 // today is the fixed route /avatar/ (a server metadata endpoint publishing
 // a configurable prefix is future work, not part of this module).
 type AvatarService struct {
-	users     *store.UserStore
-	objects   *oss.LocalObjectStorage
-	idGen     *snowflake.IDGenerator
-	cfg       config.AvatarConfig
-	conv      ImageConverter
-	transcode func(src io.Reader, conv ImageConverter, size, maxDim int) ([]byte, error)
+	users          *store.UserStore
+	objects        *oss.LocalObjectStorage
+	idGen          *snowflake.IDGenerator
+	cfg            config.AvatarConfig
+	conv           ImageConverter
+	transcode      func(src io.Reader, conv ImageConverter, size, maxDim int) ([]byte, error)
+	transcodeSlots chan struct{}
+	userLocks      *avatarUserLocks
 }
+
+var ErrTranscodeBusy = errors.New("image: transcode capacity exhausted")
 
 // AvatarOption configures an AvatarService after its defaults are applied.
 // Options exist so tests can replace the converter or the transcode
@@ -51,12 +56,14 @@ func WithTranscode(fn func(src io.Reader, conv ImageConverter, size, maxDim int)
 // replace either of those (mainly for tests).
 func NewAvatarService(users *store.UserStore, objects *oss.LocalObjectStorage, idGen *snowflake.IDGenerator, cfg config.AvatarConfig, opts ...AvatarOption) *AvatarService {
 	s := &AvatarService{
-		users:     users,
-		objects:   objects,
-		idGen:     idGen,
-		cfg:       cfg,
-		conv:      JPEGConverter{Quality: cfg.Quality},
-		transcode: Transcode,
+		users:          users,
+		objects:        objects,
+		idGen:          idGen,
+		cfg:            cfg,
+		conv:           JPEGConverter{Quality: cfg.Quality},
+		transcode:      Transcode,
+		transcodeSlots: make(chan struct{}, cfg.MaxConcurrentTranscodes),
+		userLocks:      newAvatarUserLocks(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -70,11 +77,24 @@ func NewAvatarService(users *store.UserStore, objects *oss.LocalObjectStorage, i
 // commit removes the freshly written object to avoid orphans.
 //
 // It returns the managed name ("<id>.jpg"). Errors: store.ErrNotFound when
-// the user is gone, ErrImageTooLarge, ErrNotAnImage.
+// the user is gone, ErrImageTooLarge, ErrNotAnImage, or ErrTranscodeBusy.
+//
+// A per-user lock covers the read, storage write, metadata update, and stale
+// cleanup, so concurrent upload/reset operations cannot delete a newly
+// committed avatar. The bounded slot is acquired after that lock and released
+// on return; distinct users can transcode concurrently without queueing.
 func (s *AvatarService) Upload(ctx context.Context, userID int64, src io.Reader) (string, error) {
+	unlock := s.userLocks.lock(userID)
+	defer unlock()
 	user, err := s.users.GetUserByID(ctx, userID)
 	if err != nil {
 		return "", err
+	}
+	select {
+	case s.transcodeSlots <- struct{}{}:
+		defer func() { <-s.transcodeSlots }()
+	default:
+		return "", ErrTranscodeBusy
 	}
 
 	id, err := s.idGen.Next()
@@ -106,8 +126,11 @@ func (s *AvatarService) Upload(ctx context.Context, userID int64, src io.Reader)
 
 // Reset clears the user's avatar. The stored object, if any, is deleted
 // best-effort after the metadata commit. Errors: store.ErrNotFound when the
-// user is gone.
+// user is gone. It uses the same per-user lock as Upload so reset cannot race
+// an upload's metadata update or stale-object cleanup.
 func (s *AvatarService) Reset(ctx context.Context, userID int64) error {
+	unlock := s.userLocks.lock(userID)
+	defer unlock()
 	user, err := s.users.GetUserByID(ctx, userID)
 	if err != nil {
 		return err

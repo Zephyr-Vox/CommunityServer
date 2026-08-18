@@ -246,13 +246,13 @@ func (s *UserService) Unban(ctx context.Context, userID int64) error {
 }
 
 // Delete hard-deletes a user. Sessions and roles cascade; invites the user
-// created keep their rows with created_by set to NULL. The user's avatar
-// object is removed best-effort first, if a cleaner is wired up.
+// created keep their rows with created_by set to NULL. The committed avatar
+// reference is removed best-effort after the deletion transaction succeeds.
 func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
 	}
-	user, err := s.users.GetUserByID(ctx, userID)
+	_, err := s.users.GetUserByID(ctx, userID)
 	if err != nil {
 		return err
 	}
@@ -263,12 +263,14 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	} else if last {
 		return ErrLastAdmin
 	}
-	if s.avatarCleaner != nil && user.Avatar.Valid {
-		_ = s.avatarCleaner.DeleteAvatar(ctx, user.Avatar.String) // best-effort
-	}
 	unlock := s.principals.LockMutation(userID)
 	defer unlock()
+	var avatarName string
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
+		user, err := tx.Users.GetUserByID(ctx, userID)
+		if err != nil {
+			return err
+		}
 		last, err := isLastAdmin(ctx, tx.Users, userID)
 		if err != nil {
 			return err
@@ -276,12 +278,18 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 		if last {
 			return ErrLastAdmin
 		}
+		if user.Avatar.Valid {
+			avatarName = user.Avatar.String
+		}
 		return tx.Users.Delete(ctx, userID)
 	}); err != nil {
 		return err
 	}
 	s.principals.Invalidate(userID)
 	s.presence.Remove(userID)
+	if s.avatarCleaner != nil && avatarName != "" {
+		_ = s.avatarCleaner.DeleteAvatar(ctx, avatarName) // best-effort after commit
+	}
 	return nil
 }
 

@@ -70,10 +70,11 @@ func testConfigFull(dir string, httpPort int, registrationMode string, loginRate
 		},
 		Storage: config.StorageConfig{BaseDir: filepath.Join(dir, "objects")},
 		Avatar: config.AvatarConfig{
-			MaxUploadSize: 10 << 20,
-			MaxDimension:  4096,
-			TargetSize:    256,
-			Quality:       85,
+			MaxUploadSize:           10 << 20,
+			MaxDimension:            2048,
+			TargetSize:              256,
+			Quality:                 85,
+			MaxConcurrentTranscodes: 2,
 		},
 	}
 }

@@ -47,8 +47,8 @@ func TestLoadAppGeneratesDefault(t *testing.T) {
 	if app.Storage.BaseDir != "./data/objects" {
 		t.Fatalf("storage.base_dir = %q, want ./data/objects", app.Storage.BaseDir)
 	}
-	if app.Avatar.MaxUploadSize != 10<<20 || app.Avatar.MaxDimension != 4096 || app.Avatar.TargetSize != 256 || app.Avatar.Quality != 85 {
-		t.Fatalf("avatar = %+v, want 10 MiB / 4096 / 256 / 85", app.Avatar)
+	if app.Avatar.MaxUploadSize != 10<<20 || app.Avatar.MaxDimension != 2048 || app.Avatar.TargetSize != 256 || app.Avatar.Quality != 85 || app.Avatar.MaxConcurrentTranscodes != 2 {
+		t.Fatalf("avatar = %+v, want 10 MiB / 2048 / 256 / 85 / 2", app.Avatar)
 	}
 	if app.Server.Host != "0.0.0.0" || app.Server.HTTPPort != 8745 || app.Server.VoicePort != 8746 || app.Server.DBPath != "./data/zephyr.db" {
 		t.Fatalf("server = %+v, want 0.0.0.0:8745 voice 8746 db ./data/zephyr.db", app.Server)
@@ -834,12 +834,13 @@ max_upload_size = 20971520
 max_dimension = 2048
 target_size = 128
 quality = 70
+max_concurrent_transcodes = 4
 `)
 	app, err := config.LoadApp(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if app.Avatar.MaxUploadSize != 20971520 || app.Avatar.MaxDimension != 2048 || app.Avatar.TargetSize != 128 || app.Avatar.Quality != 70 {
+	if app.Avatar.MaxUploadSize != 20971520 || app.Avatar.MaxDimension != 2048 || app.Avatar.TargetSize != 128 || app.Avatar.Quality != 70 || app.Avatar.MaxConcurrentTranscodes != 4 {
 		t.Fatalf("avatar = %+v, want custom values", app.Avatar)
 	}
 }

@@ -70,10 +70,11 @@ type StorageConfig struct {
 // operational parameters the administrator tunes per deployment; there are
 // no hidden constants in the image package.
 type AvatarConfig struct {
-	MaxUploadSize int64 // request body limit in bytes; default 10 MiB
-	MaxDimension  int   // source image max side in pixels; rejects decompression bombs
-	TargetSize    int   // output avatar side in pixels (square)
-	Quality       int   // JPEG quality, 0-100
+	MaxUploadSize           int64 // request body limit in bytes; default 10 MiB
+	MaxDimension            int   // source image max side in pixels; rejects decompression bombs
+	TargetSize              int   // output avatar side in pixels (square)
+	Quality                 int   // JPEG quality, 0-100
+	MaxConcurrentTranscodes int   // concurrent decode/encode pipelines; default 2
 }
 
 // LogConfig configures the human-readable log pipeline. Path empty means
@@ -102,10 +103,11 @@ type appConfig struct {
 		BaseDir string `mapstructure:"base_dir"`
 	} `mapstructure:"storage"`
 	Avatar struct {
-		MaxUploadSize *int64 `mapstructure:"max_upload_size"`
-		MaxDimension  *int   `mapstructure:"max_dimension"`
-		TargetSize    *int   `mapstructure:"target_size"`
-		Quality       *int   `mapstructure:"quality"`
+		MaxUploadSize           *int64 `mapstructure:"max_upload_size"`
+		MaxDimension            *int   `mapstructure:"max_dimension"`
+		TargetSize              *int   `mapstructure:"target_size"`
+		Quality                 *int   `mapstructure:"quality"`
+		MaxConcurrentTranscodes *int   `mapstructure:"max_concurrent_transcodes"`
 	} `mapstructure:"avatar"`
 	Auth struct {
 		AccessTokenTTL   string  `mapstructure:"access_token_ttl"`
@@ -141,6 +143,7 @@ func LoadApp(path string) (*App, error) {
 	return newApp(cfg)
 }
 
+// newApp validates parsed configuration and builds its runtime representation.
 func newApp(cfg appConfig) (*App, error) {
 	accessTTL, refreshTTL, err := validateApp(cfg)
 	if err != nil {
@@ -270,6 +273,7 @@ func validDNSName(name string) bool {
 	return true
 }
 
+// validDNSLabel reports whether label is a valid ASCII DNS label.
 func validDNSLabel(label string) bool {
 	if len(label) < 1 || len(label) > 63 {
 		return false
@@ -330,10 +334,11 @@ func validateApp(cfg appConfig) (accessTTL, refreshTTL time.Duration, err error)
 // number is an error, an absent key keeps the default.
 func validateAvatar(cfg appConfig) (AvatarConfig, error) {
 	a := AvatarConfig{
-		MaxUploadSize: 10 << 20, // 10 MiB
-		MaxDimension:  4096,
-		TargetSize:    256,
-		Quality:       85,
+		MaxUploadSize:           10 << 20, // 10 MiB
+		MaxDimension:            2048,
+		TargetSize:              256,
+		Quality:                 85,
+		MaxConcurrentTranscodes: 2,
 	}
 	if cfg.Avatar.MaxUploadSize != nil {
 		if *cfg.Avatar.MaxUploadSize <= 0 {
@@ -358,6 +363,12 @@ func validateAvatar(cfg appConfig) (AvatarConfig, error) {
 			return AvatarConfig{}, errors.New("config: avatar.quality must be 0-100")
 		}
 		a.Quality = *cfg.Avatar.Quality
+	}
+	if cfg.Avatar.MaxConcurrentTranscodes != nil {
+		if *cfg.Avatar.MaxConcurrentTranscodes < 1 || *cfg.Avatar.MaxConcurrentTranscodes > 32 {
+			return AvatarConfig{}, errors.New("config: avatar.max_concurrent_transcodes must be 1-32")
+		}
+		a.MaxConcurrentTranscodes = *cfg.Avatar.MaxConcurrentTranscodes
 	}
 	return a, nil
 }
@@ -398,6 +409,7 @@ func validateLog(cfg appConfig) (slog.Level, string, int, error) {
 	return level, path, keep, nil
 }
 
+// ensureDefaultAppFile creates path with a fresh secret when it is absent.
 func ensureDefaultAppFile(path string) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
@@ -421,6 +433,7 @@ func ensureDefaultAppFile(path string) error {
 	return nil
 }
 
+// randomHex returns n cryptographically random bytes encoded as hexadecimal.
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {

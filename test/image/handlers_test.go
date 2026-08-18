@@ -10,6 +10,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -20,6 +22,7 @@ import (
 	"zephyr.vox/server/ce/internal/auth"
 	img "zephyr.vox/server/ce/internal/image"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
+	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/validation"
 )
 
@@ -163,6 +166,104 @@ func TestUploadAvatarHandlerPayloadTooLarge(t *testing.T) {
 	rec := doRequest(t, app, http.MethodPost, "/api/v0/me/avatar", token, ctype, body)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUploadAvatarHandlerRejectsOversizedTrailingPart(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.MaxUploadSize = 1024
+	e := newEnv(t, cfg)
+	app := newAvatarEcho(t, e)
+	userID := createUser(t, e, "alice")
+	token := loginToken(t, e, "alice")
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	file, err := writer.CreateFormFile("file", "avatar.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(pngBytes(t, 8, 8, nrgba(1, 2, 3))); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("trailing", strings.Repeat("x", 2048)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := doRequest(t, app, http.MethodPost, "/api/v0/me/avatar", token, writer.FormDataContentType(), &body)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != api.CodePayloadTooLarge {
+		t.Fatalf("code = %d, want %d", response.Code, api.CodePayloadTooLarge)
+	}
+	user, err := e.stores.Users.GetUserByID(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Avatar.Valid {
+		t.Fatalf("rejected upload changed avatar to %q", user.Avatar.String)
+	}
+}
+
+func TestUploadAvatarHandlerTranscodeBusy(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.MaxConcurrentTranscodes = 1
+	e := newEnv(t, cfg)
+	createUser(t, e, "alice")
+	createUser(t, e, "bob")
+	firstToken := loginToken(t, e, "alice")
+	secondToken := loginToken(t, e, "bob")
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	e.svc = img.NewAvatarService(e.stores.Users, e.objects, idGen, cfg, img.WithTranscode(
+		func(io.Reader, img.ImageConverter, int, int) ([]byte, error) {
+			once.Do(func() { close(started) })
+			<-release
+			return []byte("fake-jpeg"), nil
+		},
+	))
+	app := newAvatarEcho(t, e)
+
+	body, ctype := multipartBody(t, "file", pngBytes(t, 8, 8, nrgba(1, 2, 3)))
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- doRequest(t, app, http.MethodPost, "/api/v0/me/avatar", firstToken, ctype, body)
+	}()
+	<-started
+
+	secondBody, secondType := multipartBody(t, "file", pngBytes(t, 8, 8, nrgba(4, 5, 6)))
+	second := doRequest(t, app, http.MethodPost, "/api/v0/me/avatar", secondToken, secondType, secondBody)
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, body = %s", second.Code, second.Body.String())
+	}
+	var response struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != api.CodeRateLimited {
+		t.Fatalf("second code = %d, want %d", response.Code, api.CodeRateLimited)
+	}
+
+	close(release)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, body = %s", first.Code, first.Body.String())
 	}
 }
 

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,7 +70,7 @@ func newEnv(t *testing.T, cfg config.AvatarConfig) *env {
 }
 
 func defaultCfg() config.AvatarConfig {
-	return config.AvatarConfig{MaxUploadSize: 10 << 20, MaxDimension: 4096, TargetSize: 64, Quality: 85}
+	return config.AvatarConfig{MaxUploadSize: 10 << 20, MaxDimension: 2048, TargetSize: 64, Quality: 85, MaxConcurrentTranscodes: 2}
 }
 
 // pngBytes encodes a solid-color NRGBA image as PNG bytes.
@@ -394,5 +396,57 @@ func TestAvatarServiceWithInjectedTranscode(t *testing.T) {
 	rc.Close()
 	if obj.ContentType != "image/jpeg" {
 		t.Fatalf("content_type = %q, want image/jpeg", obj.ContentType)
+	}
+}
+
+func TestAvatarTranscodeSlotsRejectWhenFull(t *testing.T) {
+	e := newEnv(t, config.AvatarConfig{
+		MaxUploadSize:           10 << 20,
+		MaxDimension:            2048,
+		TargetSize:              64,
+		Quality:                 85,
+		MaxConcurrentTranscodes: 2,
+	})
+	ctx := context.Background()
+	users := []int64{createUser(t, e, "alice"), createUser(t, e, "bob"), createUser(t, e, "carol")}
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var calls atomic.Int64
+	svc := img.NewAvatarService(e.stores.Users, e.objects, idGen, defaultCfg(), img.WithTranscode(
+		func(io.Reader, img.ImageConverter, int, int) ([]byte, error) {
+			calls.Add(1)
+			started <- struct{}{}
+			<-release
+			return []byte("fake-jpeg"), nil
+		},
+	))
+
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, userID := range users[:2] {
+		wg.Go(func() {
+			_, err := svc.Upload(ctx, userID, strings.NewReader("ignored"))
+			results <- err
+		})
+	}
+	for range 2 {
+		<-started
+	}
+	if _, err := svc.Upload(ctx, users[2], strings.NewReader("ignored")); !errors.Is(err, img.ErrTranscodeBusy) {
+		t.Fatalf("third upload error = %v, want ErrTranscodeBusy", err)
+	}
+	close(release)
+	wg.Wait()
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("occupied slot upload failed: %v", err)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("transcode calls = %d, want 2", calls.Load())
 	}
 }
