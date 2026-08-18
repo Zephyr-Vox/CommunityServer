@@ -135,7 +135,9 @@ type Session struct {
 	remote    *net.UDPAddr
 	rxReplay  *ReplayWindow
 	sendSeq   uint64
+	active    bool
 	mu        sync.Mutex
+	sendMu    sync.Mutex
 }
 
 // Manager is the in-memory session registry. mu protects only the table
@@ -245,17 +247,20 @@ func (m *Manager) Create(userID int64, deviceID string, encrypted bool) (Session
 	m.mu.Lock()
 	replaced := false
 	var snapshot *RevokedSessionSnapshot
+	var replacedSession *Session
 	var revokeHandler RevocationHandler
 	if oldID, exists := m.byUser[userID]; exists {
 		if old, ok := m.sessions[oldID]; ok {
 			old.mu.Lock()
 			if !old.expiredLocked(nowMS) {
-				snap := newRevokedSnapshotLocked(old)
-				snapshot = &snap
 				replaced = true
 			}
+			old.deactivateLocked()
 			old.mu.Unlock()
 			delete(m.sessions, oldID)
+			if replaced {
+				replacedSession = old
+			}
 		}
 		delete(m.byUser, userID)
 	}
@@ -263,6 +268,16 @@ func (m *Manager) Create(userID int64, deviceID string, encrypted bool) (Session
 	m.byUser[userID] = id
 	revokeHandler = m.onRevoke
 	m.mu.Unlock()
+	if replacedSession != nil {
+		// The table swap is complete before waiting for Send, so another Create
+		// cannot observe a partially removed old session under Manager.mu.
+		replacedSession.sendMu.Lock()
+		replacedSession.mu.Lock()
+		snap := newRevokedSnapshotLocked(replacedSession)
+		replacedSession.mu.Unlock()
+		replacedSession.sendMu.Unlock()
+		snapshot = &snap
+	}
 
 	if snapshot != nil && revokeHandler != nil {
 		revokeHandler(RevocationReplaced, *snapshot)
@@ -290,6 +305,7 @@ func newSession(id [16]byte, userID int64, deviceID string, encrypted bool, nowM
 		s2cAEAD:   s2cAEAD,
 		rxBudget:  NewTokenBucket(float64(limits.SessionPacketsPerSec), limits.SessionBurst, now),
 		rxReplay:  &ReplayWindow{},
+		active:    true,
 	}
 }
 
@@ -307,6 +323,9 @@ func (m *Manager) Get(id [16]byte) (*Session, bool) {
 	nowMS := m.nowMillis()
 	sess.mu.Lock()
 	expired := sess.expiredLocked(nowMS)
+	if expired {
+		sess.deactivateLocked()
+	}
 	sess.mu.Unlock()
 	if !expired {
 		m.mu.Unlock()
@@ -343,6 +362,9 @@ func (m *Manager) SessionIDByUser(userID int64) ([16]byte, bool) {
 	nowMS := m.nowMillis()
 	sess.mu.Lock()
 	expired := sess.expiredLocked(nowMS)
+	if expired {
+		sess.deactivateLocked()
+	}
 	sess.mu.Unlock()
 	if !expired {
 		m.mu.Unlock()
@@ -393,14 +415,19 @@ func (m *Manager) InvalidateUser(userID int64) int {
 
 	nowMS := m.nowMillis()
 	sess.mu.Lock()
-	snap := newRevokedSnapshotLocked(sess)
 	active := !sess.expiredLocked(nowMS)
+	sess.deactivateLocked()
 	sess.mu.Unlock()
 
 	handler := m.onRevoke
 	m.mu.Unlock()
 
 	if active && handler != nil {
+		sess.sendMu.Lock()
+		sess.mu.Lock()
+		snap := newRevokedSnapshotLocked(sess)
+		sess.mu.Unlock()
+		sess.sendMu.Unlock()
 		// Run outside the manager lock: the handler may send a UDP packet.
 		handler(RevocationRevoked, snap)
 	}
@@ -425,6 +452,7 @@ func (m *Manager) Delete(id [16]byte, userID int64) error {
 	nowMS := m.nowMillis()
 	sess.mu.Lock()
 	expired := sess.expiredLocked(nowMS)
+	sess.deactivateLocked()
 	sess.mu.Unlock()
 	m.deleteLocked(id, userID)
 	if expired {
@@ -448,6 +476,9 @@ func (m *Manager) Purge() int {
 	for id, sess := range m.sessions {
 		sess.mu.Lock()
 		isExpired := sess.expiredLocked(nowMS)
+		if isExpired {
+			sess.deactivateLocked()
+		}
 		sess.mu.Unlock()
 		if isExpired {
 			m.deleteLocked(id, sess.UserID)
@@ -494,11 +525,10 @@ func (s *Session) touchLocked(nowMS int64) {
 	s.ExpiresAt = nowMS + SessionTTL.Milliseconds()
 }
 
-// allowPacketAt consumes one token-bucket token. It runs before decryption so
-// an attacker spraying cheap garbage cannot force expensive AEAD work. The
-// caller passes the same clock sample used for the rest of the datagram.
-func (s *Session) allowPacketAt(now time.Time) bool {
-	return s.rxBudget.TakeAt(now)
+// deactivateLocked makes a removed session reject every future receive and
+// send reservation. Callers hold s.mu before removing it from Manager indexes.
+func (s *Session) deactivateLocked() {
+	s.active = false
 }
 
 // cryptoSnapshot copies the c2s AEAD handle and mode out of the session. The
@@ -514,13 +544,33 @@ func (s *Session) cryptoSnapshot() (encrypted bool, c2sAEAD cipher.AEAD) {
 // critical section. Semantic validation (heartbeat shape, speaker_id,
 // registered channel, flags) happens before this call, so invalid packets can
 // never extend TTL or move the remote address.
-func (s *Session) acceptPacket(seq uint64, now time.Time, remote *net.UDPAddr) (accepted bool) {
+type receiveDecision uint8
+
+const (
+	receiveAccepted receiveDecision = iota
+	receiveDroppedReplay
+	receiveDroppedRateLimit
+	receiveDroppedInactive
+)
+
+// acceptPacket atomically validates liveness, replay and authenticated rate
+// budget before advancing the replay window or learning a remote address.
+func (s *Session) acceptPacket(seq uint64, now time.Time, remote *net.UDPAddr) receiveDecision {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if !s.active {
+		return receiveDroppedInactive
+	}
+	if !s.rxReplay.WouldAccept(seq) {
+		return receiveDroppedReplay
+	}
+	if !s.rxBudget.TakeAt(now) {
+		return receiveDroppedRateLimit
+	}
 	accepted, advanced := s.rxReplay.Accept(seq)
 	if !accepted {
-		return false
+		panic("protocol: replay window changed while session lock held")
 	}
 	s.touchLocked(now.UnixMilli())
 	// remote follows only high-water advancement: a late in-window packet
@@ -528,7 +578,7 @@ func (s *Session) acceptPacket(seq uint64, now time.Time, remote *net.UDPAddr) (
 	if advanced && remote != nil {
 		s.remote = cloneUDPAddr(remote)
 	}
-	return true
+	return receiveAccepted
 }
 
 // reserveSendSeq allocates the next s2c sequence inside Session.mu, then
@@ -539,6 +589,9 @@ func (s *Session) reserveSendSeq() (seq uint64, encrypted bool, s2cAEAD cipher.A
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if !s.active {
+		return 0, false, nil, nil, ErrSessionNotFound
+	}
 	if s.sendSeq == math.MaxUint64 {
 		return 0, false, nil, nil, ErrSequenceExhausted
 	}

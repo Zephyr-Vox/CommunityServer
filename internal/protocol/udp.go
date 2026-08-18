@@ -4,6 +4,7 @@ import (
 	"crypto/cipher"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -41,9 +42,13 @@ const (
 	StatsDroppedMalformed
 	StatsDroppedUnknownSession
 	StatsDroppedRateLimit
+	StatsDroppedGlobalIngress
+	StatsDroppedSourceIngress
+	StatsDroppedSourceTableFull
 	StatsDroppedAuthentication
 	StatsDroppedChannel
 	StatsDroppedReplay
+	StatsDroppedSessionRateLimit
 	StatsHeartbeatReceived
 	StatsFrameDelivered
 	StatsSendSuccess
@@ -75,6 +80,7 @@ type UDPServer struct {
 	registry     *ChannelTypeRegistry
 	onFrame      FrameHandler
 	statsHandler StatsHandler
+	ingress      *IngressLimiter
 
 	connMu  sync.Mutex
 	conn    net.PacketConn
@@ -94,19 +100,27 @@ func WithStatsHandler(handler StatsHandler) UDPOption {
 	}
 }
 
-// NewUDPServer returns a UDP server bound to manager and registry. onFrame
-// may be nil, in which case validated frames are counted nowhere and simply
-// dropped after transport validation.
-func NewUDPServer(manager *Manager, registry *ChannelTypeRegistry, onFrame FrameHandler, opts ...UDPOption) *UDPServer {
+// NewUDPServer returns a UDP server bound to manager and registry. ingress
+// limits are enforced before header parsing and AEAD work. onFrame may be nil,
+// in which case validated frames are counted nowhere and simply dropped.
+func NewUDPServer(manager *Manager, registry *ChannelTypeRegistry, onFrame FrameHandler, limits IngressLimits, opts ...UDPOption) (*UDPServer, error) {
+	if manager == nil || registry == nil {
+		return nil, errors.New("protocol: nil manager or registry")
+	}
+	ingress, err := NewIngressLimiter(limits, manager.now)
+	if err != nil {
+		return nil, err
+	}
 	s := &UDPServer{
 		manager:  manager,
 		registry: registry,
 		onFrame:  onFrame,
+		ingress:  ingress,
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
-	return s
+	return s, nil
 }
 
 // Start registers pc synchronously and starts the datagram read loop on a new
@@ -134,8 +148,12 @@ func (s *UDPServer) Start(pc net.PacketConn) (<-chan error, error) {
 	}
 	if s.serving {
 		s.connMu.Unlock()
+		_ = pc.Close()
 		return nil, errors.New("protocol: udp server already serving")
 	}
+	// Seal before publishing the serving state: callers that observe Start's
+	// successful return can no longer race a late channel registration.
+	s.registry.Seal()
 	s.serving = true
 	s.conn = pc
 	s.wg.Add(1)
@@ -159,10 +177,6 @@ func (s *UDPServer) serve(pc net.PacketConn) error {
 		s.connMu.Unlock()
 		s.wg.Done()
 	}()
-
-	// Registering after this point is a protocol-version escalation: v1
-	// deliberately freezes the stream table before the first datagram.
-	s.registry.Seal()
 
 	// Read into MaxPacketSize+1 so a datagram longer than the limit is
 	// detectable: UDP ReadFrom truncates silently, and with a 1200-byte
@@ -249,6 +263,8 @@ func (s *UDPServer) Send(id [16]byte, channelType uint8, speakerID int64, channe
 	if !ok {
 		return fail(ErrSessionNotFound)
 	}
+	sess.sendMu.Lock()
+	defer sess.sendMu.Unlock()
 	seq, encrypted, aead, remote, err := sess.reserveSendSeq()
 	if err != nil {
 		return fail(err)
@@ -358,6 +374,7 @@ func (s *UDPServer) PurgeLoop(interval time.Duration, ticks <-chan time.Time, st
 		select {
 		case <-ticks:
 			s.manager.Purge()
+			s.ingress.Sweep(s.manager.now())
 		case <-stop:
 			return
 		}
@@ -387,6 +404,23 @@ func (s *UDPServer) handleDatagram(p []byte, addr net.Addr) {
 		s.reportStats(StatsSample{Bytes: len(p), Kind: StatsDroppedMalformed})
 		return
 	}
+	addrIP, ok := netip.AddrFromSlice(udpAddr.IP)
+	if !ok {
+		s.reportStats(StatsSample{Bytes: len(p), Kind: StatsDroppedMalformed})
+		return
+	}
+	now := s.manager.now()
+	switch s.ingress.Allow(addrIP, now) {
+	case IngressDroppedGlobal:
+		s.reportStats(StatsSample{Bytes: len(p), Kind: StatsDroppedGlobalIngress})
+		return
+	case IngressDroppedSource:
+		s.reportStats(StatsSample{Bytes: len(p), Kind: StatsDroppedSourceIngress})
+		return
+	case IngressDroppedTableFull:
+		s.reportStats(StatsSample{Bytes: len(p), Kind: StatsDroppedSourceTableFull})
+		return
+	}
 
 	sessionID, seq, ok := parseOuterHeader(p)
 	if !ok {
@@ -399,17 +433,6 @@ func (s *UDPServer) handleDatagram(p []byte, addr net.Addr) {
 		s.reportStats(StatsSample{
 			Kind:      StatsDroppedUnknownSession,
 			SessionID: sessionID,
-			Bytes:     len(p),
-		})
-		return
-	}
-
-	now := s.manager.now()
-	if !sess.allowPacketAt(now) {
-		s.reportStats(StatsSample{
-			Kind:      StatsDroppedRateLimit,
-			SessionID: sessionID,
-			UserID:    sess.UserID,
 			Bytes:     len(p),
 		})
 		return
@@ -483,7 +506,8 @@ func (s *UDPServer) handleDatagram(p []byte, addr net.Addr) {
 		return
 	}
 
-	if !sess.acceptPacket(seq, now, udpAddr) {
+	switch sess.acceptPacket(seq, now, udpAddr) {
+	case receiveDroppedReplay:
 		s.reportStats(StatsSample{
 			Kind:        StatsDroppedReplay,
 			SessionID:   sessionID,
@@ -491,6 +515,11 @@ func (s *UDPServer) handleDatagram(p []byte, addr net.Addr) {
 			ChannelType: ch.ChannelType,
 			Bytes:       len(p),
 		})
+		return
+	case receiveDroppedRateLimit:
+		s.reportStats(StatsSample{Kind: StatsDroppedSessionRateLimit, SessionID: sessionID, UserID: sess.UserID, ChannelType: ch.ChannelType, Bytes: len(p)})
+		return
+	case receiveDroppedInactive:
 		return
 	}
 	if ch.ChannelType == HeartbeatChannelType {

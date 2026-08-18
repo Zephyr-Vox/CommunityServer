@@ -21,6 +21,24 @@ type ReplayWindow struct {
 	bits [2]uint64
 }
 
+// WouldAccept reports whether Accept would admit seq without changing window
+// state. The caller holds the same Session mutex used for Accept.
+func (w *ReplayWindow) WouldAccept(seq uint64) bool {
+	if seq == 0 {
+		return false
+	}
+	if seq > w.high {
+		return true
+	}
+	offset := w.high - seq
+	if offset >= replayWindowSize {
+		return false
+	}
+	word := offset / 64
+	bit := uint(offset % 64)
+	return w.bits[word]&(uint64(1)<<bit) == 0
+}
+
 // Accept classifies one received sequence number.
 //
 // accepted = the packet is not a replay and is inside the window
