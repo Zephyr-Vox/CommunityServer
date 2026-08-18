@@ -102,7 +102,7 @@ func (s *LocalObjectStorage) Put(ctx context.Context, bucket, name string, src i
 	if err != nil {
 		return Object{}, err
 	}
-	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+	if err := securePrivateDir(tmpDir); err != nil {
 		return Object{}, fmt.Errorf("oss: create internal temp directory: %w", err)
 	}
 	tmp, err := os.CreateTemp(tmpDir, internalName(name)+".tmp-")
@@ -258,10 +258,21 @@ func internalPaths(bucketDir, name string) (tmpDir, backup string, err error) {
 	internal := filepath.Join(bucketDir, internalDirName)
 	tmpDir = filepath.Join(internal, "tmp")
 	backupDir := filepath.Join(internal, "backup")
-	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+	if err := securePrivateDir(internal); err != nil {
+		return "", "", fmt.Errorf("oss: create internal directory: %w", err)
+	}
+	if err := securePrivateDir(backupDir); err != nil {
 		return "", "", fmt.Errorf("oss: create internal backup directory: %w", err)
 	}
 	return tmpDir, filepath.Join(backupDir, internalName(name)), nil
+}
+
+// securePrivateDir creates path and tightens an existing directory to 0700.
+func securePrivateDir(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o700)
 }
 
 // internalName hashes a public object name so internal paths never embed it.

@@ -102,9 +102,27 @@ func TestRejectsUnsafeComponents(t *testing.T) {
 		if err := e.objects.Delete(ctx, tc[0], tc[1]); !errors.Is(err, oss.ErrInvalidKey) {
 			t.Fatalf("Delete(%q, %q) = %v, want ErrInvalidKey", tc[0], tc[1], err)
 		}
+		if _, rc, err := e.objects.Open(ctx, tc[0], tc[1]); !errors.Is(err, oss.ErrInvalidKey) {
+			if rc != nil {
+				_ = rc.Close()
+			}
+			t.Fatalf("Open(%q, %q) = %v, want ErrInvalidKey", tc[0], tc[1], err)
+		}
 	}
 	if _, err := e.objects.Put(ctx, "avatars", ".zephyr-internal", strings.NewReader("x"), oss.PutOptions{}); !errors.Is(err, oss.ErrInvalidKey) {
 		t.Fatalf("Put reserved name = %v, want ErrInvalidKey", err)
+	}
+	if _, err := e.objects.Stat(ctx, "avatars", ".zephyr-internal"); !errors.Is(err, oss.ErrInvalidKey) {
+		t.Fatalf("Stat reserved name = %v, want ErrInvalidKey", err)
+	}
+	if err := e.objects.Delete(ctx, "avatars", ".zephyr-internal"); !errors.Is(err, oss.ErrInvalidKey) {
+		t.Fatalf("Delete reserved name = %v, want ErrInvalidKey", err)
+	}
+	if _, rc, err := e.objects.Open(ctx, "avatars", ".zephyr-internal"); !errors.Is(err, oss.ErrInvalidKey) {
+		if rc != nil {
+			_ = rc.Close()
+		}
+		t.Fatalf("Open reserved name = %v, want ErrInvalidKey", err)
 	}
 }
 
@@ -268,6 +286,152 @@ func TestConcurrentSameKeyPutsEndConsistent(t *testing.T) {
 	}
 }
 
+func TestConcurrentFooAndBackupSuffixRemainIndependent(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	payloads := map[string][]struct {
+		content     string
+		contentType string
+	}{
+		"foo":     {{"A", "image/png"}, {"BB", "text/plain"}, {"CCC", "image/jpeg"}},
+		"foo.bak": {{"one", "application/octet-stream"}, {"two", "text/plain"}, {"three", "image/png"}},
+	}
+
+	var wg sync.WaitGroup
+	for name, values := range payloads {
+		for worker := range 8 {
+			wg.Go(func() {
+				for round := range 20 {
+					value := values[(worker+round)%len(values)]
+					if _, err := e.objects.Put(ctx, "avatars", name, strings.NewReader(value.content), oss.PutOptions{ContentType: value.contentType}); err != nil {
+						t.Errorf("Put(%q): %v", name, err)
+						return
+					}
+				}
+			})
+		}
+	}
+	wg.Wait()
+
+	for name, values := range payloads {
+		obj, err := e.objects.Stat(ctx, "avatars", name)
+		if err != nil {
+			t.Fatalf("Stat(%q): %v", name, err)
+		}
+		_, rc, err := e.objects.Open(ctx, "avatars", name)
+		if err != nil {
+			t.Fatalf("Open(%q): %v", name, err)
+		}
+		data, readErr := io.ReadAll(rc)
+		_ = rc.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		matched := false
+		for _, value := range values {
+			if string(data) == value.content {
+				matched = true
+				if obj.ContentType != value.contentType || obj.Size != int64(len(data)) {
+					t.Fatalf("%s metadata %+v inconsistent with %q", name, obj, data)
+				}
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("%s content %q matches no writer payload", name, data)
+		}
+	}
+}
+
+func TestConcurrentFooAndBackupSuffixPutDeleteRemainIndependent(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	for _, name := range []string{"foo", "foo.bak"} {
+		if _, err := e.objects.Put(ctx, "avatars", name, strings.NewReader("initial"), oss.PutOptions{ContentType: "text/plain"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var wg sync.WaitGroup
+	for _, name := range []string{"foo", "foo.bak"} {
+		name := name
+		wg.Go(func() {
+			for range 20 {
+				if _, err := e.objects.Put(ctx, "avatars", name, strings.NewReader("put-"+name), oss.PutOptions{ContentType: "text/plain"}); err != nil {
+					t.Errorf("Put(%q): %v", name, err)
+					return
+				}
+			}
+		})
+		wg.Go(func() {
+			for range 20 {
+				if err := e.objects.Delete(ctx, "avatars", name); err != nil {
+					t.Errorf("Delete(%q): %v", name, err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	for _, name := range []string{"foo", "foo.bak"} {
+		want := "final-" + name
+		if _, err := e.objects.Put(ctx, "avatars", name, strings.NewReader(want), oss.PutOptions{ContentType: "text/plain"}); err != nil {
+			t.Fatal(err)
+		}
+		obj, rc, err := e.objects.Open(ctx, "avatars", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, readErr := io.ReadAll(rc)
+		_ = rc.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if string(data) != want || obj.Size != int64(len(want)) {
+			t.Fatalf("final %q state = %q %+v", name, data, obj)
+		}
+	}
+}
+
+func TestSuccessfulOverwriteCleansInternalTempAndBackupFiles(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	internal := filepath.Join(e.root, "avatars", ".zephyr-internal")
+	for _, dir := range []string{internal, filepath.Join(internal, "tmp"), filepath.Join(internal, "backup")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.objects.Put(ctx, "avatars", "foo", strings.NewReader("old"), oss.PutOptions{ContentType: "text/plain"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.objects.Put(ctx, "avatars", "foo", strings.NewReader("new"), oss.PutOptions{ContentType: "text/plain"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"", "tmp", "backup"} {
+		path := filepath.Join(internal, dir)
+		internalInfo, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if internalInfo.Mode().Perm() != 0o700 {
+			t.Fatalf("internal directory %q mode = %o, want 700", dir, internalInfo.Mode().Perm())
+		}
+		if dir == "" {
+			continue
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("internal %s files after successful overwrite = %v", dir, entries)
+		}
+	}
+}
+
 func TestConcurrentPutDeleteSameKeyEndConsistent(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
@@ -346,6 +510,15 @@ func TestPutOverwriteFailureRestoresOldFile(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(e.root, "avatars", "1.png.bak")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("backup file should not remain, stat err = %v", err)
+	}
+	for _, dir := range []string{"tmp", "backup"} {
+		entries, err := os.ReadDir(filepath.Join(e.root, "avatars", ".zephyr-internal", dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("internal %s files after failed overwrite = %v", dir, entries)
+		}
 	}
 
 	// Reopen the database: the old metadata row must match the old file.
