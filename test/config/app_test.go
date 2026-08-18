@@ -131,6 +131,87 @@ source_burst = 0
 	}
 }
 
+func TestLoadAppRejectsEveryInvalidVoiceLimit(t *testing.T) {
+	const base = `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[voice.limits]
+%s = %s
+`
+	fields := []string{
+		"global_ingress_packets_per_sec",
+		"global_ingress_burst",
+		"source_packets_per_sec",
+		"source_burst",
+		"source_entry_limit",
+		"session_packets_per_sec",
+		"session_burst",
+	}
+	for _, value := range []string{"0", "-1"} {
+		for _, field := range fields {
+			t.Run(field+"_"+value, func(t *testing.T) {
+				_, err := config.LoadApp(writeApp(t, fmt.Sprintf(base, field, value)))
+				if err == nil || !strings.Contains(err.Error(), "voice.limits."+field) {
+					t.Fatalf("error = %v, want %s validation", err, field)
+				}
+			})
+		}
+	}
+	for _, value := range []string{`"invalid"`, `"0s"`, `"-1s"`} {
+		t.Run("source_entry_ttl_"+value, func(t *testing.T) {
+			_, err := config.LoadApp(writeApp(t, fmt.Sprintf(base, "source_entry_ttl", value)))
+			if err == nil || !strings.Contains(err.Error(), "voice.limits.source_entry_ttl") {
+				t.Fatalf("error = %v, want source_entry_ttl validation", err)
+			}
+		})
+	}
+}
+
+func TestLoadAppRejectsInvalidAvatarTranscodeConcurrency(t *testing.T) {
+	const base = `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+
+[avatar]
+max_concurrent_transcodes = %d
+`
+	for _, value := range []int{0, 33} {
+		t.Run(fmt.Sprint(value), func(t *testing.T) {
+			_, err := config.LoadApp(writeApp(t, fmt.Sprintf(base, value)))
+			if err == nil || !strings.Contains(err.Error(), "avatar.max_concurrent_transcodes") {
+				t.Fatalf("error = %v, want max_concurrent_transcodes validation", err)
+			}
+		})
+	}
+}
+
 func TestLoadAppDoesNotOverwriteExisting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "zephyr.toml")
 	if _, err := config.LoadApp(path); err != nil {
