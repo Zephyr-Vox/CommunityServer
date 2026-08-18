@@ -277,7 +277,7 @@ func newRegisterEcho(t *testing.T, svc *auth.RegisterService) *echo.Echo {
 	app := echo.New()
 	app.Validator = validation.New()
 	app.HTTPErrorHandler = newErrorHandler()
-	app.POST("/api/v0/auth/register", auth.RegisterHandler(svc))
+	app.POST("/api/v0/auth/register", auth.RegisterHandler(svc), auth.IPRateLimit(1))
 	return app
 }
 
@@ -337,5 +337,19 @@ func TestRegisterHandlerWeakPassword(t *testing.T) {
 	rec := postJSON(t, app, "/api/v0/auth/register", `{"username":"alice","password":"secret"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestRegisterHandlerRateLimitBeforeBind(t *testing.T) {
+	e := newEnv(t)
+	app := newRegisterEcho(t, newRegisterService(t, e, auth.RegistrationOpen))
+
+	first := postJSON(t, app, "/api/v0/auth/register", `{"username":"alice","password":"secret123"}`)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, body = %s", first.Code, first.Body.String())
+	}
+	second := postJSON(t, app, "/api/v0/auth/register", `{malformed`)
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want 429, body = %s", second.Code, second.Body.String())
 	}
 }

@@ -3,6 +3,7 @@ package auth_test
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -45,6 +46,7 @@ func (c *fakeClock) set(now int64) {
 }
 
 type env struct {
+	conn       *sql.DB
 	stores     *store.Stores
 	svc        *auth.AuthService
 	principals *auth.PrincipalCache
@@ -76,6 +78,7 @@ func newEnv(t *testing.T) *env {
 	principals := auth.NewPrincipalCache(stores.Users, time.Minute)
 	svc := auth.NewAuthService(stores, principals, secret, 15*time.Minute, 30*24*time.Hour, clock.get)
 	return &env{
+		conn:       conn,
 		stores:     stores,
 		svc:        svc,
 		principals: principals,

@@ -113,6 +113,7 @@ func LogoutHandler(svc *AuthService) echo.HandlerFunc {
 //   - 2 username taken: username already registered
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
+//   - 1008 rate limited: too many registration attempts
 //   - 1009 internal: unexpected server error
 func RegisterHandler(svc *RegisterService) echo.HandlerFunc {
 	const (
@@ -148,6 +149,7 @@ func RegisterHandler(svc *RegisterService) echo.HandlerFunc {
 //   - 2 admin already exists: an admin was created out of band
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
+//   - 1008 rate limited: too many activation attempts
 //   - 1009 internal: unexpected server error
 func ActivateHandler(mgr *ActivationManager) echo.HandlerFunc {
 	const (
@@ -624,6 +626,9 @@ func MePasswordHandler(svc *AuthService) echo.HandlerFunc {
 		if err := svc.ChangeOwnPassword(c.Request().Context(), p.UserID, req.OldPassword, req.NewPassword); err != nil {
 			if errors.Is(err, ErrWrongPassword) {
 				return api.NewError(codeWrongPassword, http.StatusBadRequest, "wrong current password")
+			}
+			if errors.Is(err, store.ErrNotFound) {
+				return api.NewError(1002, http.StatusUnauthorized, "unauthorized")
 			}
 			return err
 		}

@@ -17,7 +17,7 @@ func newAuthEcho(e *env) *echo.Echo {
 	app := echo.New()
 	app.Validator = validation.New()
 	app.HTTPErrorHandler = newErrorHandler()
-	app.POST("/api/v0/auth/login", auth.LoginHandler(e.svc), auth.LoginRateLimit(1))
+	app.POST("/api/v0/auth/login", auth.LoginHandler(e.svc), auth.IPRateLimit(1))
 	app.POST("/api/v0/auth/refresh", auth.RefreshHandler(e.svc))
 	app.POST("/api/v0/auth/logout", auth.LogoutHandler(e.svc))
 	return app

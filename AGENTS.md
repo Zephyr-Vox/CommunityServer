@@ -74,6 +74,7 @@ ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 - Standard library `testing` only; no framework.
 - Mirror package paths: `test/auth/register_test.go` tests `internal/auth`.
 - Concurrency correctness is load-bearing (snowflake, cache singleflight, invite redemption), so race-sensitive tests are mandatory, not optional.
+- SQL triggers are permitted only as test fixtures for deterministic database-race tests; production code, business logic, and production schemas must not use SQL triggers.
 - Full suite must be green before presenting a commit for review.
 
 ## Commit & Pull Request Guidelines

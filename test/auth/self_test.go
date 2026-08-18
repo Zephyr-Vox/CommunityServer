@@ -2,6 +2,7 @@ package auth_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -86,5 +87,39 @@ func TestMePasswordHandlerSuccessRevokesTokens(t *testing.T) {
 	}
 	if _, err := e.svc.Login(context.Background(), "alice", "newsecret123", "dev-1"); err != nil {
 		t.Fatalf("login with new password failed: %v", err)
+	}
+}
+
+func TestMePasswordHandlerDeletedUser(t *testing.T) {
+	e := newEnv(t)
+	svc, _ := newUserService(t, e)
+	app := newMeSelfEcho(t, e, svc)
+	u := e.createUser(t, "alice", "secret123", "member")
+	token := loginToken(t, e, "alice", "secret123")
+	if _, err := e.principals.Get(context.Background(), u.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.conn.Exec(`CREATE TRIGGER delete_user_before_password_update
+		BEFORE UPDATE OF password_hash ON users
+		BEGIN
+			DELETE FROM users WHERE id = OLD.id;
+		END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := requestMethodWithToken(t, app, http.MethodPost, "/api/v0/me/password", token,
+		`{"old_password":"secret123","new_password":"newsecret123"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != 1002 {
+		t.Fatalf("code = %d, want 1002", resp.Code)
 	}
 }

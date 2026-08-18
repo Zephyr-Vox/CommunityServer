@@ -158,6 +158,13 @@ func TestSetPasswordHashBumpsAuthVersion(t *testing.T) {
 	}
 }
 
+func TestSetPasswordHashNotFound(t *testing.T) {
+	s, _ := newTestEnv(t)
+	if err := s.Users.SetPasswordHash(context.Background(), 999999, "newhash"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("err = %v, want store.ErrNotFound", err)
+	}
+}
+
 func TestBanUnban(t *testing.T) {
 	s, _ := newTestEnv(t)
 	ctx := context.Background()

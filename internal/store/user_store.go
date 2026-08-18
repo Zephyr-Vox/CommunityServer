@@ -89,11 +89,18 @@ func (s *UserStore) SetAvatar(ctx context.Context, id int64, avatar *string) (*d
 // invalidates previously issued access tokens. Full revocation (also deleting
 // sessions and invalidating the principal cache) is the auth service's job.
 func (s *UserStore) SetPasswordHash(ctx context.Context, id int64, passwordHash string) error {
-	return mapError(s.q.SetUserPasswordHash(ctx, db.SetUserPasswordHashParams{
+	rows, err := s.q.SetUserPasswordHash(ctx, db.SetUserPasswordHashParams{
 		PasswordHash: passwordHash,
 		UpdatedAt:    s.now(),
 		ID:           id,
-	}))
+	})
+	if err != nil {
+		return mapError(err)
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // TouchLastLogin records the current time as last_login_at.

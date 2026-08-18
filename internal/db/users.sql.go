@@ -288,7 +288,7 @@ func (q *Queries) SetUserBanned(ctx context.Context, arg SetUserBannedParams) er
 	return err
 }
 
-const setUserPasswordHash = `-- name: SetUserPasswordHash :exec
+const setUserPasswordHash = `-- name: SetUserPasswordHash :execrows
 UPDATE users
 SET password_hash = ?, auth_version = auth_version + 1, updated_at = ?
 WHERE id = ?
@@ -300,9 +300,12 @@ type SetUserPasswordHashParams struct {
 	ID           int64  `json:"id"`
 }
 
-func (q *Queries) SetUserPasswordHash(ctx context.Context, arg SetUserPasswordHashParams) error {
-	_, err := q.db.ExecContext(ctx, setUserPasswordHash, arg.PasswordHash, arg.UpdatedAt, arg.ID)
-	return err
+func (q *Queries) SetUserPasswordHash(ctx context.Context, arg SetUserPasswordHashParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setUserPasswordHash, arg.PasswordHash, arg.UpdatedAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const touchUserLastLogin = `-- name: TouchUserLastLogin :exec

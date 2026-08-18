@@ -21,7 +21,7 @@ SET avatar = ?, updated_at = ?
 WHERE id = ?
 RETURNING *;
 
--- name: SetUserPasswordHash :exec
+-- name: SetUserPasswordHash :execrows
 UPDATE users
 SET password_hash = ?, auth_version = auth_version + 1, updated_at = ?
 WHERE id = ?;

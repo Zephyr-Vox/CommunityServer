@@ -47,8 +47,8 @@ func (a *App) routes(e *echo.Echo) error {
 
 	authGroup := api.Group("/auth")
 	authGroup.GET("/status", auth.StatusHandler(a.stores, auth.RegistrationMode(a.cfg.RegistrationMode)))
-	authGroup.POST("/register", auth.RegisterHandler(a.register))
-	authGroup.POST("/login", auth.LoginHandler(a.authSvc), auth.LoginRateLimit(a.cfg.LoginRateLimit))
+	authGroup.POST("/register", auth.RegisterHandler(a.register), auth.IPRateLimit(a.cfg.LoginRateLimit))
+	authGroup.POST("/login", auth.LoginHandler(a.authSvc), auth.IPRateLimit(a.cfg.LoginRateLimit))
 	authGroup.POST("/refresh", auth.RefreshHandler(a.authSvc))
 	authGroup.POST("/logout", auth.LogoutHandler(a.authSvc))
 	authGroup.GET("/me", auth.MeHandler(a.stores.Users, authz), authed()...)
@@ -75,7 +75,7 @@ func (a *App) routes(e *echo.Echo) error {
 	users.DELETE("/:id", auth.DeleteUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserDelete))...)
 
 	admin := api.Group("/admin")
-	admin.POST("/activate", auth.ActivateHandler(a.activate), auth.LoginRateLimit(a.cfg.LoginRateLimit))
+	admin.POST("/activate", auth.ActivateHandler(a.activate), auth.IPRateLimit(a.cfg.LoginRateLimit))
 	admin.GET("/invites", auth.InviteListHandler(a.invites), authed(rbacecho.Require(authz, rbac.PermInviteManage))...)
 	admin.POST("/invites", auth.InviteCreateHandler(a.invites), authed(rbacecho.Require(authz, rbac.PermInviteManage))...)
 	admin.DELETE("/invites/:id", auth.InviteDeleteHandler(a.invites), authed(rbacecho.Require(authz, rbac.PermInviteManage))...)

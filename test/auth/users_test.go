@@ -328,6 +328,29 @@ func TestGetUserHandlerNotFound(t *testing.T) {
 	}
 }
 
+func TestResetUserPasswordHandlerNotFound(t *testing.T) {
+	e := newEnv(t)
+	svc, _ := newUserService(t, e)
+	app := newUserAdminEcho(t, e, svc, newRoles(t))
+	e.createUser(t, "boss", "secret123", "admin")
+	token := loginToken(t, e, "boss", "secret123")
+
+	rec := requestMethodWithToken(t, app, http.MethodPost, "/api/v0/users/999999/password", token,
+		`{"password":"newsecret123"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != 2 {
+		t.Fatalf("code = %d, want 2", resp.Code)
+	}
+}
+
 func TestUpdateUserHandler(t *testing.T) {
 	e := newEnv(t)
 	svc, _ := newUserService(t, e)
