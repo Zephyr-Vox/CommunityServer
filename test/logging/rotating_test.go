@@ -57,6 +57,48 @@ func listArchives(t *testing.T, dir string) []string {
 	return names
 }
 
+func waitArchives(t *testing.T, dir string, want int) []string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		archives := listArchives(t, dir)
+		if len(archives) == want {
+			complete := true
+			for _, name := range archives {
+				zr, err := zip.OpenReader(filepath.Join(dir, name))
+				if err != nil {
+					complete = false
+					break
+				}
+				_ = zr.Close()
+			}
+			if complete {
+				return archives
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("archives = %v, want %d entries", archives, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func listPending(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".zephyr-pending-") && strings.HasSuffix(entry.Name(), ".log") {
+			names = append(names, entry.Name())
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
 func zipContent(t *testing.T, path string) string {
 	t.Helper()
 	zr, err := zip.OpenReader(path)
@@ -109,7 +151,7 @@ func TestRotatingWriterStartupArchivesExistingFile(t *testing.T) {
 	w := newWriter(t, dir, -1, func() time.Time { return now })
 	writeLine(t, w, "new line\n")
 
-	archives := listArchives(t, dir)
+	archives := waitArchives(t, dir, 1)
 	if len(archives) != 1 || archives[0] != "zephyr-2026-08-12-01.zip" {
 		t.Fatalf("archives = %v, want [zephyr-2026-08-12-01.zip]", archives)
 	}
@@ -118,6 +160,96 @@ func TestRotatingWriterStartupArchivesExistingFile(t *testing.T) {
 	}
 	if got := readLive(t, dir); got != "new line\n" {
 		t.Fatalf("live content = %q, want new line", got)
+	}
+}
+
+func TestRotatingWriterStartupRecoversPendingLog(t *testing.T) {
+	dir := t.TempDir()
+	pending := filepath.Join(dir, ".zephyr-pending-0175560000000-000000.log")
+	date := time.Date(2026, 8, 12, 23, 0, 0, 0, time.Local)
+	if err := os.WriteFile(pending, []byte("pending line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(pending, date, date); err != nil {
+		t.Fatal(err)
+	}
+	newWriter(t, dir, -1, func() time.Time { return date.Add(time.Hour) })
+	archives := listArchives(t, dir)
+	if len(archives) != 1 || zipContent(t, filepath.Join(dir, archives[0])) != "pending line\n" {
+		t.Fatalf("pending recovery archives = %v", archives)
+	}
+	if pending := listPending(t, dir); len(pending) != 0 {
+		t.Fatalf("pending files after recovery = %v", pending)
+	}
+}
+
+func TestRotatingWriterRecoveryReplacesIncompleteMarkedArchive(t *testing.T) {
+	dir := t.TempDir()
+	pending := filepath.Join(dir, ".zephyr-pending-0175560000000-000000.log")
+	date := time.Date(2026, 8, 12, 23, 0, 0, 0, time.Local)
+	if err := os.WriteFile(pending, []byte("recover me\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(pending, date, date); err != nil {
+		t.Fatal(err)
+	}
+	target := "zephyr-2026-08-12-01.zip"
+	if err := os.WriteFile(filepath.Join(dir, target), []byte("partial zip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pending+".archive", []byte(target), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newWriter(t, dir, -1, func() time.Time { return date.Add(time.Hour) })
+	if got := zipContent(t, filepath.Join(dir, target)); got != "recover me\n" {
+		t.Fatalf("recovered archive = %q, want pending content", got)
+	}
+	if pending := listPending(t, dir); len(pending) != 0 {
+		t.Fatalf("pending files after recovery = %v", pending)
+	}
+}
+
+func TestRotatingWriterWriteDoesNotWaitForArchiveAndCloseWaitsWorker(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Date(2026, 8, 1, 10, 0, 0, 0, time.Local)
+	current := start
+	started := make(chan struct{})
+	release := make(chan struct{})
+	w, err := logging.NewRotatingWriter(dir, logging.RotatingWriterConfig{
+		Keep: -1,
+		Now:  func() time.Time { return current },
+		ArchivePending: func(string, string) error {
+			close(started)
+			<-release
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLine(t, w, "before\n")
+	current = current.AddDate(0, 0, 7)
+	writeDone := make(chan error, 1)
+	go func() { _, err := w.Write([]byte("after\n")); writeDone <- err }()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("rotation Write = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write waited for archive worker")
+	}
+	<-started
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- w.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before worker archive completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close = %v", err)
 	}
 }
 
@@ -133,7 +265,7 @@ func TestRotatingWriterRotatesAfterSevenDays(t *testing.T) {
 	current = start.AddDate(0, 0, 7)
 	writeLine(t, w, "c\n") // 2026-08-08: rotation due
 
-	archives := listArchives(t, dir)
+	archives := waitArchives(t, dir, 1)
 	if len(archives) != 1 || archives[0] != "zephyr-2026-08-07-01.zip" {
 		t.Fatalf("archives = %v, want [zephyr-2026-08-07-01.zip] (base = last record date)", archives)
 	}
@@ -156,7 +288,7 @@ func TestRotatingWriterSameDayCounterIncrements(t *testing.T) {
 	current = start.AddDate(0, 0, 7)
 	writeLine(t, w, "b\n")
 
-	archives := listArchives(t, dir)
+	archives := waitArchives(t, dir, 2)
 	want := []string{"zephyr-2026-08-01-01.zip", "zephyr-2026-08-01-02.zip"}
 	if !slices.Equal(archives, want) {
 		t.Fatalf("archives = %v, want %v", archives, want)
@@ -187,6 +319,7 @@ func TestRotatingWriterKeepZeroNoArchives(t *testing.T) {
 	writeLine(t, w, "new\n")
 	current = start.AddDate(0, 0, 7)
 	writeLine(t, w, "after rotation\n")
+	time.Sleep(10 * time.Millisecond)
 
 	if archives := listArchives(t, dir); len(archives) != 0 {
 		t.Fatalf("archives after rotation = %v, want none (keep=0)", archives)
@@ -247,33 +380,39 @@ func TestRotatingWriterCreatesDir(t *testing.T) {
 func TestRotatingWriterArchiveFailureKeepsLiveLog(t *testing.T) {
 	dir := t.TempDir()
 	start := time.Date(2026, 8, 1, 10, 0, 0, 0, time.Local)
-	writeOldLive(t, dir, "old\n", start.Add(-time.Hour))
 	current := start
-	w := newWriter(t, dir, -1, func() time.Time { return current })
-	writeLine(t, w, "new1\n")
-
-	// Remove directory write permission so creating the archive zip fails.
-	if err := os.Chmod(dir, 0o555); err != nil {
+	w, err := logging.NewRotatingWriter(dir, logging.RotatingWriterConfig{
+		Keep: -1,
+		Now:  func() time.Time { return current },
+		ArchivePending: func(string, string) error {
+			return errors.New("archive blocked")
+		},
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	t.Cleanup(func() { _ = w.Close() })
+	writeLine(t, w, "new1\n")
 
-	var reported error
-	w.OnError = func(err error) { reported = err }
+	reported := make(chan error, 1)
+	w.OnError = func(err error) { reported <- err }
 	current = start.AddDate(0, 0, 7)
 	writeLine(t, w, "new2\n")
 
-	if reported == nil {
+	select {
+	case <-reported:
+	case <-time.After(time.Second):
 		t.Fatal("rotation failure was not reported through OnError")
 	}
-	if got := readLive(t, dir); got != "new1\nnew2\n" {
-		t.Fatalf("live = %q, want both lines preserved after failed archive", got)
+	if got := readLive(t, dir); got != "new2\n" {
+		t.Fatalf("live = %q, want fresh live line after failed archive", got)
 	}
-	// Only the startup archive exists; the failed rotation must not have
-	// left a partial zip behind.
+	if pending := listPending(t, dir); len(pending) != 1 {
+		t.Fatalf("pending = %v, want failed archive retained", pending)
+	}
 	archives := listArchives(t, dir)
-	if len(archives) != 1 || archives[0] != "zephyr-2026-08-01-01.zip" {
-		t.Fatalf("archives = %v, want only the startup archive", archives)
+	if len(archives) != 0 {
+		t.Fatalf("archives = %v, want no partial archive", archives)
 	}
 }
 
