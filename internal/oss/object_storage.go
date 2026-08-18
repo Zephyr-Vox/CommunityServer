@@ -2,6 +2,7 @@ package oss
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -72,7 +73,7 @@ func (s *LocalObjectStorage) Put(ctx context.Context, bucket, name string, src i
 	if err := validateComponent(bucket); err != nil {
 		return Object{}, err
 	}
-	if err := validateComponent(name); err != nil {
+	if err := validateObjectName(name); err != nil {
 		return Object{}, err
 	}
 	unlock := s.locks.Lock(objectKey(bucket, name))
@@ -97,7 +98,14 @@ func (s *LocalObjectStorage) Put(ctx context.Context, bucket, name string, src i
 		}
 	}
 
-	tmp, err := os.CreateTemp(dir, name+".tmp-*")
+	tmpDir, backup, err := internalPaths(dir, name)
+	if err != nil {
+		return Object{}, err
+	}
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		return Object{}, fmt.Errorf("oss: create internal temp directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(tmpDir, internalName(name)+".tmp-")
 	if err != nil {
 		return Object{}, fmt.Errorf("oss: create temp file: %w", err)
 	}
@@ -122,7 +130,6 @@ func (s *LocalObjectStorage) Put(ctx context.Context, bucket, name string, src i
 	}
 
 	path := filepath.Join(dir, name)
-	backup := path + ".bak"
 	hadOldFile := false
 	if _, err := os.Lstat(path); err == nil {
 		if err := os.Rename(path, backup); err != nil {
@@ -179,7 +186,7 @@ func (s *LocalObjectStorage) Open(ctx context.Context, bucket, name string) (Obj
 	if err := validateComponent(bucket); err != nil {
 		return Object{}, nil, err
 	}
-	if err := validateComponent(name); err != nil {
+	if err := validateObjectName(name); err != nil {
 		return Object{}, nil, err
 	}
 	unlock := s.locks.Lock(objectKey(bucket, name))
@@ -208,7 +215,7 @@ func (s *LocalObjectStorage) Stat(ctx context.Context, bucket, name string) (Obj
 	if err := validateComponent(bucket); err != nil {
 		return Object{}, err
 	}
-	if err := validateComponent(name); err != nil {
+	if err := validateObjectName(name); err != nil {
 		return Object{}, err
 	}
 	unlock := s.locks.Lock(objectKey(bucket, name))
@@ -227,7 +234,7 @@ func (s *LocalObjectStorage) Delete(ctx context.Context, bucket, name string) er
 	if err := validateComponent(bucket); err != nil {
 		return err
 	}
-	if err := validateComponent(name); err != nil {
+	if err := validateObjectName(name); err != nil {
 		return err
 	}
 	unlock := s.locks.Lock(objectKey(bucket, name))
@@ -244,6 +251,23 @@ func (s *LocalObjectStorage) Delete(ctx context.Context, bucket, name string) er
 		return fmt.Errorf("oss: delete file: %w", err)
 	}
 	return nil
+}
+
+// internalPaths returns private temp and backup locations for one object name.
+func internalPaths(bucketDir, name string) (tmpDir, backup string, err error) {
+	internal := filepath.Join(bucketDir, internalDirName)
+	tmpDir = filepath.Join(internal, "tmp")
+	backupDir := filepath.Join(internal, "backup")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		return "", "", fmt.Errorf("oss: create internal backup directory: %w", err)
+	}
+	return tmpDir, filepath.Join(backupDir, internalName(name)), nil
+}
+
+// internalName hashes a public object name so internal paths never embed it.
+func internalName(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return fmt.Sprintf("%x", sum[:])
 }
 
 // filePath resolves bucket/name under root and, as a final defense, verifies

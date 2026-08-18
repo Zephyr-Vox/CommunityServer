@@ -27,7 +27,7 @@ func (s *LocalObjectStorage) GetHandler(bucket string) (echo.HandlerFunc, error)
 	}
 	return func(c *echo.Context) error {
 		name := c.Param("file")
-		if err := validateComponent(name); err != nil {
+		if err := validateObjectName(name); err != nil {
 			return api.NewError(api.CodeNotFound, http.StatusNotFound, "not found")
 		}
 

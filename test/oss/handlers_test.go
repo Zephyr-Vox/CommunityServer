@@ -77,6 +77,18 @@ func TestGetHandlerServesObject(t *testing.T) {
 	}
 }
 
+func TestGetHandlerHidesReservedInternalName(t *testing.T) {
+	e := newEnv(t)
+	app := newHandlerApp(t, e)
+	rec := get(t, app, "/avatar/.zephyr-internal", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := envelopeCode(t, rec); code != api.CodeNotFound {
+		t.Fatalf("code = %d, want %d", code, api.CodeNotFound)
+	}
+}
+
 func TestGetHandlerMissingObjectIsNotFound(t *testing.T) {
 	e := newEnv(t)
 	app := newHandlerApp(t, e)

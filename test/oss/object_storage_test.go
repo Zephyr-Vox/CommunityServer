@@ -2,6 +2,7 @@ package oss_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -101,6 +102,34 @@ func TestRejectsUnsafeComponents(t *testing.T) {
 		if err := e.objects.Delete(ctx, tc[0], tc[1]); !errors.Is(err, oss.ErrInvalidKey) {
 			t.Fatalf("Delete(%q, %q) = %v, want ErrInvalidKey", tc[0], tc[1], err)
 		}
+	}
+	if _, err := e.objects.Put(ctx, "avatars", ".zephyr-internal", strings.NewReader("x"), oss.PutOptions{}); !errors.Is(err, oss.ErrInvalidKey) {
+		t.Fatalf("Put reserved name = %v, want ErrInvalidKey", err)
+	}
+}
+
+func TestPutKeepsPublicBackupSuffixObjectsIndependent(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	for name, content := range map[string]string{"foo": "one", "foo.bak": "two"} {
+		if _, err := e.objects.Put(ctx, "avatars", name, strings.NewReader(content), oss.PutOptions{ContentType: "text/plain"}); err != nil {
+			t.Fatalf("Put(%q) = %v", name, err)
+		}
+	}
+	if _, err := e.objects.Put(ctx, "avatars", "foo", strings.NewReader("three"), oss.PutOptions{ContentType: "text/plain"}); err != nil {
+		t.Fatal(err)
+	}
+	_, rc, err := e.objects.Open(ctx, "avatars", "foo.bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "two" {
+		t.Fatalf("foo.bak content = %q, want two", data)
 	}
 }
 
@@ -348,7 +377,8 @@ func TestPutKeepsStaleBackupUntilCommit(t *testing.T) {
 
 	// Simulate a crash between stashing the old file and renaming the new one.
 	path := filepath.Join(e.root, "avatars", "1.png")
-	backup := path + ".bak"
+	sum := sha256.Sum256([]byte("1.png"))
+	backup := filepath.Join(e.root, "avatars", ".zephyr-internal", "backup", fmt.Sprintf("%x", sum[:]))
 	if err := os.Rename(path, backup); err != nil {
 		t.Fatal(err)
 	}

@@ -7,12 +7,26 @@ import (
 	"strings"
 )
 
+const internalDirName = ".zephyr-internal"
+
 // validateComponent checks that a bucket or name is a single path segment
 // the filesystem accepts: non-empty, no slash, not "." or "..", no NUL.
 // Spaces, Unicode, dots and dashes are allowed; naming policy belongs to
 // the caller.
 func validateComponent(s string) error {
 	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, "/\x00") {
+		return ErrInvalidKey
+	}
+	return nil
+}
+
+// validateObjectName applies component validation and reserves the internal
+// storage directory from every public object operation.
+func validateObjectName(name string) error {
+	if err := validateComponent(name); err != nil {
+		return err
+	}
+	if name == internalDirName {
 		return ErrInvalidKey
 	}
 	return nil
