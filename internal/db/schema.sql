@@ -205,3 +205,26 @@ CREATE TABLE IF NOT EXISTS objects (
     created_at    INTEGER NOT NULL CHECK (created_at >= 0),
     PRIMARY KEY (bucket, name)
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS command_idempotency (
+    principal_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key  TEXT    NOT NULL CHECK (length(idempotency_key) BETWEEN 16 AND 64),
+    endpoint         TEXT    NOT NULL CHECK (length(endpoint) BETWEEN 1 AND 256),
+    request_hmac     TEXT    NOT NULL CHECK (length(request_hmac) = 64),
+    command_id       INTEGER NOT NULL UNIQUE CHECK (command_id > 0),
+    status           INTEGER NOT NULL CHECK (status BETWEEN 100 AND 599),
+    result_body      TEXT    NOT NULL CHECK (json_valid(result_body)),
+    etag             TEXT,
+    location         TEXT,
+    cache_control    TEXT,
+    pragma           TEXT,
+    stream_epoch     TEXT    NOT NULL CHECK (length(stream_epoch) = 32),
+    geid             INTEGER NOT NULL CHECK (geid >= 0),
+    state_cursor     TEXT    NOT NULL CHECK (length(state_cursor) > 0),
+    created_at       INTEGER NOT NULL CHECK (created_at >= 0),
+    expires_at       INTEGER NOT NULL CHECK (expires_at > created_at),
+    PRIMARY KEY (principal_id, idempotency_key)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_command_idempotency_expires
+    ON command_idempotency(expires_at, created_at);

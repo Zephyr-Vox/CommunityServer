@@ -30,6 +30,8 @@ type Stores struct {
 	Sessions *SessionStore
 	// Invites manages registration invite codes.
 	Invites *InviteStore
+	// Idempotency manages durable completed HTTP command results.
+	Idempotency *IdempotencyStore
 }
 
 // New builds the stores over a connection. The idGen supplies snowflake IDs
@@ -48,6 +50,7 @@ func New(conn *sql.DB, idGen *snowflake.IDGenerator, now func() int64) *Stores {
 		Mutes:        &MuteStore{q: q, idGen: idGen, now: now},
 		Sessions:     &SessionStore{q: q, idGen: idGen, now: now},
 		Invites:      &InviteStore{q: q, idGen: idGen, now: now},
+		Idempotency:  &IdempotencyStore{q: q, now: now},
 	}
 }
 
@@ -79,5 +82,6 @@ func (s *Stores) WithTx(tx *sql.Tx) *Stores {
 		Mutes:        &MuteStore{q: q, idGen: s.Mutes.idGen, now: s.Mutes.now},
 		Sessions:     &SessionStore{q: q, idGen: s.Sessions.idGen, now: s.Sessions.now},
 		Invites:      &InviteStore{q: q, idGen: s.Invites.idGen, now: s.Invites.now},
+		Idempotency:  &IdempotencyStore{q: q, now: s.Idempotency.now, transactional: true},
 	}
 }

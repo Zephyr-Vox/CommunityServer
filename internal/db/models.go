@@ -43,6 +43,25 @@ type ChannelGroup struct {
 	Version    int64  `json:"version"`
 }
 
+type CommandIdempotency struct {
+	PrincipalID    int64          `json:"principal_id"`
+	IdempotencyKey string         `json:"idempotency_key"`
+	Endpoint       string         `json:"endpoint"`
+	RequestHmac    string         `json:"request_hmac"`
+	CommandID      int64          `json:"command_id"`
+	Status         int64          `json:"status"`
+	ResultBody     string         `json:"result_body"`
+	Etag           sql.NullString `json:"etag"`
+	Location       sql.NullString `json:"location"`
+	CacheControl   sql.NullString `json:"cache_control"`
+	Pragma         sql.NullString `json:"pragma"`
+	StreamEpoch    string         `json:"stream_epoch"`
+	Geid           int64          `json:"geid"`
+	StateCursor    string         `json:"state_cursor"`
+	CreatedAt      int64          `json:"created_at"`
+	ExpiresAt      int64          `json:"expires_at"`
+}
+
 type GroupAccess struct {
 	ID            int64          `json:"id"`
 	GroupID       int64          `json:"group_id"`

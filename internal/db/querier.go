@@ -12,6 +12,7 @@ import (
 type Querier interface {
 	BumpUserAuthVersion(ctx context.Context, arg BumpUserAuthVersionParams) error
 	ConsumeInvite(ctx context.Context, arg ConsumeInviteParams) (Invite, error)
+	CountCommandIdempotency(ctx context.Context) (int64, error)
 	CountOwners(ctx context.Context) (int64, error)
 	CountRoleReferences(ctx context.Context, roleKey string) (int64, error)
 	CreateChannel(ctx context.Context, arg CreateChannelParams) (Channel, error)
@@ -21,12 +22,14 @@ type Querier interface {
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	DeleteChannel(ctx context.Context, id int64) (int64, error)
 	DeleteChannelPermissionConfig(ctx context.Context, channelID sql.NullInt64) (sql.NullInt64, error)
+	DeleteExpiredCommandIdempotency(ctx context.Context, expiresAt int64) (int64, error)
 	DeleteExpiredSessions(ctx context.Context, expiresAt int64) (int64, error)
 	DeleteGroupPermissionConfig(ctx context.Context, groupID sql.NullInt64) (sql.NullInt64, error)
 	DeleteInvite(ctx context.Context, id int64) (int64, error)
 	DeleteMute(ctx context.Context, id int64) (int64, error)
 	DeleteMutesForUser(ctx context.Context, userID int64) error
 	DeleteObject(ctx context.Context, arg DeleteObjectParams) error
+	DeleteOldestCommandIdempotency(ctx context.Context, limit int64) (int64, error)
 	DeleteRole(ctx context.Context, key string) (string, error)
 	DeleteRoleBinding(ctx context.Context, id int64) (int64, error)
 	DeleteServerRoleBindingsForUser(ctx context.Context, userID int64) error
@@ -38,6 +41,7 @@ type Querier interface {
 	GetChannel(ctx context.Context, id int64) (Channel, error)
 	GetChannelGroup(ctx context.Context, id int64) (ChannelGroup, error)
 	GetChannelPermissionConfig(ctx context.Context, channelID sql.NullInt64) (ScopePermissionConfig, error)
+	GetCommandIdempotency(ctx context.Context, arg GetCommandIdempotencyParams) (CommandIdempotency, error)
 	GetGroupPermissionConfig(ctx context.Context, groupID sql.NullInt64) (ScopePermissionConfig, error)
 	GetInstallationState(ctx context.Context) (InstallationState, error)
 	GetInviteByCodeHash(ctx context.Context, arg GetInviteByCodeHashParams) (Invite, error)
@@ -53,6 +57,7 @@ type Querier interface {
 	GetUserByID(ctx context.Context, id int64) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	InsertChannelAccess(ctx context.Context, arg InsertChannelAccessParams) (ChannelAccess, error)
+	InsertCommandIdempotency(ctx context.Context, arg InsertCommandIdempotencyParams) error
 	InsertGroupAccess(ctx context.Context, arg InsertGroupAccessParams) (GroupAccess, error)
 	InsertMute(ctx context.Context, arg InsertMuteParams) (ModerationMute, error)
 	InsertRoleBinding(ctx context.Context, arg InsertRoleBindingParams) (UserRoleBinding, error)
