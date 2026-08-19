@@ -61,11 +61,7 @@ func startRun(t *testing.T, cfg *config.App) (string, func(), <-chan error) {
 
 func startRunWithOptions(t *testing.T, cfg *config.App, opts server.RunOptions) (string, func(), <-chan error) {
 	t.Helper()
-	roles, err := config.LoadRoles(filepath.Join(filepath.Dir(cfg.Server.DBPath), "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	app, err := server.New(cfg, roles, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app, err := server.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,11 +113,7 @@ func TestDefaultHTTPTimeouts(t *testing.T) {
 func TestRunRejectsInvalidHTTPTimeoutsBeforeListen(t *testing.T) {
 	dir := t.TempDir()
 	port := freePort(t)
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	app, err := server.New(testConfig(dir, port), roles, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app, err := server.New(testConfig(dir, port), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,11 +204,7 @@ func TestRunForceClosesConnectionAfterShutdownDeadline(t *testing.T) {
 func TestRunServesAndShutsDownGracefully(t *testing.T) {
 	dir := t.TempDir()
 	port := freePort(t)
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	app, err := server.New(testConfig(dir, port), roles, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app, err := server.New(testConfig(dir, port), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,13 +278,9 @@ func TestRunRequiredRoutesTLSHandshakeErrorsThroughSlog(t *testing.T) {
 	cfg.Server.TLSMode = config.TLSModeRequired
 	cfg.Server.TLSCertPath = filepath.Join(dir, "tls")
 
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	var buf lockedBuffer
 	logger := slog.New(logging.NewTextHandler(&buf, slog.LevelDebug))
-	app, err := server.New(cfg, roles, logger)
+	app, err := server.New(cfg, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,13 +392,9 @@ func TestRunRequiredWildcardHostSkipsJoinURL(t *testing.T) {
 	cfg.Server.TLSMode = config.TLSModeRequired
 	cfg.Server.TLSCertPath = filepath.Join(dir, "tls")
 
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	var buf bytes.Buffer
 	logger := slog.New(logging.NewTextHandler(&buf, slog.LevelDebug))
-	app, err := server.New(cfg, roles, logger)
+	app, err := server.New(cfg, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -463,13 +443,9 @@ func TestRunFileModeLogsOnlyFingerprintAndJoinURL(t *testing.T) {
 	// the spec: no "using file certificate" line, only fingerprint + join url.
 	cfg.Server.TLSCert = filepath.Join(cfg.Server.TLSCertPath, "server.crt")
 	cfg.Server.TLSKey = filepath.Join(cfg.Server.TLSCertPath, "server.key")
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	var buf bytes.Buffer
 	logger := slog.New(logging.NewTextHandler(&buf, slog.LevelDebug))
-	app, err := server.New(cfg, roles, logger)
+	app, err := server.New(cfg, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -558,13 +534,9 @@ func TestRunForceRegenerateLogsWarning(t *testing.T) {
 	}
 
 	// Second run forces regeneration and must WARN with the backup path.
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	var buf bytes.Buffer
 	logger := slog.New(logging.NewTextHandler(&buf, slog.LevelDebug))
-	app, err := server.New(cfg, roles, logger)
+	app, err := server.New(cfg, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -601,13 +573,9 @@ func TestRunBindFailureDoesNotClaimReady(t *testing.T) {
 	port := occupied.Addr().(*net.TCPAddr).Port
 
 	dir := t.TempDir()
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	var buf bytes.Buffer
 	logger := slog.New(logging.NewTextHandler(&buf, slog.LevelDebug))
-	app, err := server.New(testConfig(dir, port), roles, logger)
+	app, err := server.New(testConfig(dir, port), logger)
 	if err != nil {
 		t.Fatal(err)
 	}

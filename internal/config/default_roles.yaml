@@ -1,8 +1,0 @@
-# Default roles configuration, generated on first startup.
-# Edit this file to change which permissions each role grants.
-default_role: member
-roles:
-  - name: admin
-    permissions: ["*"]
-  - name: member
-    permissions: ["voice:join"]

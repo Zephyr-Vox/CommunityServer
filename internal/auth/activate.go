@@ -16,14 +16,12 @@ var (
 	// ErrInvalidActivationCode is returned when the activation code is
 	// missing, wrong, already used, or no code is pending.
 	ErrInvalidActivationCode = errors.New("auth: invalid activation code")
-	// ErrAdminAlreadyExists is returned when an admin exists despite a
+	// ErrOwnerAlreadyExists is returned when an owner exists despite a
 	// pending code; the code is revoked.
-	ErrAdminAlreadyExists = errors.New("auth: admin already exists")
+	ErrOwnerAlreadyExists = errors.New("auth: owner already exists")
 )
 
-const adminRole = "admin"
-
-// ActivationManager hands out the first-administrator activation code. The
+// ActivationManager hands out the first-owner activation code. The
 // plaintext code is returned exactly once (to the startup log); only its
 // SHA-256 digest is kept in memory. A pending code never expires until the
 // process restarts, at which point a fresh code replaces it.
@@ -38,9 +36,9 @@ func NewActivationManager(stores *store.Stores) *ActivationManager {
 	return &ActivationManager{stores: stores}
 }
 
-// EnsureCode is called at startup. It returns ok=false when an admin already
-// exists. Otherwise it generates a fresh 16-character base32 code, keeps only
-// its digest, and returns the plaintext for logging. Repeated calls while a
+// EnsureCode is called at startup. It returns ok=false when the installation is
+// initialized. Otherwise it generates a fresh 16-character base32 code, keeps
+// only its digest, and returns the plaintext for logging. Repeated calls while a
 // code is pending return ok=true without changing the code (the plaintext is
 // only available from the first call).
 func (m *ActivationManager) EnsureCode(ctx context.Context) (code string, ok bool, err error) {
@@ -50,12 +48,19 @@ func (m *ActivationManager) EnsureCode(ctx context.Context) (code string, ok boo
 	if m.codeHash != "" {
 		return "", true, nil
 	}
-	hasAdmin, err := m.stores.Users.HasAdmin(ctx)
+	state, err := m.stores.Installation.Get(ctx)
 	if err != nil {
 		return "", false, err
 	}
-	if hasAdmin {
+	if state.Initialized == 1 {
 		return "", false, nil
+	}
+	owners, err := m.stores.Installation.CountOwners(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	if owners != 0 {
+		return "", false, ErrOwnerAlreadyExists
 	}
 	code, err = generateActivationCode()
 	if err != nil {
@@ -65,7 +70,7 @@ func (m *ActivationManager) EnsureCode(ctx context.Context) (code string, ok boo
 	return code, true, nil
 }
 
-// Activate validates the code and creates the first admin account in a single
+// Activate validates the code and creates the first owner account in a single
 // transaction. Only one concurrent caller can win: the mutex serializes the
 // check-and-create, and the code is cleared immediately after commit. A wrong
 // code leaves the pending code intact for retries.
@@ -85,16 +90,20 @@ func (m *ActivationManager) Activate(ctx context.Context, code, username, passwo
 		return nil, ErrInvalidActivationCode
 	}
 
-	// Defensive re-check: an admin can only exist if activation already
+	// Defensive re-check: an owner can only exist if activation already
 	// happened, but a race between EnsureCode and an out-of-band write should
 	// not create a second one. Revoke the pending code either way.
-	hasAdmin, err := m.stores.Users.HasAdmin(ctx)
+	state, err := m.stores.Installation.Get(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if hasAdmin {
+	owners, err := m.stores.Installation.CountOwners(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if state.Initialized == 1 || owners != 0 {
 		m.codeHash = ""
-		return nil, ErrAdminAlreadyExists
+		return nil, ErrOwnerAlreadyExists
 	}
 
 	// Same account-field rules as Register; see prepareAccount. Hashing stays
@@ -105,9 +114,9 @@ func (m *ActivationManager) Activate(ctx context.Context, code, username, passwo
 		return nil, err
 	}
 
-	// Create the user and grant the admin role in one transaction. The code is
-	// cleared only after commit, so a failed write keeps the admin able to
-	// retry with the same code.
+	// Create the user, grant the owner binding and flip installation state in
+	// one transaction. The code is cleared only after commit, so a failed write
+	// keeps the owner able to retry with the same code.
 	tx, err := m.stores.BeginTx(ctx)
 	if err != nil {
 		return nil, err
@@ -119,7 +128,7 @@ func (m *ActivationManager) Activate(ctx context.Context, code, username, passwo
 	if err != nil {
 		return nil, err
 	}
-	if err := txStores.Users.SetRoles(ctx, user.ID, []string{adminRole}); err != nil {
+	if err := txStores.ActivateFirstOwner(ctx, user.ID); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {

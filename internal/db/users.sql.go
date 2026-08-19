@@ -26,17 +26,6 @@ func (q *Queries) BumpUserAuthVersion(ctx context.Context, arg BumpUserAuthVersi
 	return err
 }
 
-const countUsersWithRole = `-- name: CountUsersWithRole :one
-SELECT COUNT(*) AS count FROM user_roles WHERE role = ?
-`
-
-func (q *Queries) CountUsersWithRole(ctx context.Context, role string) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countUsersWithRole, role)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (id, username, password_hash, nickname, avatar, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -90,53 +79,6 @@ func (q *Queries) DeleteUser(ctx context.Context, id int64) (int64, error) {
 	return id_2, err
 }
 
-const deleteUserRoles = `-- name: DeleteUserRoles :exec
-DELETE FROM user_roles WHERE user_id = ?
-`
-
-func (q *Queries) DeleteUserRoles(ctx context.Context, userID int64) error {
-	_, err := q.db.ExecContext(ctx, deleteUserRoles, userID)
-	return err
-}
-
-const existsAdminRole = `-- name: ExistsAdminRole :one
-SELECT EXISTS(SELECT 1 FROM user_roles WHERE role = 'admin') AS has_admin
-`
-
-func (q *Queries) ExistsAdminRole(ctx context.Context) (bool, error) {
-	row := q.db.QueryRowContext(ctx, existsAdminRole)
-	var has_admin bool
-	err := row.Scan(&has_admin)
-	return has_admin, err
-}
-
-const getRolesForUser = `-- name: GetRolesForUser :many
-SELECT role FROM user_roles WHERE user_id = ?
-`
-
-func (q *Queries) GetRolesForUser(ctx context.Context, userID int64) ([]string, error) {
-	rows, err := q.db.QueryContext(ctx, getRolesForUser, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []string
-	for rows.Next() {
-		var role string
-		if err := rows.Scan(&role); err != nil {
-			return nil, err
-		}
-		items = append(items, role)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const getUserByID = `-- name: GetUserByID :one
 SELECT id, username, password_hash, nickname, avatar, auth_version, banned_at, last_login_at, created_at, updated_at FROM users WHERE id = ?
 `
@@ -179,20 +121,6 @@ func (q *Queries) GetUserByUsername(ctx context.Context, username string) (User,
 		&i.UpdatedAt,
 	)
 	return i, err
-}
-
-const insertUserRole = `-- name: InsertUserRole :exec
-INSERT INTO user_roles (user_id, role) VALUES (?, ?)
-`
-
-type InsertUserRoleParams struct {
-	UserID int64  `json:"user_id"`
-	Role   string `json:"role"`
-}
-
-func (q *Queries) InsertUserRole(ctx context.Context, arg InsertUserRoleParams) error {
-	_, err := q.db.ExecContext(ctx, insertUserRole, arg.UserID, arg.Role)
-	return err
 }
 
 const listUsers = `-- name: ListUsers :many

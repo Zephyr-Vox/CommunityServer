@@ -146,7 +146,7 @@ func RegisterHandler(svc *RegisterService) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 invalid activation code: code wrong, used, or none pending
-//   - 2 admin already exists: an admin was created out of band
+//   - 2 owner already exists: an owner binding already exists
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1008 rate limited: too many activation attempts
@@ -154,7 +154,7 @@ func RegisterHandler(svc *RegisterService) echo.HandlerFunc {
 func ActivateHandler(mgr *ActivationManager) echo.HandlerFunc {
 	const (
 		codeInvalidActivationCode = 1
-		codeAdminAlreadyExists    = 2
+		codeOwnerAlreadyExists    = 2
 	)
 	return func(c *echo.Context) error {
 		var req activateRequest
@@ -167,8 +167,8 @@ func ActivateHandler(mgr *ActivationManager) echo.HandlerFunc {
 			switch {
 			case errors.Is(err, ErrInvalidActivationCode):
 				return api.NewError(codeInvalidActivationCode, http.StatusForbidden, "invalid activation code")
-			case errors.Is(err, ErrAdminAlreadyExists):
-				return api.NewError(codeAdminAlreadyExists, http.StatusForbidden, "admin already exists")
+			case errors.Is(err, ErrOwnerAlreadyExists):
+				return api.NewError(codeOwnerAlreadyExists, http.StatusForbidden, "owner already exists")
 			default:
 				return err
 			}
@@ -178,15 +178,15 @@ func ActivateHandler(mgr *ActivationManager) echo.HandlerFunc {
 }
 
 // InviteCreateHandler handles POST /api/v0/admin/invites. The route must be
-// mounted behind AuthN and Require(invite:manage).
+// mounted behind AuthN and Require(invite.manage).
 //
 // Errors:
-//   - 1 unknown role: role is not defined in roles.yaml
+//   - 1 unknown role: role is not defined in the database or is owner
 //   - 2 invalid expiry: expires_at must be in the future
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
-//   - 1003 forbidden: missing invite:manage permission
+//   - 1003 forbidden: missing invite.manage permission
 //   - 1009 internal: unexpected server error
 func InviteCreateHandler(svc *InviteService) echo.HandlerFunc {
 	const (
@@ -206,6 +206,8 @@ func InviteCreateHandler(svc *InviteService) echo.HandlerFunc {
 				return api.NewError(codeUnknownRole, http.StatusBadRequest, "unknown role")
 			case errors.Is(err, ErrInvalidExpiry):
 				return api.NewError(codeInvalidExpiry, http.StatusBadRequest, "expires_at must be in the future")
+			case errors.Is(err, ErrPermissionRequired):
+				return echo.ErrForbidden
 			default:
 				return err
 			}
@@ -251,7 +253,7 @@ func MeHandler(users *store.UserStore, authz *rbac.Authorizer) echo.HandlerFunc 
 }
 
 // StatusHandler handles GET /api/v0/auth/status. It is unauthenticated and
-// tells the client which bootstrap form to show: first-admin activation when
+// tells the client which bootstrap form to show: first-owner activation when
 // activation_required is true, otherwise normal registration with the
 // reported registration_mode (open or invite).
 //
@@ -259,13 +261,13 @@ func MeHandler(users *store.UserStore, authz *rbac.Authorizer) echo.HandlerFunc 
 //   - 1009 internal: unexpected server error
 func StatusHandler(stores *store.Stores, mode RegistrationMode) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		hasAdmin, err := stores.Users.HasAdmin(c.Request().Context())
+		state, err := stores.Installation.Get(c.Request().Context())
 		if err != nil {
 			return err
 		}
 		return api.OK(c, http.StatusOK, statusResponse{
 			RegistrationMode:   string(mode),
-			ActivationRequired: !hasAdmin,
+			ActivationRequired: state.Initialized == 0,
 		})
 	}
 }
@@ -343,7 +345,7 @@ func UpdateUserHandler(svc *UserService) echo.HandlerFunc {
 		codeInvalidID    = 1
 		codeUserNotFound = 2
 	)
-	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
 		id, err := parsePathID(c)
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
@@ -352,59 +354,17 @@ func UpdateUserHandler(svc *UserService) echo.HandlerFunc {
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		user, err := svc.UpdateProfile(c.Request().Context(), id, req.Nickname)
+		user, err := svc.UpdateManagedProfile(c.Request().Context(), p.UserID, id, req.Nickname)
 		if errors.Is(err, store.ErrNotFound) {
 			return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+		}
+		if errors.Is(err, ErrPermissionRequired) {
+			return echo.ErrForbidden
 		}
 		if err != nil {
 			return err
 		}
 		return api.OK(c, http.StatusOK, newUserResponse(user))
-	})
-}
-
-// SetUserRolesHandler handles PUT /api/v0/users/:id/roles. The route must be
-// mounted behind AuthN and Require(user:update).
-//
-// Errors:
-//   - 1 invalid id: malformed or non-positive path id
-//   - 2 unknown role: role is not defined in roles.yaml
-//   - 3 user not found
-//   - 4 last admin: the only admin cannot be demoted
-//   - 1000 invalid request parameters: field validation failed
-//   - 1001 malformed request: body could not be parsed
-//   - 1002 unauthorized: missing or invalid access token
-//   - 1003 forbidden: missing user:update permission
-//   - 1009 internal: unexpected server error
-func SetUserRolesHandler(svc *UserService) echo.HandlerFunc {
-	const (
-		codeInvalidID    = 1
-		codeUnknownRole  = 2
-		codeUserNotFound = 3
-		codeLastAdmin    = 4
-	)
-	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
-		id, err := parsePathID(c)
-		if err != nil {
-			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
-		}
-		var req setRolesRequest
-		if err := api.Bind(c, &req); err != nil {
-			return err
-		}
-		if err := svc.SetRoles(c.Request().Context(), id, req.Roles); err != nil {
-			switch {
-			case errors.Is(err, ErrUnknownRole):
-				return api.NewError(codeUnknownRole, http.StatusBadRequest, "unknown role")
-			case errors.Is(err, store.ErrNotFound):
-				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
-			case errors.Is(err, ErrLastAdmin):
-				return api.NewError(codeLastAdmin, http.StatusBadRequest, "cannot remove the last admin")
-			default:
-				return err
-			}
-		}
-		return api.NoContent(c, http.StatusNoContent)
 	})
 }
 
@@ -414,6 +374,7 @@ func SetUserRolesHandler(svc *UserService) echo.HandlerFunc {
 // Errors:
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 user not found
+//   - 3 owner protected: owner transfer is required before this operation
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -421,10 +382,11 @@ func SetUserRolesHandler(svc *UserService) echo.HandlerFunc {
 //   - 1009 internal: unexpected server error
 func ResetUserPasswordHandler(svc *AuthService) echo.HandlerFunc {
 	const (
-		codeInvalidID    = 1
-		codeUserNotFound = 2
+		codeInvalidID      = 1
+		codeUserNotFound   = 2
+		codeOwnerProtected = 3
 	)
-	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
 		id, err := parsePathID(c)
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
@@ -433,9 +395,15 @@ func ResetUserPasswordHandler(svc *AuthService) echo.HandlerFunc {
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		if err := svc.ResetPassword(c.Request().Context(), id, req.Password); err != nil {
+		if err := svc.ResetPassword(c.Request().Context(), p.UserID, id, req.Password); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			}
+			if errors.Is(err, ErrOwnerProtected) {
+				return api.NewError(codeOwnerProtected, http.StatusBadRequest, "owner is protected")
+			}
+			if errors.Is(err, ErrPermissionRequired) {
+				return echo.ErrForbidden
 			}
 			return err
 		}
@@ -450,14 +418,16 @@ func ResetUserPasswordHandler(svc *AuthService) echo.HandlerFunc {
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 self action: kicking yourself is not allowed
 //   - 3 user not found
+//   - 4 owner protected: owner transfer is required before this operation
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing user:kick permission
 //   - 1009 internal: unexpected server error
 func KickUserHandler(svc *UserService) echo.HandlerFunc {
 	const (
-		codeInvalidID    = 1
-		codeSelfAction   = 2
-		codeUserNotFound = 3
+		codeInvalidID      = 1
+		codeSelfAction     = 2
+		codeUserNotFound   = 3
+		codeOwnerProtected = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
 		id, err := parsePathID(c)
@@ -470,6 +440,10 @@ func KickUserHandler(svc *UserService) echo.HandlerFunc {
 				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot kick yourself")
 			case errors.Is(err, store.ErrNotFound):
 				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			case errors.Is(err, ErrOwnerProtected):
+				return api.NewError(codeOwnerProtected, http.StatusBadRequest, "owner is protected")
+			case errors.Is(err, ErrPermissionRequired):
+				return echo.ErrForbidden
 			default:
 				return err
 			}
@@ -485,16 +459,16 @@ func KickUserHandler(svc *UserService) echo.HandlerFunc {
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 self action: banning yourself is not allowed
 //   - 3 user not found
-//   - 4 last admin: the only admin cannot be banned
+//   - 4 owner protected: owner transfer is required before this operation
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing user:update permission
 //   - 1009 internal: unexpected server error
 func BanUserHandler(svc *UserService) echo.HandlerFunc {
 	const (
-		codeInvalidID    = 1
-		codeSelfAction   = 2
-		codeUserNotFound = 3
-		codeLastAdmin    = 4
+		codeInvalidID      = 1
+		codeSelfAction     = 2
+		codeUserNotFound   = 3
+		codeOwnerProtected = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
 		id, err := parsePathID(c)
@@ -507,8 +481,10 @@ func BanUserHandler(svc *UserService) echo.HandlerFunc {
 				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot ban yourself")
 			case errors.Is(err, store.ErrNotFound):
 				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
-			case errors.Is(err, ErrLastAdmin):
-				return api.NewError(codeLastAdmin, http.StatusBadRequest, "cannot remove the last admin")
+			case errors.Is(err, ErrOwnerProtected):
+				return api.NewError(codeOwnerProtected, http.StatusBadRequest, "owner is protected")
+			case errors.Is(err, ErrPermissionRequired):
+				return echo.ErrForbidden
 			default:
 				return err
 			}
@@ -531,14 +507,17 @@ func UnbanUserHandler(svc *UserService) echo.HandlerFunc {
 		codeInvalidID    = 1
 		codeUserNotFound = 2
 	)
-	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
 		id, err := parsePathID(c)
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
 		}
-		if err := svc.Unban(c.Request().Context(), id); err != nil {
+		if err := svc.Unban(c.Request().Context(), p.UserID, id); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
+			}
+			if errors.Is(err, ErrPermissionRequired) {
+				return echo.ErrForbidden
 			}
 			return err
 		}
@@ -553,16 +532,16 @@ func UnbanUserHandler(svc *UserService) echo.HandlerFunc {
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 self action: deleting yourself is not allowed
 //   - 3 user not found
-//   - 4 last admin: the only admin cannot be deleted
+//   - 4 owner protected: owner transfer is required before this operation
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing user:delete permission
 //   - 1009 internal: unexpected server error
 func DeleteUserHandler(svc *UserService) echo.HandlerFunc {
 	const (
-		codeInvalidID    = 1
-		codeSelfAction   = 2
-		codeUserNotFound = 3
-		codeLastAdmin    = 4
+		codeInvalidID      = 1
+		codeSelfAction     = 2
+		codeUserNotFound   = 3
+		codeOwnerProtected = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
 		id, err := parsePathID(c)
@@ -575,8 +554,10 @@ func DeleteUserHandler(svc *UserService) echo.HandlerFunc {
 				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot delete yourself")
 			case errors.Is(err, store.ErrNotFound):
 				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
-			case errors.Is(err, ErrLastAdmin):
-				return api.NewError(codeLastAdmin, http.StatusBadRequest, "cannot remove the last admin")
+			case errors.Is(err, ErrOwnerProtected):
+				return api.NewError(codeOwnerProtected, http.StatusBadRequest, "owner is protected")
+			case errors.Is(err, ErrPermissionRequired):
+				return echo.ErrForbidden
 			default:
 				return err
 			}
@@ -637,12 +618,12 @@ func MePasswordHandler(svc *AuthService) echo.HandlerFunc {
 }
 
 // InviteListHandler handles GET /api/v0/admin/invites. The route must be
-// mounted behind AuthN and Require(invite:manage).
+// mounted behind AuthN and Require(invite.manage).
 //
 // Errors:
 //   - 1 invalid pagination: limit must be 1-100, offset non-negative
 //   - 1002 unauthorized: missing or invalid access token
-//   - 1003 forbidden: missing invite:manage permission
+//   - 1003 forbidden: missing invite.manage permission
 //   - 1009 internal: unexpected server error
 func InviteListHandler(svc *InviteService) echo.HandlerFunc {
 	const codeInvalidPagination = 1
@@ -664,27 +645,30 @@ func InviteListHandler(svc *InviteService) echo.HandlerFunc {
 }
 
 // InviteDeleteHandler handles DELETE /api/v0/admin/invites/:id. The route
-// must be mounted behind AuthN and Require(invite:manage).
+// must be mounted behind AuthN and Require(invite.manage).
 //
 // Errors:
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 invite not found
 //   - 1002 unauthorized: missing or invalid access token
-//   - 1003 forbidden: missing invite:manage permission
+//   - 1003 forbidden: missing invite.manage permission
 //   - 1009 internal: unexpected server error
 func InviteDeleteHandler(svc *InviteService) echo.HandlerFunc {
 	const (
 		codeInvalidID      = 1
 		codeInviteNotFound = 2
 	)
-	return rbacecho.WithPrincipal(func(c *echo.Context, _ *rbac.Principal) error {
+	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
 		id, err := parsePathID(c)
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
 		}
-		if err := svc.Delete(c.Request().Context(), id); err != nil {
+		if err := svc.Delete(c.Request().Context(), p.UserID, id); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				return api.NewError(codeInviteNotFound, http.StatusNotFound, "invite not found")
+			}
+			if errors.Is(err, ErrPermissionRequired) {
+				return echo.ErrForbidden
 			}
 			return err
 		}

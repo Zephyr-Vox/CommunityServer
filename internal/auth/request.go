@@ -40,10 +40,6 @@ type updateProfileRequest struct {
 	Nickname string `json:"nickname" validate:"omitempty,max=32"`
 }
 
-type setRolesRequest struct {
-	Roles []string `json:"roles" validate:"required,min=1,max=32,dive,required"`
-}
-
 type resetPasswordRequest struct {
 	Password string `json:"password" validate:"required,password"`
 }

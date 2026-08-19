@@ -1,5 +1,5 @@
 -- name: CreateInvite :one
-INSERT INTO invites (id, code_hash, role, uses_left, expires_at, created_by, created_at)
+INSERT INTO invites (id, code_hash, role_key, uses_left, expires_at, created_by, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 RETURNING *;
 

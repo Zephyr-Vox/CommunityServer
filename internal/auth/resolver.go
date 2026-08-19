@@ -35,6 +35,6 @@ func NewPrincipalResolver(principals *PrincipalCache) rbacecho.PrincipalResolver
 		if snap.Banned {
 			return nil, echo.NewHTTPError(http.StatusForbidden, "user banned")
 		}
-		return &rbac.Principal{UserID: claims.UserID, Roles: snap.Roles}, nil
+		return &rbac.Principal{UserID: claims.UserID, Bindings: snap.Bindings}, nil
 	}
 }

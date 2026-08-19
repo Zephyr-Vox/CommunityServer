@@ -14,7 +14,7 @@ const consumeInvite = `-- name: ConsumeInvite :one
 UPDATE invites
 SET uses_left = uses_left - 1
 WHERE id = ? AND uses_left > 0 AND (expires_at IS NULL OR expires_at > CAST(?2 AS INTEGER))
-RETURNING id, code_hash, role, uses_left, expires_at, created_by, created_at
+RETURNING id, code_hash, role_key, uses_left, expires_at, created_by, created_at
 `
 
 type ConsumeInviteParams struct {
@@ -28,7 +28,7 @@ func (q *Queries) ConsumeInvite(ctx context.Context, arg ConsumeInviteParams) (I
 	err := row.Scan(
 		&i.ID,
 		&i.CodeHash,
-		&i.Role,
+		&i.RoleKey,
 		&i.UsesLeft,
 		&i.ExpiresAt,
 		&i.CreatedBy,
@@ -38,15 +38,15 @@ func (q *Queries) ConsumeInvite(ctx context.Context, arg ConsumeInviteParams) (I
 }
 
 const createInvite = `-- name: CreateInvite :one
-INSERT INTO invites (id, code_hash, role, uses_left, expires_at, created_by, created_at)
+INSERT INTO invites (id, code_hash, role_key, uses_left, expires_at, created_by, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
-RETURNING id, code_hash, role, uses_left, expires_at, created_by, created_at
+RETURNING id, code_hash, role_key, uses_left, expires_at, created_by, created_at
 `
 
 type CreateInviteParams struct {
 	ID        int64         `json:"id"`
 	CodeHash  string        `json:"code_hash"`
-	Role      string        `json:"role"`
+	RoleKey   string        `json:"role_key"`
 	UsesLeft  int64         `json:"uses_left"`
 	ExpiresAt sql.NullInt64 `json:"expires_at"`
 	CreatedBy sql.NullInt64 `json:"created_by"`
@@ -57,7 +57,7 @@ func (q *Queries) CreateInvite(ctx context.Context, arg CreateInviteParams) (Inv
 	row := q.db.QueryRowContext(ctx, createInvite,
 		arg.ID,
 		arg.CodeHash,
-		arg.Role,
+		arg.RoleKey,
 		arg.UsesLeft,
 		arg.ExpiresAt,
 		arg.CreatedBy,
@@ -67,7 +67,7 @@ func (q *Queries) CreateInvite(ctx context.Context, arg CreateInviteParams) (Inv
 	err := row.Scan(
 		&i.ID,
 		&i.CodeHash,
-		&i.Role,
+		&i.RoleKey,
 		&i.UsesLeft,
 		&i.ExpiresAt,
 		&i.CreatedBy,
@@ -88,7 +88,7 @@ func (q *Queries) DeleteInvite(ctx context.Context, id int64) (int64, error) {
 }
 
 const getInviteByCodeHash = `-- name: GetInviteByCodeHash :one
-SELECT id, code_hash, role, uses_left, expires_at, created_by, created_at FROM invites WHERE code_hash = ? AND (expires_at IS NULL OR expires_at > CAST(?2 AS INTEGER))
+SELECT id, code_hash, role_key, uses_left, expires_at, created_by, created_at FROM invites WHERE code_hash = ? AND (expires_at IS NULL OR expires_at > CAST(?2 AS INTEGER))
 `
 
 type GetInviteByCodeHashParams struct {
@@ -102,7 +102,7 @@ func (q *Queries) GetInviteByCodeHash(ctx context.Context, arg GetInviteByCodeHa
 	err := row.Scan(
 		&i.ID,
 		&i.CodeHash,
-		&i.Role,
+		&i.RoleKey,
 		&i.UsesLeft,
 		&i.ExpiresAt,
 		&i.CreatedBy,
@@ -112,7 +112,7 @@ func (q *Queries) GetInviteByCodeHash(ctx context.Context, arg GetInviteByCodeHa
 }
 
 const listInvites = `-- name: ListInvites :many
-SELECT id, code_hash, role, uses_left, expires_at, created_by, created_at FROM invites
+SELECT id, code_hash, role_key, uses_left, expires_at, created_by, created_at FROM invites
 ORDER BY created_at DESC
 LIMIT ? OFFSET ?
 `
@@ -134,7 +134,7 @@ func (q *Queries) ListInvites(ctx context.Context, arg ListInvitesParams) ([]Inv
 		if err := rows.Scan(
 			&i.ID,
 			&i.CodeHash,
-			&i.Role,
+			&i.RoleKey,
 			&i.UsesLeft,
 			&i.ExpiresAt,
 			&i.CreatedBy,

@@ -46,20 +46,5 @@ SELECT * FROM users
 ORDER BY created_at DESC
 LIMIT ? OFFSET ?;
 
--- name: GetRolesForUser :many
-SELECT role FROM user_roles WHERE user_id = ?;
-
--- name: InsertUserRole :exec
-INSERT INTO user_roles (user_id, role) VALUES (?, ?);
-
--- name: DeleteUserRoles :exec
-DELETE FROM user_roles WHERE user_id = ?;
-
--- name: ExistsAdminRole :one
-SELECT EXISTS(SELECT 1 FROM user_roles WHERE role = 'admin') AS has_admin;
-
--- name: CountUsersWithRole :one
-SELECT COUNT(*) AS count FROM user_roles WHERE role = ?;
-
 -- name: DeleteUser :one
 DELETE FROM users WHERE id = ? RETURNING id;

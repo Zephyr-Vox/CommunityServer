@@ -196,6 +196,9 @@ func newEnv(t *testing.T) *env {
 	}
 	now := func() int64 { return time.Now().UnixMilli() }
 	stores := store.New(conn, idGen, now)
+	if err := stores.SeedAndVerify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	secret := []byte("test-secret-0123456789abcdef0123456789abcdef")
 	return &env{
 		stores:     stores,
@@ -214,7 +217,7 @@ func (e *env) createUser(t *testing.T, username string) *db.User {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := e.stores.Users.SetRoles(context.Background(), u.ID, []string{"member"}); err != nil {
+	if _, err := e.stores.Roles.InsertBinding(context.Background(), u.ID, "member", "server", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	return u

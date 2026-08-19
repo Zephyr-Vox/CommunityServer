@@ -15,7 +15,7 @@ type InviteStore struct {
 }
 
 // Create inserts an invite and returns it. expiresAt and createdBy may be nil.
-func (s *InviteStore) Create(ctx context.Context, codeHash, role string, usesLeft int64, expiresAt, createdBy *int64) (*db.Invite, error) {
+func (s *InviteStore) Create(ctx context.Context, codeHash, roleKey string, usesLeft int64, expiresAt, createdBy *int64) (*db.Invite, error) {
 	id, err := s.idGen.Next()
 	if err != nil {
 		return nil, err
@@ -23,7 +23,7 @@ func (s *InviteStore) Create(ctx context.Context, codeHash, role string, usesLef
 	inv, err := s.q.CreateInvite(ctx, db.CreateInviteParams{
 		ID:        id,
 		CodeHash:  codeHash,
-		Role:      role,
+		RoleKey:   roleKey,
 		UsesLeft:  usesLeft,
 		ExpiresAt: nullInt64(expiresAt),
 		CreatedBy: nullInt64(createdBy),

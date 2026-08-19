@@ -8,14 +8,77 @@ import (
 	"database/sql"
 )
 
+type Channel struct {
+	ID         int64         `json:"id"`
+	GroupID    sql.NullInt64 `json:"group_id"`
+	Name       string        `json:"name"`
+	Mode       string        `json:"mode"`
+	Temporary  int64         `json:"temporary"`
+	Visibility string        `json:"visibility"`
+	Capacity   int64         `json:"capacity"`
+	Position   int64         `json:"position"`
+	Pinned     int64         `json:"pinned"`
+	CreatedBy  sql.NullInt64 `json:"created_by"`
+	CreatedAt  int64         `json:"created_at"`
+	UpdatedAt  int64         `json:"updated_at"`
+	Version    int64         `json:"version"`
+}
+
+type ChannelAccess struct {
+	ID            int64          `json:"id"`
+	ChannelID     int64          `json:"channel_id"`
+	PrincipalType string         `json:"principal_type"`
+	UserID        sql.NullInt64  `json:"user_id"`
+	RoleKey       sql.NullString `json:"role_key"`
+	CreatedAt     int64          `json:"created_at"`
+}
+
+type ChannelGroup struct {
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	Position   int64  `json:"position"`
+	Visibility string `json:"visibility"`
+	CreatedAt  int64  `json:"created_at"`
+	UpdatedAt  int64  `json:"updated_at"`
+	Version    int64  `json:"version"`
+}
+
+type GroupAccess struct {
+	ID            int64          `json:"id"`
+	GroupID       int64          `json:"group_id"`
+	PrincipalType string         `json:"principal_type"`
+	UserID        sql.NullInt64  `json:"user_id"`
+	RoleKey       sql.NullString `json:"role_key"`
+	CreatedAt     int64          `json:"created_at"`
+}
+
+type InstallationState struct {
+	ID          int64 `json:"id"`
+	Initialized int64 `json:"initialized"`
+}
+
 type Invite struct {
 	ID        int64         `json:"id"`
 	CodeHash  string        `json:"code_hash"`
-	Role      string        `json:"role"`
+	RoleKey   string        `json:"role_key"`
 	UsesLeft  int64         `json:"uses_left"`
 	ExpiresAt sql.NullInt64 `json:"expires_at"`
 	CreatedBy sql.NullInt64 `json:"created_by"`
 	CreatedAt int64         `json:"created_at"`
+}
+
+type ModerationMute struct {
+	ID        int64         `json:"id"`
+	ScopeType string        `json:"scope_type"`
+	GroupID   sql.NullInt64 `json:"group_id"`
+	ChannelID sql.NullInt64 `json:"channel_id"`
+	UserID    int64         `json:"user_id"`
+	Kind      string        `json:"kind"`
+	ExpiresAt sql.NullInt64 `json:"expires_at"`
+	CreatedBy sql.NullInt64 `json:"created_by"`
+	Reason    string        `json:"reason"`
+	CreatedAt int64         `json:"created_at"`
+	Version   int64         `json:"version"`
 }
 
 type Object struct {
@@ -25,6 +88,26 @@ type Object struct {
 	Size         int64  `json:"size"`
 	OriginalName string `json:"original_name"`
 	CreatedAt    int64  `json:"created_at"`
+}
+
+type Role struct {
+	Key         string `json:"key"`
+	DisplayName string `json:"display_name"`
+	Rank        int64  `json:"rank"`
+	Builtin     int64  `json:"builtin"`
+	Immutable   int64  `json:"immutable"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+	Version     int64  `json:"version"`
+}
+
+type ScopePermissionConfig struct {
+	ScopeType string        `json:"scope_type"`
+	GroupID   sql.NullInt64 `json:"group_id"`
+	ChannelID sql.NullInt64 `json:"channel_id"`
+	Config    string        `json:"config"`
+	UpdatedAt int64         `json:"updated_at"`
+	Version   int64         `json:"version"`
 }
 
 type Session struct {
@@ -51,7 +134,12 @@ type User struct {
 	UpdatedAt    int64          `json:"updated_at"`
 }
 
-type UserRole struct {
-	UserID int64  `json:"user_id"`
-	Role   string `json:"role"`
+type UserRoleBinding struct {
+	ID        int64         `json:"id"`
+	UserID    int64         `json:"user_id"`
+	RoleKey   string        `json:"role_key"`
+	ScopeType string        `json:"scope_type"`
+	GroupID   sql.NullInt64 `json:"group_id"`
+	ChannelID sql.NullInt64 `json:"channel_id"`
+	CreatedAt int64         `json:"created_at"`
 }

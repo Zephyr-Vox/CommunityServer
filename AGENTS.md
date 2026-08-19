@@ -16,7 +16,7 @@ ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 
 - One process instance is exactly one community server. There is no tenant or multi-server concept; "creating a server" means first-time initialization/bootstrap of this backend process. Do not introduce a `servers` table or tenant scoping.
 - `internal/protocol` remains transport-only and has no Echo/HTTP/config/channel/realtime dependency. Application adapters own control-plane integration.
-- Until the channel/realtime migration lands, runtime `roles.yaml` and HTTP presence heartbeat remain transitional current behavior. Narrow hardening work must use that current model without expanding it; the migration removes both rather than adding compatibility paths.
+- DB-backed RBAC has replaced runtime `roles.yaml`. HTTP presence heartbeat remains transitional until the realtime migration removes it rather than expanding it.
 - Voice overload control has fixed hard upper bounds with safe defaults. Startup configuration may lower or override valid limits before they are passed to the protocol package.
 
 ## Target Invariants (Channel/Realtime Pending)
@@ -58,7 +58,7 @@ ZephyrVox CommunityServer is a Go 1.26.5 + Echo v5 + SQLite voice server.
 - Every application log call carries a `module` attr (or derives from a logger that sets one). Domain packages do not log directly: they return errors, and boundary layers (`cmd`, the HTTP request logger, the API error handler) record them.
 - All IDs are 63-bit snowflake IDs; timestamps are Unix milliseconds (UTC); SQL comments are English.
 - Group helpers by what they serve (e.g., `token.go`, `middleware.go`); no generic `utils` packages.
-- Do not add backward-compatibility code unless there is a concrete need, such as persisted data, shipped behavior, external consumers, or an explicit user requirement; if unclear, ask one short question instead of guessing.
+- Until `VERSION` is changed to `1.0.0`, do not preserve code or database compatibility. Prefer clean, breaking refactors and schema rebuilds when they improve the overall architecture, correctness, or implementation clarity. Do not add migration or compatibility layers during this development phase.
 - Every production function must have a doc comment. Production code excludes `*_test.go` files and generated files. Internal helpers may be brief but must state their purpose and important behavior. Exported functions and APIs require standard-library-quality documentation covering their contract, errors, side effects, and concurrency semantics where relevant.
 - Long production functions and implementations involving races, concurrency, resource ownership, state transitions, or otherwise non-obvious control flow must include process-oriented comments explaining the design and each non-obvious step. Do not leave complex behavior implicit in code alone.
 - Request/response DTOs go in `request.go` / `response.go`; request-shape validation uses struct tags through `internal/validation`.

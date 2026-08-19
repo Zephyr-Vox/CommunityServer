@@ -238,7 +238,8 @@ func TestResetMissingUserDoesNotRevokeOtherSessions(t *testing.T) {
 	if _, err := e.svc.Login(ctx, "alice", "secret123", "dev-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.svc.ResetPassword(ctx, 999999, "newsecret"); !errors.Is(err, store.ErrNotFound) {
+	admin := e.createUser(t, "admin", "secret123", "admin")
+	if err := e.svc.ResetPassword(ctx, admin.ID, 999999, "newsecret"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("ResetPassword missing user = %v, want ErrNotFound", err)
 	}
 	sessions, err := e.stores.Sessions.ListByUser(ctx, u.ID)

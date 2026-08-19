@@ -18,6 +18,28 @@ var (
 	ErrConflict = errors.New("store: conflict")
 	// ErrSessionReused is returned when a rotated refresh token is presented again.
 	ErrSessionReused = errors.New("store: session token reuse detected")
+	// ErrOwnerBindingProtected is returned when a generic binding operation
+	// attempts to grant or revoke owner. First activation and owner transfer
+	// are the only paths allowed to change the unique owner binding.
+	ErrOwnerBindingProtected = errors.New("store: owner binding is protected")
+	// ErrBuiltinRoleProtected is returned when a generic role mutation attempts
+	// to delete a built-in role or change immutable owner fields.
+	ErrBuiltinRoleProtected = errors.New("store: built-in role is protected")
+	// ErrOwnerTransferForbidden is returned when a transfer caller is not the
+	// current owner of an initialized installation.
+	ErrOwnerTransferForbidden = errors.New("store: owner transfer forbidden")
+	// ErrOwnerTransferTarget is returned when an owner transfer target is the
+	// current owner or is banned.
+	ErrOwnerTransferTarget = errors.New("store: invalid owner transfer target")
+	// ErrInstallationInvariant is returned when persisted installation state
+	// and owner bindings do not satisfy their required relationship.
+	ErrInstallationInvariant = errors.New("store: installation invariant violated")
+	// ErrTransactionRequired is returned when an internal owner mutation is
+	// attempted outside a caller-owned transaction.
+	ErrTransactionRequired = errors.New("store: transaction required")
+	// ErrInvalidPermissionConfig is returned when a config references an
+	// unknown role/permission or violates scope and owner constraints.
+	ErrInvalidPermissionConfig = errors.New("store: invalid permission config")
 )
 
 // SQLite extended result code for SQLITE_CONSTRAINT_UNIQUE.

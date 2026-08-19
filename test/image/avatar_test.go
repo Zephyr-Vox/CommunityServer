@@ -54,6 +54,9 @@ func newEnv(t *testing.T, cfg config.AvatarConfig) *env {
 	}
 	now := func() int64 { return time.Now().UnixMilli() }
 	stores := store.New(conn, idGen, now)
+	if err := stores.SeedAndVerify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	root := t.TempDir()
 	objects, err := oss.NewLocalObjectStorage(root, conn, now)
 	if err != nil {
@@ -662,7 +665,7 @@ func TestDeleteUserDuringUploadCleansUncommittedAvatar(t *testing.T) {
 	e := newEnv(t, defaultCfg())
 	bossID := createUser(t, e, "boss")
 	aliceID := createUser(t, e, "alice")
-	if err := e.stores.Users.SetRoles(context.Background(), bossID, []string{"admin"}); err != nil {
+	if _, err := e.stores.Roles.InsertBinding(context.Background(), bossID, "admin", "server", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	idGen, err := snowflake.New()
@@ -678,7 +681,7 @@ func TestDeleteUserDuringUploadCleansUncommittedAvatar(t *testing.T) {
 			return []byte("fake-jpeg"), nil
 		},
 	))
-	userSvc := auth.NewUserService(e.stores, nil, e.principals, presence.New(time.Now), avatarSvc)
+	userSvc := auth.NewUserService(e.stores, e.principals, presence.New(time.Now), avatarSvc)
 	uploadDone := make(chan error, 1)
 	go func() {
 		_, err := avatarSvc.Upload(context.Background(), aliceID, bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255})))
@@ -710,14 +713,14 @@ func TestDeleteAfterUploadCleansCommittedAvatar(t *testing.T) {
 	e := newEnv(t, defaultCfg())
 	bossID := createUser(t, e, "boss")
 	userID := createUser(t, e, "alice")
-	if err := e.stores.Users.SetRoles(context.Background(), bossID, []string{"admin"}); err != nil {
+	if _, err := e.stores.Roles.InsertBinding(context.Background(), bossID, "admin", "server", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	avatar, err := e.svc.Upload(context.Background(), userID, bytes.NewReader(pngBytes(t, 32, 32, color.NRGBA{R: 1, A: 255})))
 	if err != nil {
 		t.Fatal(err)
 	}
-	userSvc := auth.NewUserService(e.stores, nil, e.principals, presence.New(time.Now), e.svc)
+	userSvc := auth.NewUserService(e.stores, e.principals, presence.New(time.Now), e.svc)
 	if err := userSvc.Delete(context.Background(), bossID, userID); err != nil {
 		t.Fatal(err)
 	}
@@ -730,7 +733,7 @@ func TestDeleteAfterAvatarMetadataCommitBeforeUploadReturns(t *testing.T) {
 	e := newEnv(t, defaultCfg())
 	bossID := createUser(t, e, "boss")
 	userID := createUser(t, e, "alice")
-	if err := e.stores.Users.SetRoles(context.Background(), bossID, []string{"admin"}); err != nil {
+	if _, err := e.stores.Roles.InsertBinding(context.Background(), bossID, "admin", "server", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	committed := make(chan struct{})
@@ -740,7 +743,7 @@ func TestDeleteAfterAvatarMetadataCommitBeforeUploadReturns(t *testing.T) {
 		once.Do(func() { close(committed) })
 		<-release
 	}))
-	userSvc := auth.NewUserService(e.stores, nil, e.principals, presence.New(time.Now), e.svc)
+	userSvc := auth.NewUserService(e.stores, e.principals, presence.New(time.Now), e.svc)
 
 	uploadDone := make(chan struct {
 		name string

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http/httptest"
@@ -73,6 +74,9 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	stores := store.New(conn, idGen, clock.get)
+	if err := stores.SeedAndVerify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	secret := []byte("test-secret-0123456789abcdef0123456789abcdef")
 	principals := auth.NewPrincipalCache(stores, time.Minute)
@@ -97,8 +101,15 @@ func (e *env) createUser(t *testing.T, username, password string, roles ...strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(roles) > 0 {
-		if err := e.stores.Users.SetRoles(context.Background(), u.ID, roles); err != nil {
+	for _, role := range roles {
+		if _, err := e.stores.Roles.Get(context.Background(), role); errors.Is(err, store.ErrNotFound) {
+			if _, err := e.stores.Roles.Create(context.Background(), role, role, 100); err != nil {
+				t.Fatal(err)
+			}
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.stores.Roles.InsertBinding(context.Background(), u.ID, role, "server", nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

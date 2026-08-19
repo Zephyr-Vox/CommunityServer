@@ -2,6 +2,7 @@ package auth_test
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/labstack/echo/v5"
@@ -18,7 +19,8 @@ func newStatusEcho(e *env, mode auth.RegistrationMode) *echo.Echo {
 
 func getStatus(t *testing.T, e *env, mode auth.RegistrationMode) map[string]any {
 	t.Helper()
-	rec := getPathWithToken(t, newStatusEcho(e, mode), "/api/v0/auth/status", "")
+	rec := httptest.NewRecorder()
+	newStatusEcho(e, mode).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v0/auth/status", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
@@ -37,9 +39,16 @@ func TestStatusHandlerRequiresActivation(t *testing.T) {
 	}
 }
 
-func TestStatusHandlerNoActivationAfterAdmin(t *testing.T) {
+func TestStatusHandlerNoActivationAfterOwner(t *testing.T) {
 	e := newEnv(t)
-	e.createUser(t, "boss", "secret123", "admin")
+	mgr := auth.NewActivationManager(e.stores)
+	code, _, err := mgr.EnsureCode(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Activate(t.Context(), code, "boss", "secret123", ""); err != nil {
+		t.Fatal(err)
+	}
 
 	resp := getStatus(t, e, auth.RegistrationInvite)
 	if resp["activation_required"] != false {

@@ -28,7 +28,7 @@ type userEnvelope struct {
 
 type inviteResponse struct {
 	ID        int64  `json:"id"`
-	Role      string `json:"role"`
+	RoleKey   string `json:"role_key"`
 	UsesLeft  int64  `json:"uses_left"`
 	ExpiresAt *int64 `json:"expires_at"`
 	CreatedAt int64  `json:"created_at"`
@@ -96,7 +96,7 @@ func newInviteResponse(inv *db.Invite) inviteResponse {
 	}
 	return inviteResponse{
 		ID:        inv.ID,
-		Role:      inv.Role,
+		RoleKey:   inv.RoleKey,
 		UsesLeft:  inv.UsesLeft,
 		ExpiresAt: expiresAt,
 		CreatedAt: inv.CreatedAt,

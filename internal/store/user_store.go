@@ -152,69 +152,7 @@ func (s *UserStore) ListUsers(ctx context.Context, limit, offset int64) ([]db.Us
 	return users, nil
 }
 
-// GetRoles returns the role names assigned to a user.
-func (s *UserStore) GetRoles(ctx context.Context, userID int64) ([]string, error) {
-	roles, err := s.q.GetRolesForUser(ctx, userID)
-	if err != nil {
-		return nil, mapError(err)
-	}
-	return roles, nil
-}
-
-// SetRoles replaces a user's roles: delete all, then insert each. On a root
-// store it runs in its own transaction; on a transaction-bound store it runs
-// directly on the caller's transaction.
-func (s *UserStore) SetRoles(ctx context.Context, userID int64, roles []string) error {
-	if s.conn == nil {
-		if err := s.q.DeleteUserRoles(ctx, userID); err != nil {
-			return mapError(err)
-		}
-		for _, role := range roles {
-			if err := s.q.InsertUserRole(ctx, db.InsertUserRoleParams{UserID: userID, Role: role}); err != nil {
-				return mapError(err)
-			}
-		}
-		return nil
-	}
-
-	tx, err := s.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	txq := s.q.WithTx(tx)
-	if err := txq.DeleteUserRoles(ctx, userID); err != nil {
-		return mapError(err)
-	}
-	for _, role := range roles {
-		if err := txq.InsertUserRole(ctx, db.InsertUserRoleParams{UserID: userID, Role: role}); err != nil {
-			return mapError(err)
-		}
-	}
-	return tx.Commit()
-}
-
-// HasAdmin reports whether at least one user has the admin role.
-func (s *UserStore) HasAdmin(ctx context.Context) (bool, error) {
-	ok, err := s.q.ExistsAdminRole(ctx)
-	if err != nil {
-		return false, mapError(err)
-	}
-	return ok, nil
-}
-
-// CountUsersWithRole returns how many users currently hold role.
-func (s *UserStore) CountUsersWithRole(ctx context.Context, role string) (int64, error) {
-	n, err := s.q.CountUsersWithRole(ctx, role)
-	if err != nil {
-		return 0, mapError(err)
-	}
-	return n, nil
-}
-
-// Delete removes a user row. Sessions and roles cascade; invites the user
-// created keep their rows with created_by set to NULL (ON DELETE SET NULL).
+// Delete removes a user row. Sessions and role bindings cascade; invites the
 func (s *UserStore) Delete(ctx context.Context, id int64) error {
 	_, err := s.q.DeleteUser(ctx, id)
 	return mapError(err)

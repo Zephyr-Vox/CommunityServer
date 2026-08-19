@@ -128,8 +128,128 @@ func TestBootstrapActivateLoginMe(t *testing.T) {
 		}
 		return false
 	}
-	if !has("invite:manage") || !has("user:delete") {
-		t.Fatalf("admin permissions = %v, want wildcard expansion", perms)
+	if !has("*") {
+		t.Fatalf("owner permissions = %v, want wildcard", perms)
+	}
+}
+
+func TestRoleBindingsAndOwnerTransfer(t *testing.T) {
+	app := newTestApp(t)
+	_, ownerToken := activateAdmin(t, app)
+
+	register := func(username string) (int64, string) {
+		t.Helper()
+		rec := postJSON(t, app, "/api/v0/auth/register", `{"username":"`+username+`","password":"secret123"}`)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("register %s status = %d, body = %s", username, rec.Code, rec.Body.String())
+		}
+		user, ok := dataOf(t, rec)["user"].(map[string]any)
+		if !ok {
+			t.Fatalf("register %s response has no user", username)
+		}
+		id, ok := user["id"].(float64)
+		if !ok {
+			t.Fatalf("register %s ID = %v", username, user["id"])
+		}
+		rec = postJSON(t, app, "/api/v0/auth/login", `{"username":"`+username+`","password":"secret123","device_id":"`+username+`-device"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("login %s status = %d, body = %s", username, rec.Code, rec.Body.String())
+		}
+		token, _ := dataOf(t, rec)["access_token"].(string)
+		return int64(id), token
+	}
+
+	aliceID, aliceToken := register("alice")
+	bobID, bobToken := register("bob")
+
+	ownerBinding := `{"user_id":` + strconv.FormatInt(aliceID, 10) + `,"role_key":"owner","scope":{"type":"server"}}`
+	rec := postJSONToken(t, app, "/api/v0/rbac/bindings", ownerToken, ownerBinding)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("generic owner binding status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	adminBinding := `{"user_id":` + strconv.FormatInt(aliceID, 10) + `,"role_key":"admin","scope":{"type":"server"}}`
+	rec = postJSONToken(t, app, "/api/v0/rbac/bindings", ownerToken, adminBinding)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("admin binding status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	bobAdminBinding := `{"user_id":` + strconv.FormatInt(bobID, 10) + `,"role_key":"admin","scope":{"type":"server"}}`
+	rec = postJSONToken(t, app, "/api/v0/rbac/bindings", ownerToken, bobAdminBinding)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("second admin binding status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rec = getToken(t, app, "/api/v0/rbac/bindings", aliceToken); rec.Code != http.StatusOK {
+		t.Fatalf("promoted admin bindings status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	transfer := `{"target_user_id":` + strconv.FormatInt(aliceID, 10) + `}`
+	rec = postJSONToken(t, app, "/api/v0/owner/transfer", ownerToken, transfer)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner transfer status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	for name, request := range map[string]func() *httptest.ResponseRecorder{
+		"kick": func() *httptest.ResponseRecorder {
+			return postJSONToken(t, app, "/api/v0/users/"+itoa(aliceID)+"/kick", bobToken, "")
+		},
+		"ban": func() *httptest.ResponseRecorder {
+			return postJSONToken(t, app, "/api/v0/users/"+itoa(aliceID)+"/ban", bobToken, "")
+		},
+		"delete": func() *httptest.ResponseRecorder {
+			return requestToken(t, app, http.MethodDelete, "/api/v0/users/"+itoa(aliceID), bobToken, "")
+		},
+	} {
+		if rec := request(); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s new owner status = %d, want 400, body = %s", name, rec.Code, rec.Body.String())
+		}
+	}
+
+	role := `{"key":"moderator","display_name":"Moderator","rank":500}`
+	rec = postJSONToken(t, app, "/api/v0/rbac/roles", ownerToken, role)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("previous owner role create status = %d, want 403, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = postJSONToken(t, app, "/api/v0/rbac/roles", aliceToken, role)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("new owner role create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	permissionConfig := `{"scope":{"type":"server"},"config":{"owner":["*"],"admin":[],"member":[],"moderator":["invite.manage"]}}`
+	rec = requestToken(t, app, http.MethodPut, "/api/v0/rbac/config", aliceToken, permissionConfig)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("permission config update status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	moderatorBinding := `{"user_id":` + strconv.FormatInt(bobID, 10) + `,"role_key":"moderator","scope":{"type":"server"}}`
+	rec = postJSONToken(t, app, "/api/v0/rbac/bindings", aliceToken, moderatorBinding)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("new owner binding status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	bindingID, ok := dataOf(t, rec)["id"].(float64)
+	if !ok {
+		t.Fatalf("moderator binding ID = %v", dataOf(t, rec)["id"])
+	}
+	rec = postJSONToken(t, app, "/api/v0/admin/invites", bobToken, `{}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("custom role permission status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = requestToken(t, app, http.MethodPatch, "/api/v0/rbac/roles/moderator", aliceToken,
+		`{"display_name":"Moderation","rank":400}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("role patch status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = requestToken(t, app, http.MethodPost, "/api/v0/rbac/config/reset", aliceToken, `{"scope":{"type":"server"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("permission config reset status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = requestToken(t, app, http.MethodDelete, "/api/v0/rbac/roles/moderator", aliceToken, "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("referenced role delete status = %d, want 409, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = requestToken(t, app, http.MethodDelete, "/api/v0/rbac/bindings/"+itoa(int64(bindingID)), aliceToken, "")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("binding delete status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = requestToken(t, app, http.MethodDelete, "/api/v0/rbac/roles/moderator", aliceToken, "")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("role delete status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 }
 

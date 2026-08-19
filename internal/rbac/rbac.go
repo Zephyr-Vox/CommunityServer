@@ -8,7 +8,7 @@ import (
 	"slices"
 )
 
-// Permission is a named capability, e.g. "user:create".
+// Permission is a named capability, e.g. "user:read".
 type Permission string
 
 // Wildcard grants every registered permission.
@@ -16,8 +16,17 @@ const Wildcard Permission = "*"
 
 // Principal is the authenticated identity whose permissions are being checked.
 type Principal struct {
-	UserID int64
-	Roles  []string
+	UserID   int64
+	Bindings []RoleBinding
+}
+
+// RoleBinding identifies a role granted to a user at one resource scope.
+// GroupID and ChannelID are populated only for their matching scope types.
+type RoleBinding struct {
+	RoleKey   string
+	ScopeType string
+	GroupID   *int64
+	ChannelID *int64
 }
 
 // Decision is the outcome of an authorization check, with a reason suitable
@@ -67,12 +76,17 @@ func (a *Authorizer) Permissions(ctx context.Context, p Principal) ([]Permission
 	return a.effectivePermissions(ctx, p)
 }
 
-// effectivePermissions returns the deduplicated grants from a principal's roles.
+// effectivePermissions returns grants from the principal's server bindings.
+// Target-scoped authorization will add the applicable group/channel bindings;
+// current HTTP routes are server-scoped and must not accidentally merge them.
 func (a *Authorizer) effectivePermissions(ctx context.Context, p Principal) ([]Permission, error) {
 	seen := make(map[Permission]struct{})
 	var permissions []Permission
-	for _, role := range p.Roles {
-		granted, ok, err := a.store.PermissionsForRole(ctx, role)
+	for _, binding := range p.Bindings {
+		if binding.ScopeType != "server" {
+			continue
+		}
+		granted, ok, err := a.store.PermissionsForRole(ctx, binding.RoleKey)
 		if err != nil {
 			return nil, err
 		}

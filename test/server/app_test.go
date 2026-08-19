@@ -38,11 +38,7 @@ func newTestAppWithMode(t *testing.T, mode string) *server.App {
 
 func newTestAppWith(t *testing.T, dir, registrationMode string, loginRateLimit float64) *server.App {
 	t.Helper()
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	app, err := server.New(testConfigFull(dir, 8745, registrationMode, loginRateLimit), roles, testLogger(t))
+	app, err := server.New(testConfigFull(dir, 8745, registrationMode, loginRateLimit), testLogger(t))
 	if err != nil {
 		t.Fatal(err)
 	}

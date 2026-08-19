@@ -21,7 +21,7 @@ func TestCreateAndGetInvite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inv.ID <= 0 || inv.CodeHash != "codehash" || inv.Role != "member" || inv.UsesLeft != 3 {
+	if inv.ID <= 0 || inv.CodeHash != "codehash" || inv.RoleKey != "member" || inv.UsesLeft != 3 {
 		t.Fatalf("unexpected invite: %+v", inv)
 	}
 	if !inv.ExpiresAt.Valid || inv.ExpiresAt.Int64 != expires {

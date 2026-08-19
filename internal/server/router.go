@@ -11,6 +11,7 @@ import (
 	"zephyr.vox/server/ce/internal/image"
 	"zephyr.vox/server/ce/internal/presence"
 	"zephyr.vox/server/ce/internal/rbac"
+	rbaccontrol "zephyr.vox/server/ce/internal/rbac/control"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
 )
 
@@ -35,7 +36,8 @@ func (a *App) routes(e *echo.Echo) error {
 		NewClaimsFunc: func(c *echo.Context) jwt.Claims { return &auth.Claims{} },
 	})
 	authnMW := rbacecho.AuthN(auth.NewPrincipalResolver(a.principals))
-	authz := rbac.NewAuthorizer(a.roles)
+	authz := rbac.NewAuthorizer(a.stores.Roles)
+	rbacSvc := rbaccontrol.NewService(a.stores, a.principals)
 
 	// authed wraps the standard authentication chain; extra middleware (e.g.
 	// permission checks) runs after it.
@@ -67,12 +69,26 @@ func (a *App) routes(e *echo.Echo) error {
 	users.GET("", auth.ListUsersHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserRead))...)
 	users.GET("/:id", auth.GetUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserRead))...)
 	users.PATCH("/:id", auth.UpdateUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
-	users.PUT("/:id/roles", auth.SetUserRolesHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
 	users.POST("/:id/password", auth.ResetUserPasswordHandler(a.authSvc), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
 	users.POST("/:id/kick", auth.KickUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserKick))...)
 	users.POST("/:id/ban", auth.BanUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
 	users.POST("/:id/unban", auth.UnbanUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
 	users.DELETE("/:id", auth.DeleteUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserDelete))...)
+
+	rbacGroup := api.Group("/rbac")
+	rbacGroup.GET("/roles", rbaccontrol.ListRolesHandler(rbacSvc), authed()...)
+	rbacGroup.POST("/roles", rbaccontrol.CreateRoleHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.PATCH("/roles/:key", rbaccontrol.UpdateRoleHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.DELETE("/roles/:key", rbaccontrol.DeleteRoleHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.GET("/bindings", rbaccontrol.ListBindingsHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.POST("/bindings", rbaccontrol.CreateBindingHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.DELETE("/bindings/:id", rbaccontrol.DeleteBindingHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.GET("/config", rbaccontrol.GetConfigHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.PUT("/config", rbaccontrol.UpdateConfigHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.POST("/config/reset", rbaccontrol.ResetConfigHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+
+	owner := api.Group("/owner")
+	owner.POST("/transfer", rbaccontrol.TransferOwnerHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
 
 	admin := api.Group("/admin")
 	admin.POST("/activate", auth.ActivateHandler(a.activate), auth.IPRateLimit(a.cfg.LoginRateLimit))

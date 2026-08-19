@@ -6,10 +6,10 @@ Single-server community edition of a lightweight voice-community server, in the 
 
 ## Features
 
-- Account bootstrap: first-admin activation code, open or invite-based registration
+- Account bootstrap: first-owner activation code, open or invite-based registration
 - Authentication: argon2id passwords, short-lived JWT access tokens, rotating refresh sessions with reuse detection
-- Role-based authorization: permissions configured in `roles.yaml`, enforced per route
-- User management: list/detail, profile, roles, password reset, kick, ban/unban, hard delete
+- Database-backed RBAC: seeded built-in roles, scoped bindings, ACLs and permission configs
+- User management: list/detail, profile, password reset, kick, ban/unban, hard delete
 - Invite management: create / list / delete invite codes
 - Presence: lightweight in-memory heartbeat-based online status
 - Realtime protocol model: each client has its own WS control connection; one account has at most one logical UDP voice session
@@ -34,13 +34,13 @@ This is the target protocol model. The current HTTP API list below still reflect
 go run ./cmd/zephyrd
 ```
 
-The first start generates `config/zephyr.toml` and `config/roles.yaml` automatically and opens the SQLite database configured in `server.db_path` (default `./data/zephyr.db`). When no administrator exists yet, the startup log prints a one-time activation code:
+The first start generates `config/zephyr.toml` and opens the SQLite database configured in `server.db_path` (default `./data/zephyr.db`). It seeds `owner`, `admin`, `member`, the root permission config, installation state, and a public announcement channel. Until the first owner activates, the startup log prints a one-time activation code:
 
 ```sh
-INFO first admin activation required code: ABC234...
+INFO first owner activation required code: ABC234...
 ```
 
-Activate the first admin. The default config serves HTTPS with an
+Activate the first owner. The default config serves HTTPS with an
 auto-generated self-signed certificate, so local curl calls need `-k`:
 
 ```sh
@@ -57,7 +57,7 @@ Then sign in with the same credentials at `POST /api/v0/auth/login`.
 Flags:
 
 ```sh
-zephyrd -config config/zephyr.toml -roles config/roles.yaml
+zephyrd -config config/zephyr.toml
 ```
 
 ## Configuration
@@ -87,12 +87,7 @@ zephyrd -config config/zephyr.toml -roles config/roles.yaml
 
 Console logs are human-readable colored lines on stdout. When `log.path` is set (the default), the same lines are also written to `zephyr.log` there; every 7 days the accumulated file is merged into a dated `.zip` archive (`zephyr-YYYY-MM-DD-NN.zip`) and `log.archive_keep` prunes old archives.
 
-`config/roles.yaml` defines roles and their permissions. The generated default has:
-
-- `admin`: `["*"]`
-- `member`: `["voice:join"]`
-
-Available permissions: `voice:join`, `user:read`, `user:create`, `user:update`, `user:delete`, `user:kick`, `invite:manage`.
+RBAC lives in SQLite. `owner` is globally unique and always grants `*`; `admin` and `member` are seeded roles. The root permission config grants admin server/user/invite/group/channel/moderation permissions and member `channel.create_temporary`. Roles, bindings, ACLs, local permission-config snapshots and mutes use database foreign keys and scope-specific uniqueness constraints.
 
 ## API Conventions
 
@@ -115,7 +110,8 @@ All paths are prefixed with `/api/v0`.
 |---|---|
 | Auth | `GET /auth/status`, `POST /auth/register`, `POST /admin/activate`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout` |
 | Self | `GET /auth/me`, `PATCH /me`, `POST /me/avatar`, `DELETE /me/avatar`, `POST /me/password` |
-| Users | `GET /users`, `GET /users/:id`, `PATCH /users/:id`, `PUT /users/:id/roles`, `POST /users/:id/password`, `POST /users/:id/kick`, `POST /users/:id/ban`, `POST /users/:id/unban`, `DELETE /users/:id` |
+| Users | `GET /users`, `GET /users/:id`, `PATCH /users/:id`, `POST /users/:id/password`, `POST /users/:id/kick`, `POST /users/:id/ban`, `POST /users/:id/unban`, `DELETE /users/:id` |
+| RBAC | `GET /rbac/roles`, `POST /rbac/roles`, `PATCH /rbac/roles/:key`, `DELETE /rbac/roles/:key`, `GET/POST/DELETE /rbac/bindings`, `GET/PUT /rbac/config`, `POST /rbac/config/reset`, `POST /owner/transfer` |
 | Invites | `GET /admin/invites`, `POST /admin/invites`, `DELETE /admin/invites/:id` |
 | Presence | `POST /presence/heartbeat`, `GET /presence` |
 

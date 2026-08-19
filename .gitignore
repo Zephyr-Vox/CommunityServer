@@ -10,7 +10,6 @@
 .env
 *.env
 *.local.yaml
-/config/roles.yaml
 /config/zephyr.toml
 /spec/
 

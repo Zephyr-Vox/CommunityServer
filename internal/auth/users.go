@@ -3,12 +3,12 @@ package auth
 import (
 	"context"
 	"errors"
-	"slices"
 	"strconv"
 
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/db"
+	"zephyr.vox/server/ce/internal/rbac"
 	"zephyr.vox/server/ce/internal/store"
 )
 
@@ -18,9 +18,9 @@ var (
 	// ErrInvalidPagination is returned when limit/offset query parameters are
 	// missing, malformed or out of range.
 	ErrInvalidPagination = errors.New("auth: invalid pagination")
-	// ErrLastAdmin is returned when an operation would remove the last user
-	// holding the admin role, locking the deployment out of administration.
-	ErrLastAdmin = errors.New("auth: cannot remove the last admin")
+	// ErrOwnerProtected is returned when an operation would mutate the sole
+	// owner through a non-transfer path.
+	ErrOwnerProtected = errors.New("auth: owner is protected")
 )
 
 // PresenceRevoker removes a user from the online registry immediately after
@@ -48,7 +48,6 @@ type UserWithRoles struct {
 type UserService struct {
 	stores        *store.Stores
 	users         *store.UserStore
-	roles         RoleProvider
 	principals    *PrincipalCache
 	presence      PresenceRevoker
 	avatarCleaner AvatarCleaner
@@ -56,11 +55,10 @@ type UserService struct {
 
 // NewUserService returns a UserService. avatarCleaner may be nil, in which
 // case account deletion leaves avatar objects behind.
-func NewUserService(stores *store.Stores, roles RoleProvider, principals *PrincipalCache, presence PresenceRevoker, avatarCleaner AvatarCleaner) *UserService {
+func NewUserService(stores *store.Stores, principals *PrincipalCache, presence PresenceRevoker, avatarCleaner AvatarCleaner) *UserService {
 	return &UserService{
 		stores:        stores,
 		users:         stores.Users,
-		roles:         roles,
 		principals:    principals,
 		presence:      presence,
 		avatarCleaner: avatarCleaner,
@@ -77,7 +75,7 @@ func (s *UserService) List(ctx context.Context, limit, offset int64) ([]UserWith
 	}
 	out := make([]UserWithRoles, 0, len(users))
 	for i := range users {
-		roles, err := s.users.GetRoles(ctx, users[i].ID)
+		roles, err := s.serverRoles(ctx, users[i].ID)
 		if err != nil {
 			return nil, err
 		}
@@ -92,7 +90,7 @@ func (s *UserService) Get(ctx context.Context, userID int64) (*UserWithRoles, er
 	if err != nil {
 		return nil, err
 	}
-	roles, err := s.users.GetRoles(ctx, userID)
+	roles, err := s.serverRoles(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -116,68 +114,58 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 	return s.users.UpdateNickname(ctx, userID, nickname)
 }
 
-// SetRoles replaces a user's roles after validating them against the role
-// configuration, then clears the principal cache so the change is immediate.
-// Duplicate roles are accepted and collapsed. The last admin cannot be
-// demoted, banned or deleted: doing so would lock the deployment out.
-func (s *UserService) SetRoles(ctx context.Context, userID int64, roles []string) error {
-	roles = dedupeRoles(roles)
-	for _, role := range roles {
-		if !s.roles.HasRole(role) {
-			return ErrUnknownRole
-		}
-	}
-	unlock := s.principals.LockMutation(userID)
+// UpdateManagedProfile changes a user's nickname after verifying that actorID
+// still has user:update within the write transaction. Self-service callers use
+// UpdateProfile instead and require no management permission.
+func (s *UserService) UpdateManagedProfile(ctx context.Context, actorID, userID int64, nickname string) (*db.User, error) {
+	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
+	var user *db.User
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
-		if _, err := tx.Users.GetUserByID(ctx, userID); err != nil {
+		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserUpdate); err != nil {
 			return err
 		}
-		last, err := isLastAdmin(ctx, tx.Users, userID)
-		if err != nil {
+		var err error
+		user, err = tx.Users.GetUserByID(ctx, userID)
+		if err != nil || nickname == "" {
 			return err
 		}
-		if last && !slices.Contains(roles, adminRole) {
-			return ErrLastAdmin
-		}
-		return tx.Users.SetRoles(ctx, userID, roles)
-	}); err != nil {
+		user, err = tx.Users.UpdateNickname(ctx, userID, nickname)
 		return err
+	}); err != nil {
+		return nil, err
 	}
-	s.principals.Invalidate(userID)
-	return nil
+	return user, nil
 }
 
-// dedupeRoles collapses repeated role names while preserving first-seen order.
-func dedupeRoles(roles []string) []string {
-	seen := make(map[string]struct{}, len(roles))
-	out := make([]string, 0, len(roles))
-	for _, role := range roles {
-		if _, ok := seen[role]; ok {
-			continue
+// serverRoles returns server-scope role keys for the existing user response
+// DTO. Scoped bindings remain available through the DB-backed RBAC store.
+func (s *UserService) serverRoles(ctx context.Context, userID int64) ([]string, error) {
+	bindings, err := s.stores.Roles.ListBindings(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	roles := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		if binding.ScopeType == "server" {
+			roles = append(roles, binding.RoleKey)
 		}
-		seen[role] = struct{}{}
-		out = append(out, role)
 	}
-	return out
+	return roles, nil
 }
 
-// isLastAdmin reports whether userID currently holds the admin role and is
-// the only user who does. Call it inside the same transaction as the mutation
-// so a concurrent role change cannot remove the last admin.
-func isLastAdmin(ctx context.Context, users *store.UserStore, userID int64) (bool, error) {
-	roles, err := users.GetRoles(ctx, userID)
+// isOwner reports whether userID has the unique server owner binding.
+func isOwner(ctx context.Context, roles *store.RoleStore, userID int64) (bool, error) {
+	bindings, err := roles.ListBindings(ctx, userID)
 	if err != nil {
 		return false, err
 	}
-	if !slices.Contains(roles, adminRole) {
-		return false, nil
+	for _, binding := range bindings {
+		if binding.ScopeType == "server" && binding.RoleKey == ownerRole {
+			return true, nil
+		}
 	}
-	n, err := users.CountUsersWithRole(ctx, adminRole)
-	if err != nil {
-		return false, err
-	}
-	return n <= 1, nil
+	return false, nil
 }
 
 // Kick bumps auth_version and deletes every session in one transaction, then
@@ -187,12 +175,25 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
 	}
-	if _, err := s.users.GetUserByID(ctx, userID); err != nil {
-		return err
-	}
-	unlock := s.principals.LockMutation(userID)
+	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
+		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserKick); err != nil {
+			return err
+		}
+		// Owner transfer holds this same user barrier. Rechecking after the
+		// lock and inside this transaction prevents a target promoted while a
+		// moderation request was waiting from being kicked.
+		if _, err := tx.Users.GetUserByID(ctx, userID); err != nil {
+			return err
+		}
+		owner, err := isOwner(ctx, tx.Roles, userID)
+		if err != nil {
+			return err
+		}
+		if owner {
+			return ErrOwnerProtected
+		}
 		if err := tx.Users.BumpAuthVersion(ctx, userID); err != nil {
 			return err
 		}
@@ -211,18 +212,22 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
 	}
-	unlock := s.principals.LockMutation(userID)
+	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
+		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserUpdate); err != nil {
+			return err
+		}
+		// See Kick: transfer and account mutation must serialize on the target.
 		if _, err := tx.Users.GetUserByID(ctx, userID); err != nil {
 			return err
 		}
-		last, err := isLastAdmin(ctx, tx.Users, userID)
+		owner, err := isOwner(ctx, tx.Roles, userID)
 		if err != nil {
 			return err
 		}
-		if last {
-			return ErrLastAdmin
+		if owner {
+			return ErrOwnerProtected
 		}
 		return tx.Users.Ban(ctx, userID)
 	}); err != nil {
@@ -233,52 +238,51 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 	return nil
 }
 
-// Unban lifts the ban and clears the principal cache.
-func (s *UserService) Unban(ctx context.Context, userID int64) error {
-	if _, err := s.users.GetUserByID(ctx, userID); err != nil {
-		return err
-	}
-	unlock := s.principals.LockMutation(userID)
+// Unban lifts the ban after confirming actorID still has user:update, then
+// clears the target's principal cache.
+func (s *UserService) Unban(ctx context.Context, actorID, userID int64) error {
+	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
-	if err := s.users.Unban(ctx, userID); err != nil {
+	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
+		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserUpdate); err != nil {
+			return err
+		}
+		if _, err := tx.Users.GetUserByID(ctx, userID); err != nil {
+			return err
+		}
+		return tx.Users.Unban(ctx, userID)
+	}); err != nil {
 		return err
 	}
 	s.principals.Invalidate(userID)
 	return nil
 }
 
-// Delete hard-deletes a user. Sessions and roles cascade; invites the user
+// Delete hard-deletes a user. Sessions and role bindings cascade; invites the user
 // created keep their rows with created_by set to NULL. The committed avatar
 // reference is removed best-effort after the deletion transaction succeeds.
 func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
 	}
-	_, err := s.users.GetUserByID(ctx, userID)
-	if err != nil {
-		return err
-	}
-	// Reject before the best-effort avatar cleanup so a refused deletion does
-	// not destroy the avatar; the transactional check below is authoritative.
-	if last, err := isLastAdmin(ctx, s.users, userID); err != nil {
-		return err
-	} else if last {
-		return ErrLastAdmin
-	}
-	unlock := s.principals.LockMutation(userID)
+	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
 	var avatarName string
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
+		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserDelete); err != nil {
+			return err
+		}
+		// See Kick: deletion must observe owner status after any pending transfer.
 		user, err := tx.Users.GetUserByID(ctx, userID)
 		if err != nil {
 			return err
 		}
-		last, err := isLastAdmin(ctx, tx.Users, userID)
+		owner, err := isOwner(ctx, tx.Roles, userID)
 		if err != nil {
 			return err
 		}
-		if last {
-			return ErrLastAdmin
+		if owner {
+			return ErrOwnerProtected
 		}
 		if user.Avatar.Valid {
 			avatarName = user.Avatar.String

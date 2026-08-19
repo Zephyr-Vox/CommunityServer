@@ -6,10 +6,10 @@
 
 ## 功能
 
-- 账号引导：首管理员激活码、开放注册 / 邀请码注册
+- 账号引导：首 owner 激活码、开放注册 / 邀请码注册
 - 认证：argon2id 密码、短时效 JWT access token、可轮换且带重用检测的 refresh session
-- 基于角色的授权：权限在 `roles.yaml` 中配置，按路由强制
-- 用户管理：列表/详情、资料、角色、重置密码、踢下线、封禁/解封、硬删除
+- 数据库驱动的 RBAC：内置角色、scope binding、ACL 和权限配置
+- 用户管理：列表/详情、资料、重置密码、踢下线、封禁/解封、硬删除
 - 邀请码管理：创建 / 列表 / 删除
 - presence：轻量内存心跳在线状态
 - 实时协议模型：每个客户端独立维护一条 WS 控制连接；每个账号最多一个逻辑 UDP 语音会话
@@ -34,13 +34,13 @@
 go run ./cmd/zephyrd
 ```
 
-首次启动会自动生成 `config/zephyr.toml` 和 `config/roles.yaml`，并按 `server.db_path`（默认 `./data/zephyr.db`）打开数据库。当系统还没有管理员时，启动日志会打印一次性激活码：
+首次启动会自动生成 `config/zephyr.toml`，并按 `server.db_path`（默认 `./data/zephyr.db`）打开数据库。数据库会 seed `owner`、`admin`、`member`、根权限配置、installation state 和公开公告频道；首 owner 激活前，启动日志会打印一次性激活码：
 
 ```sh
-INFO first admin activation required code: ABC234...
+INFO first owner activation required code: ABC234...
 ```
 
-激活首管理员。默认配置使用 HTTPS 并提供自动生成的自签证书，本地 curl 需要加 `-k`：
+激活首 owner。默认配置使用 HTTPS 并提供自动生成的自签证书，本地 curl 需要加 `-k`：
 
 ```sh
 curl -k -X POST https://localhost:8745/api/v0/admin/activate \
@@ -56,7 +56,7 @@ curl -k -X POST https://localhost:8745/api/v0/admin/activate \
 命令行参数：
 
 ```sh
-zephyrd -config config/zephyr.toml -roles config/roles.yaml
+zephyrd -config config/zephyr.toml
 ```
 
 ## 配置
@@ -86,12 +86,7 @@ zephyrd -config config/zephyr.toml -roles config/roles.yaml
 
 控制台日志是输出到 stdout 的人类可读彩色日志。配置 `log.path`（默认）时，同一份日志也会写入该目录的 `zephyr.log`；每 7 天将累积文件合并归档为带日期的 `.zip`（`zephyr-YYYY-MM-DD-NN.zip`），并由 `log.archive_keep` 清理旧归档。
 
-`config/roles.yaml` 定义角色及其权限。默认生成内容：
-
-- `admin`：`["*"]`
-- `member`：`["voice:join"]`
-
-可用权限：`voice:join`、`user:read`、`user:create`、`user:update`、`user:delete`、`user:kick`、`invite:manage`。
+RBAC 持久化在 SQLite 中。`owner` 全局唯一并始终授予 `*`；`admin` 和 `member` 为 seed 的内置角色。根权限配置给 admin 授予 server/user/invite/group/channel/moderation 权限，给 member 授予 `channel.create_temporary`。角色、binding、ACL、本地权限配置快照和 mute 都由数据库外键及 scope 唯一约束保护。
 
 ## API 约定
 
@@ -114,7 +109,8 @@ zephyrd -config config/zephyr.toml -roles config/roles.yaml
 |---|---|
 | 认证 | `GET /auth/status`、`POST /auth/register`、`POST /admin/activate`、`POST /auth/login`、`POST /auth/refresh`、`POST /auth/logout` |
 | 自我管理 | `GET /auth/me`、`PATCH /me`、`POST /me/avatar`、`DELETE /me/avatar`、`POST /me/password` |
-| 用户管理 | `GET /users`、`GET /users/:id`、`PATCH /users/:id`、`PUT /users/:id/roles`、`POST /users/:id/password`、`POST /users/:id/kick`、`POST /users/:id/ban`、`POST /users/:id/unban`、`DELETE /users/:id` |
+| 用户管理 | `GET /users`、`GET /users/:id`、`PATCH /users/:id`、`POST /users/:id/password`、`POST /users/:id/kick`、`POST /users/:id/ban`、`POST /users/:id/unban`、`DELETE /users/:id` |
+| RBAC | `GET /rbac/roles`、`POST /rbac/roles`、`PATCH /rbac/roles/:key`、`DELETE /rbac/roles/:key`、`GET/POST/DELETE /rbac/bindings`、`GET/PUT /rbac/config`、`POST /rbac/config/reset`、`POST /owner/transfer` |
 | 邀请码 | `GET /admin/invites`、`POST /admin/invites`、`DELETE /admin/invites/:id` |
 | Presence | `POST /presence/heartbeat`、`GET /presence` |
 

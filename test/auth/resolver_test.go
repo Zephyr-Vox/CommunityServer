@@ -134,7 +134,7 @@ func TestResolverRolePropagation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var gotRoles []string
+	var gotBindings []string
 	app := echo.New()
 	jwtMW := echojwt.WithConfig(echojwt.Config{
 		SigningKey:    e.secret,
@@ -144,14 +144,16 @@ func TestResolverRolePropagation(t *testing.T) {
 	app.Use(rbacecho.AuthN(auth.NewPrincipalResolver(e.principals)))
 	app.GET("/", func(c *echo.Context) error {
 		p, _ := rbacecho.PrincipalOf(c)
-		gotRoles = p.Roles
+		for _, binding := range p.Bindings {
+			gotBindings = append(gotBindings, binding.RoleKey)
+		}
 		return c.NoContent(http.StatusOK)
 	})
 	rec := getWithToken(t, app, token)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	if len(gotRoles) != 1 || gotRoles[0] != "member" {
-		t.Fatalf("roles = %v, want [member]", gotRoles)
+	if len(gotBindings) != 1 || gotBindings[0] != "member" {
+		t.Fatalf("bindings = %v, want [member]", gotBindings)
 	}
 }

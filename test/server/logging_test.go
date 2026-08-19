@@ -23,11 +23,6 @@ func TestServerLogsToConfiguredFile(t *testing.T) {
 
 	cfg := testConfigFull(dir, 8745, "open", 120)
 	cfg.Log = config.LogConfig{Level: slog.LevelInfo, Path: logDir, ArchiveKeep: 7}
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	rot, err := logging.NewRotatingWriter(logDir, logging.RotatingWriterConfig{Keep: cfg.Log.ArchiveKeep})
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +36,7 @@ func TestServerLogsToConfiguredFile(t *testing.T) {
 		logging.NewTextHandler(rot, nil),
 	))
 
-	app, err := server.New(cfg, roles, logger)
+	app, err := server.New(cfg, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +47,7 @@ func TestServerLogsToConfiguredFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("live log missing after server.New: %v", err)
 	}
-	if !strings.Contains(string(data), "registered 26 routes") {
+	if !strings.Contains(string(data), "registered 36 routes") {
 		t.Fatalf("live log does not contain the route summary:\n%s", data)
 	}
 }
@@ -63,13 +58,8 @@ func TestServerConsoleOnlyLogging(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfigFull(dir, 8745, "open", 120)
 	cfg.Log = config.LogConfig{Level: slog.LevelInfo, Path: "", ArchiveKeep: 7}
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	logger := slog.New(logging.NewTextHandler(io.Discard, nil))
-	app, err := server.New(cfg, roles, logger)
+	app, err := server.New(cfg, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,14 +81,9 @@ func TestServerConsoleOnlyLogging(t *testing.T) {
 func TestRequestLogging(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfigFull(dir, 8745, "open", 120)
-	roles, err := config.LoadRoles(filepath.Join(dir, "roles.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	var buf bytes.Buffer
 	logger := slog.New(logging.NewTextHandler(&buf, slog.LevelDebug))
-	app, err := server.New(cfg, roles, logger)
+	app, err := server.New(cfg, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

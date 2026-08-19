@@ -62,7 +62,11 @@ func newTestEnv(t *testing.T) (*store.Stores, *fakeClock) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return store.New(conn, idGen, clock.get), clock
+	stores := store.New(conn, idGen, clock.get)
+	if err := stores.SeedAndVerify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return stores, clock
 }
 
 func mustCreateUser(t *testing.T, s *store.Stores, username string) *db.User {

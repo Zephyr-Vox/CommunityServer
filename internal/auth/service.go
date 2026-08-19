@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"zephyr.vox/server/ce/internal/db"
+	"zephyr.vox/server/ce/internal/rbac"
 	"zephyr.vox/server/ce/internal/store"
 )
 
@@ -153,10 +154,9 @@ func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 	return err
 }
 
-// ChangePassword atomically replaces the password hash, bumps auth_version,
-// and revokes all sessions in a single transaction, then invalidates the
-// principal cache. After it returns, every previously issued access and
-// refresh token is dead.
+// ChangePassword atomically replaces a verified user's password hash, bumps
+// auth_version, and revokes all sessions before invalidating the principal
+// cache. Administrative resets use ResetPassword, which rechecks actor rights.
 func (s *AuthService) ChangePassword(ctx context.Context, userID int64, newPasswordHash string) error {
 	unlock := s.principals.LockMutation(userID)
 	defer unlock()
@@ -172,18 +172,41 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID int64, newPassw
 	return nil
 }
 
-// ResetPassword hashes a new password and applies the atomic ChangePassword
-// flow. It is the admin password-reset path.
-func (s *AuthService) ResetPassword(ctx context.Context, userID int64, newPassword string) error {
+// ResetPassword hashes a new password and replaces the target credentials only
+// after actorID is confirmed to still hold user:update in the write transaction.
+// It rejects the current owner; ownership changes must use owner transfer and
+// no administrative password-reset path may take over that account.
+func (s *AuthService) ResetPassword(ctx context.Context, actorID, userID int64, newPassword string) error {
 	hash, err := HashPassword(newPassword)
 	if err != nil {
 		return err
 	}
-	return s.ChangePassword(ctx, userID, hash)
+	unlock := s.principals.LockMutation(actorID, userID)
+	defer unlock()
+	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
+		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserUpdate); err != nil {
+			return err
+		}
+		owner, err := isOwner(ctx, tx.Roles, userID)
+		if err != nil {
+			return err
+		}
+		if owner {
+			return ErrOwnerProtected
+		}
+		if err := tx.Users.SetPasswordHash(ctx, userID, hash); err != nil {
+			return err
+		}
+		return tx.Sessions.DeleteUserSessions(ctx, userID)
+	}); err != nil {
+		return err
+	}
+	s.principals.Invalidate(userID)
+	return nil
 }
 
 // ChangeOwnPassword verifies the current password before applying
-// ResetPassword, so a caller needs proof of the old secret.
+// ChangePassword, so a caller needs proof of the old secret.
 func (s *AuthService) ChangeOwnPassword(ctx context.Context, userID int64, oldPassword, newPassword string) error {
 	user, err := s.users.GetUserByID(ctx, userID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -199,7 +222,11 @@ func (s *AuthService) ChangeOwnPassword(ctx context.Context, userID int64, oldPa
 	if !ok {
 		return ErrWrongPassword
 	}
-	return s.ResetPassword(ctx, userID, newPassword)
+	hash, err := HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	return s.ChangePassword(ctx, userID, hash)
 }
 
 // runTx executes fn on stores bound to one transaction and commits it; the

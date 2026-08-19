@@ -8,12 +8,13 @@ import (
 	"time"
 
 	"zephyr.vox/server/ce/internal/db"
+	"zephyr.vox/server/ce/internal/rbac"
 	"zephyr.vox/server/ce/internal/store"
 )
 
 var (
 	// ErrUnknownRole is returned when an invite requests a role that is not
-	// defined in roles.yaml.
+	// defined in the database or requests the protected owner role.
 	ErrUnknownRole = errors.New("auth: unknown role")
 	// ErrInvalidExpiry is returned when expires_at is not in the future.
 	ErrInvalidExpiry = errors.New("auth: expires_at must be in the future")
@@ -28,29 +29,26 @@ const inviteAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 // InviteService creates registration invite codes. The plaintext code is
 // returned exactly once; the store only ever sees its SHA-256 digest.
 type InviteService struct {
-	stores *store.Stores
-	roles  RoleProvider
-	now    func() int64
+	stores     *store.Stores
+	principals *PrincipalCache
+	now        func() int64
 }
 
 // NewInviteService returns an InviteService. The now function supplies Unix
 // milliseconds and is injectable for deterministic tests.
-func NewInviteService(stores *store.Stores, roles RoleProvider, now func() int64) *InviteService {
-	return &InviteService{stores: stores, roles: roles, now: now}
+func NewInviteService(stores *store.Stores, principals *PrincipalCache, now func() int64) *InviteService {
+	return &InviteService{stores: stores, principals: principals, now: now}
 }
 
 // Create generates an 8-character [0-9A-Z] code and stores its digest.
 // Defaults: role = default_role, uses = 1, expires in DefaultInviteTTL. An
 // explicit expiresAt must be in the future.
-func (s *InviteService) Create(ctx context.Context, createdBy int64, role string, uses int64, expiresAt *int64) (string, *db.Invite, error) {
-	// Resolve and validate every field before generating anything: an invalid
-	// request must not consume randomness or touch the database. Defaults are
-	// applied here so the handler stays a thin DTO pass-through.
-	if role == "" {
-		role = s.roles.DefaultRole()
-	}
-	if !s.roles.HasRole(role) {
-		return "", nil, ErrUnknownRole
+func (s *InviteService) Create(ctx context.Context, createdBy int64, roleKey string, uses int64, expiresAt *int64) (string, *db.Invite, error) {
+	// Validate request-local fields before generating the one-time secret.
+	// Role validation stays in the transaction with the authorization recheck,
+	// so concurrent role/configuration changes cannot affect the created invite.
+	if roleKey == "" {
+		roleKey = memberRole
 	}
 	if uses <= 0 {
 		uses = 1
@@ -69,8 +67,29 @@ func (s *InviteService) Create(ctx context.Context, createdBy int64, role string
 	if err != nil {
 		return "", nil, err
 	}
-	inv, err := s.stores.Invites.Create(ctx, sha256Hex(code), role, uses, expiresAt, &createdBy)
+	unlock := s.principals.LockMutation(createdBy)
+	defer unlock()
+	tx, err := s.stores.BeginTx(ctx)
 	if err != nil {
+		return "", nil, err
+	}
+	defer tx.Rollback()
+	txStores := s.stores.WithTx(tx)
+	if err := requireServerPermission(ctx, txStores, createdBy, rbac.PermInviteManage); err != nil {
+		return "", nil, err
+	}
+	role, err := txStores.Roles.Get(ctx, roleKey)
+	if errors.Is(err, store.ErrNotFound) || roleKey == ownerRole {
+		return "", nil, ErrUnknownRole
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	inv, err := txStores.Invites.Create(ctx, sha256Hex(code), role.Key, uses, expiresAt, &createdBy)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return "", nil, err
 	}
 	return code, inv, nil
@@ -96,7 +115,15 @@ func (s *InviteService) List(ctx context.Context, limit, offset int64) ([]db.Inv
 	return s.stores.Invites.List(ctx, limit, offset)
 }
 
-// Delete removes an invite by ID, or returns ErrNotFound.
-func (s *InviteService) Delete(ctx context.Context, id int64) error {
-	return s.stores.Invites.Delete(ctx, id)
+// Delete removes an invite by ID after actorID is confirmed to still have
+// invite.manage in the write transaction.
+func (s *InviteService) Delete(ctx context.Context, actorID, id int64) error {
+	unlock := s.principals.LockMutation(actorID)
+	defer unlock()
+	return runTx(ctx, s.stores, func(tx *store.Stores) error {
+		if err := requireServerPermission(ctx, tx, actorID, rbac.PermInviteManage); err != nil {
+			return err
+		}
+		return tx.Invites.Delete(ctx, id)
+	})
 }

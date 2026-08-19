@@ -29,7 +29,6 @@ import (
 // middleware and every route.
 type App struct {
 	cfg        *config.App
-	roles      *config.Roles
 	conn       *sql.DB
 	stores     *store.Stores
 	principals *auth.PrincipalCache
@@ -45,10 +44,10 @@ type App struct {
 	logger     *slog.Logger
 }
 
-// New assembles the application from validated configuration and the role
-// configuration: it opens the database, applies the embedded schema, wires
-// every service and mounts all routes. Call Close when done.
-func New(cfg *config.App, roles *config.Roles, logger *slog.Logger) (*App, error) {
+// New assembles the application from validated configuration: it opens the
+// database, applies the embedded schema, seeds DB-backed RBAC, wires every
+// service and mounts all routes. Call Close when done.
+func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	if logger == nil {
 		return nil, errors.New("server: logger must not be nil")
 	}
@@ -71,11 +70,15 @@ func New(cfg *config.App, roles *config.Roles, logger *slog.Logger) (*App, error
 	}
 	now := func() int64 { return time.Now().UnixMilli() }
 	stores := store.New(conn, idGen, now)
+	if err := stores.SeedAndVerify(context.Background()); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("server: seed installation: %w", err)
+	}
 
 	principals := auth.NewPrincipalCache(stores, time.Minute)
 	secret := []byte(cfg.JWTSecret)
 	authSvc := auth.NewAuthService(stores, principals, secret, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, now)
-	register := auth.NewRegisterService(stores, roles, auth.RegistrationMode(cfg.RegistrationMode))
+	register := auth.NewRegisterService(stores, auth.RegistrationMode(cfg.RegistrationMode))
 	pres := presence.New(time.Now)
 	objects, err := oss.NewLocalObjectStorage(cfg.Storage.BaseDir, conn, now)
 	if err != nil {
@@ -83,8 +86,8 @@ func New(cfg *config.App, roles *config.Roles, logger *slog.Logger) (*App, error
 		return nil, fmt.Errorf("server: object storage: %w", err)
 	}
 	avatarSvc := image.NewAvatarService(stores.Users, objects, idGen, cfg.Avatar)
-	users := auth.NewUserService(stores, roles, principals, pres, avatarSvc)
-	invites := auth.NewInviteService(stores, roles, now)
+	users := auth.NewUserService(stores, principals, pres, avatarSvc)
+	invites := auth.NewInviteService(stores, principals, now)
 	activate := auth.NewActivationManager(stores)
 
 	// Do not let groups claim unmatched paths: an unknown route must surface
@@ -97,7 +100,6 @@ func New(cfg *config.App, roles *config.Roles, logger *slog.Logger) (*App, error
 
 	app := &App{
 		cfg:        cfg,
-		roles:      roles,
 		conn:       conn,
 		stores:     stores,
 		principals: principals,
@@ -131,7 +133,7 @@ func (a *App) Close() error {
 	return a.conn.Close()
 }
 
-// EnsureActivationCode makes sure a first-admin activation code exists. ok
+// EnsureActivationCode makes sure a first-owner activation code exists. ok
 // reports whether a code is pending; the plaintext is non-empty only on the
 // first call, because the manager keeps only the SHA-256 digest afterwards.
 // The caller must log the plaintext when it first appears.

@@ -83,7 +83,7 @@ const (
 	// this one (single-session-per-user semantics).
 	RevocationReplaced RevocationReason = 0x01
 	// RevocationRevoked means an admin action (kick/ban/delete) or losing
-	// voice:join revoked this session.
+	// the application revoked this session.
 	RevocationRevoked RevocationReason = 0x02
 )
 
@@ -431,7 +431,7 @@ func (m *Manager) SessionIDByUser(userID int64) ([16]byte, bool) {
 // InvalidateUser deletes every session registered to userID and returns how
 // many table entries were removed. Active sessions produce one
 // RevocationRevoked snapshot each; expired leftovers are removed silently.
-// Kick, ban, account deletion and losing voice:join all call this.
+// Kick, ban, account deletion and losing channel access all call this.
 func (m *Manager) InvalidateUser(userID int64) int {
 	m.mu.Lock()
 

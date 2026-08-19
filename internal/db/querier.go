@@ -12,36 +12,75 @@ import (
 type Querier interface {
 	BumpUserAuthVersion(ctx context.Context, arg BumpUserAuthVersionParams) error
 	ConsumeInvite(ctx context.Context, arg ConsumeInviteParams) (Invite, error)
-	CountUsersWithRole(ctx context.Context, role string) (int64, error)
+	CountOwners(ctx context.Context) (int64, error)
+	CountRoleReferences(ctx context.Context, roleKey string) (int64, error)
+	CreateChannel(ctx context.Context, arg CreateChannelParams) (Channel, error)
+	CreateChannelGroup(ctx context.Context, arg CreateChannelGroupParams) (ChannelGroup, error)
 	CreateInvite(ctx context.Context, arg CreateInviteParams) (Invite, error)
+	CreateRole(ctx context.Context, arg CreateRoleParams) (Role, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
+	DeleteChannel(ctx context.Context, id int64) (int64, error)
+	DeleteChannelPermissionConfig(ctx context.Context, channelID sql.NullInt64) (sql.NullInt64, error)
 	DeleteExpiredSessions(ctx context.Context, expiresAt int64) (int64, error)
+	DeleteGroupPermissionConfig(ctx context.Context, groupID sql.NullInt64) (sql.NullInt64, error)
 	DeleteInvite(ctx context.Context, id int64) (int64, error)
+	DeleteMute(ctx context.Context, id int64) (int64, error)
+	DeleteMutesForUser(ctx context.Context, userID int64) error
 	DeleteObject(ctx context.Context, arg DeleteObjectParams) error
+	DeleteRole(ctx context.Context, key string) (string, error)
+	DeleteRoleBinding(ctx context.Context, id int64) (int64, error)
+	DeleteServerRoleBindingsForUser(ctx context.Context, userID int64) error
 	DeleteSession(ctx context.Context, id int64) error
 	DeleteSessionByPrevTokenHash(ctx context.Context, prevTokenHash sql.NullString) (int64, error)
 	DeleteSessionByTokenHash(ctx context.Context, tokenHash string) error
 	DeleteUser(ctx context.Context, id int64) (int64, error)
-	DeleteUserRoles(ctx context.Context, userID int64) error
 	DeleteUserSessions(ctx context.Context, userID int64) error
-	ExistsAdminRole(ctx context.Context) (bool, error)
+	GetChannel(ctx context.Context, id int64) (Channel, error)
+	GetChannelGroup(ctx context.Context, id int64) (ChannelGroup, error)
+	GetChannelPermissionConfig(ctx context.Context, channelID sql.NullInt64) (ScopePermissionConfig, error)
+	GetGroupPermissionConfig(ctx context.Context, groupID sql.NullInt64) (ScopePermissionConfig, error)
+	GetInstallationState(ctx context.Context) (InstallationState, error)
 	GetInviteByCodeHash(ctx context.Context, arg GetInviteByCodeHashParams) (Invite, error)
+	GetMute(ctx context.Context, id int64) (ModerationMute, error)
 	GetObject(ctx context.Context, arg GetObjectParams) (Object, error)
-	GetRolesForUser(ctx context.Context, userID int64) ([]string, error)
+	GetOwnerBinding(ctx context.Context) (UserRoleBinding, error)
+	GetRoleBindingByID(ctx context.Context, id int64) (UserRoleBinding, error)
+	GetRoleByKey(ctx context.Context, key string) (Role, error)
+	GetServerPermissionConfig(ctx context.Context) (string, error)
+	GetServerPermissionConfigRow(ctx context.Context) (ScopePermissionConfig, error)
 	GetSessionByID(ctx context.Context, id int64) (Session, error)
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
 	GetUserByID(ctx context.Context, id int64) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
-	InsertUserRole(ctx context.Context, arg InsertUserRoleParams) error
+	InsertChannelAccess(ctx context.Context, arg InsertChannelAccessParams) (ChannelAccess, error)
+	InsertGroupAccess(ctx context.Context, arg InsertGroupAccessParams) (GroupAccess, error)
+	InsertMute(ctx context.Context, arg InsertMuteParams) (ModerationMute, error)
+	InsertRoleBinding(ctx context.Context, arg InsertRoleBindingParams) (UserRoleBinding, error)
+	ListChannelAccess(ctx context.Context, channelID int64) ([]ChannelAccess, error)
+	ListChannels(ctx context.Context) ([]Channel, error)
+	ListGroupAccess(ctx context.Context, groupID int64) ([]GroupAccess, error)
 	ListInvites(ctx context.Context, arg ListInvitesParams) ([]Invite, error)
+	ListMutesForUser(ctx context.Context, userID int64) ([]ModerationMute, error)
+	ListRoleBindings(ctx context.Context, arg ListRoleBindingsParams) ([]UserRoleBinding, error)
+	ListRoleBindingsForUser(ctx context.Context, userID int64) ([]UserRoleBinding, error)
+	ListRoles(ctx context.Context) ([]Role, error)
 	ListSessionsByUser(ctx context.Context, userID int64) ([]Session, error)
 	ListUsers(ctx context.Context, arg ListUsersParams) ([]User, error)
+	ListUsersWithRoleBindings(ctx context.Context) ([]int64, error)
 	RotateSession(ctx context.Context, arg RotateSessionParams) (Session, error)
+	SeedInstallationState(ctx context.Context) (int64, error)
+	SeedRole(ctx context.Context, arg SeedRoleParams) error
+	SeedServerPermissionConfig(ctx context.Context, arg SeedServerPermissionConfigParams) error
+	SetInstallationInitialized(ctx context.Context, arg SetInstallationInitializedParams) (int64, error)
 	SetUserAvatar(ctx context.Context, arg SetUserAvatarParams) (User, error)
 	SetUserBanned(ctx context.Context, arg SetUserBannedParams) error
 	SetUserPasswordHash(ctx context.Context, arg SetUserPasswordHashParams) (int64, error)
 	TouchUserLastLogin(ctx context.Context, arg TouchUserLastLoginParams) error
+	UpdateRole(ctx context.Context, arg UpdateRoleParams) (Role, error)
+	UpdateServerPermissionConfig(ctx context.Context, arg UpdateServerPermissionConfigParams) (ScopePermissionConfig, error)
 	UpdateUserNickname(ctx context.Context, arg UpdateUserNicknameParams) (User, error)
+	UpsertChannelPermissionConfig(ctx context.Context, arg UpsertChannelPermissionConfigParams) (ScopePermissionConfig, error)
+	UpsertGroupPermissionConfig(ctx context.Context, arg UpsertGroupPermissionConfigParams) (ScopePermissionConfig, error)
 	UpsertObject(ctx context.Context, arg UpsertObjectParams) (Object, error)
 	UpsertSession(ctx context.Context, arg UpsertSessionParams) (Session, error)
 }

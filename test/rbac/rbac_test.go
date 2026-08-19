@@ -18,94 +18,51 @@ func (s staticStore) PermissionsForRole(_ context.Context, role string) ([]rbac.
 	if s.err != nil {
 		return nil, false, s.err
 	}
-	perms, ok := s.permissions[role]
-	return perms, ok, nil
+	permissions, ok := s.permissions[role]
+	return permissions, ok, nil
 }
 
-func newTestAuthorizer() *rbac.Authorizer {
-	return rbac.NewAuthorizer(staticStore{permissions: map[string][]rbac.Permission{
-		"member": {rbac.PermVoiceJoin},
-		"admin":  {rbac.Wildcard},
+func principal(role string) rbac.Principal {
+	return rbac.Principal{UserID: 1, Bindings: []rbac.RoleBinding{{RoleKey: role, ScopeType: "server"}}}
+}
+
+func TestAuthorizerChecksServerBinding(t *testing.T) {
+	authz := rbac.NewAuthorizer(staticStore{permissions: map[string][]rbac.Permission{"member": {rbac.PermChannelCreateTemp}}})
+	if !authz.Check(context.Background(), principal("member"), rbac.PermChannelCreateTemp).Allow {
+		t.Fatal("member binding should grant channel.create_temporary")
+	}
+	if authz.Check(context.Background(), principal("member"), rbac.PermInviteManage).Allow {
+		t.Fatal("member binding must not grant invite.manage")
+	}
+}
+
+func TestAuthorizerIgnoresScopedBindingsForServerCheck(t *testing.T) {
+	authz := rbac.NewAuthorizer(staticStore{permissions: map[string][]rbac.Permission{"admin": {rbac.PermInviteManage}}})
+	p := rbac.Principal{UserID: 1, Bindings: []rbac.RoleBinding{{RoleKey: "admin", ScopeType: "group"}}}
+	if authz.Check(context.Background(), p, rbac.PermInviteManage).Allow {
+		t.Fatal("group binding must not grant a server permission")
+	}
+}
+
+func TestAuthorizerWildcardAndErrors(t *testing.T) {
+	wildcard := rbac.NewAuthorizer(staticStore{permissions: map[string][]rbac.Permission{"owner": {rbac.Wildcard}}})
+	if !wildcard.Check(context.Background(), principal("owner"), rbac.PermServerManage).Allow {
+		t.Fatal("wildcard should grant every permission")
+	}
+	broken := rbac.NewAuthorizer(staticStore{err: errors.New("boom")})
+	if broken.Check(context.Background(), principal("owner"), rbac.PermServerManage).Allow {
+		t.Fatal("lookup error must deny")
+	}
+}
+
+func TestPermissionsSortedAndDeduplicated(t *testing.T) {
+	authz := rbac.NewAuthorizer(staticStore{permissions: map[string][]rbac.Permission{
+		"a": {rbac.PermUserRead, rbac.PermInviteManage},
+		"b": {rbac.PermInviteManage},
 	}})
-}
-
-func TestCheckAllowed(t *testing.T) {
-	authz := newTestAuthorizer()
-	d := authz.Check(context.Background(), rbac.Principal{UserID: 1, Roles: []string{"member"}}, rbac.PermVoiceJoin)
-	if !d.Allow {
-		t.Fatalf("want allowed, got %+v", d)
-	}
-	if d.Reason != "allowed" {
-		t.Fatalf("unexpected reason: %q", d.Reason)
-	}
-}
-
-func TestCheckDenied(t *testing.T) {
-	authz := newTestAuthorizer()
-	d := authz.Check(context.Background(), rbac.Principal{UserID: 1, Roles: []string{"member"}}, rbac.PermUserRead)
-	if d.Allow {
-		t.Fatal("member must not read users")
-	}
-	if d.Reason != "denied: missing permission user:read" {
-		t.Fatalf("unexpected reason: %q", d.Reason)
-	}
-}
-
-func TestCheckDeniesUnknownRole(t *testing.T) {
-	authz := newTestAuthorizer()
-	d := authz.Check(context.Background(), rbac.Principal{UserID: 1, Roles: []string{"ghost"}}, rbac.PermVoiceJoin)
-	if d.Allow {
-		t.Fatal("unknown role must be denied")
-	}
-}
-
-func TestCheckDeniesNoRoles(t *testing.T) {
-	authz := newTestAuthorizer()
-	d := authz.Check(context.Background(), rbac.Principal{UserID: 1}, rbac.PermVoiceJoin)
-	if d.Allow {
-		t.Fatal("principal without roles must be denied")
-	}
-}
-
-func TestCheckWildcardGrantsEverything(t *testing.T) {
-	authz := newTestAuthorizer()
-	for _, perm := range rbac.AllPermissions {
-		d := authz.Check(context.Background(), rbac.Principal{UserID: 1, Roles: []string{"admin"}}, perm)
-		if !d.Allow {
-			t.Fatalf("admin must be allowed %q, got %+v", perm, d)
-		}
-	}
-}
-
-func TestCheckDeniesOnStoreError(t *testing.T) {
-	authz := rbac.NewAuthorizer(staticStore{err: errors.New("boom")})
-	d := authz.Check(context.Background(), rbac.Principal{UserID: 1, Roles: []string{"member"}}, rbac.PermVoiceJoin)
-	if d.Allow {
-		t.Fatal("store error must deny")
-	}
-	if d.Reason != "denied: permission lookup failed" {
-		t.Fatalf("unexpected reason: %q", d.Reason)
-	}
-}
-
-func TestPermissionsDeduplicatesAndSorts(t *testing.T) {
-	authz := newTestAuthorizer()
-	perms, err := authz.Permissions(context.Background(), rbac.Principal{UserID: 1, Roles: []string{"member", "member"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(perms, []rbac.Permission{rbac.PermVoiceJoin}) {
-		t.Fatalf("unexpected permissions: %v", perms)
-	}
-}
-
-func TestPermissionsWithWildcardRole(t *testing.T) {
-	authz := newTestAuthorizer()
-	perms, err := authz.Permissions(context.Background(), rbac.Principal{UserID: 1, Roles: []string{"admin"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(perms, []rbac.Permission{rbac.Wildcard}) {
-		t.Fatalf("unexpected permissions: %v", perms)
+	p := rbac.Principal{UserID: 1, Bindings: []rbac.RoleBinding{{RoleKey: "a", ScopeType: "server"}, {RoleKey: "b", ScopeType: "server"}}}
+	perms, err := authz.Permissions(context.Background(), p)
+	if err != nil || !reflect.DeepEqual(perms, []rbac.Permission{rbac.PermInviteManage, rbac.PermUserRead}) {
+		t.Fatalf("permissions = %v, err = %v", perms, err)
 	}
 }

@@ -27,7 +27,6 @@ func main() {
 // run loads configuration and starts the server process.
 func run() error {
 	appConfigPath := flag.String("config", "config/zephyr.toml", "path to zephyr.toml (generated on first start)")
-	rolesPath := flag.String("roles", "config/roles.yaml", "path to roles.yaml (generated on first start)")
 	forceRegenerateCert := flag.Bool("force-regenerate-cert", false,
 		"regenerate the auto-generated self-signed certificate on startup (auto mode only)")
 	flag.Parse()
@@ -36,11 +35,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	roles, err := config.LoadRoles(*rolesPath)
-	if err != nil {
-		return err
-	}
-
 	logger, cleanup, err := newLogger(appConfig.Log)
 	if err != nil {
 		return err
@@ -49,7 +43,7 @@ func run() error {
 	slog.SetDefault(logger)
 	log := slog.With("module", "main")
 
-	app, err := server.New(appConfig, roles, logger)
+	app, err := server.New(appConfig, logger)
 	if err != nil {
 		return err
 	}
@@ -65,9 +59,9 @@ func run() error {
 	if pending {
 		// The plaintext is available exactly once: after this log line only
 		// its digest remains in memory.
-		log.Info("first admin activation required code: " + code)
+		log.Info("first owner activation required code: " + code)
 	} else {
-		log.Info("admin already exists; first-admin activation is disabled")
+		log.Info("installation initialized; first-owner activation is disabled")
 	}
 
 	addr := appConfig.Server.Host + ":" + strconv.Itoa(appConfig.Server.HTTPPort)
