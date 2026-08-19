@@ -104,6 +104,45 @@ func (q *Queries) InsertMute(ctx context.Context, arg InsertMuteParams) (Moderat
 	return i, err
 }
 
+const listAllMutes = `-- name: ListAllMutes :many
+SELECT id, scope_type, group_id, channel_id, user_id, kind, expires_at, created_by, reason, created_at, version FROM moderation_mutes ORDER BY id
+`
+
+func (q *Queries) ListAllMutes(ctx context.Context) ([]ModerationMute, error) {
+	rows, err := q.db.QueryContext(ctx, listAllMutes)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ModerationMute
+	for rows.Next() {
+		var i ModerationMute
+		if err := rows.Scan(
+			&i.ID,
+			&i.ScopeType,
+			&i.GroupID,
+			&i.ChannelID,
+			&i.UserID,
+			&i.Kind,
+			&i.ExpiresAt,
+			&i.CreatedBy,
+			&i.Reason,
+			&i.CreatedAt,
+			&i.Version,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listMutesForUser = `-- name: ListMutesForUser :many
 SELECT id, scope_type, group_id, channel_id, user_id, kind, expires_at, created_by, reason, created_at, version FROM moderation_mutes WHERE user_id = ? ORDER BY id
 `

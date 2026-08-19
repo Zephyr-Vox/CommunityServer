@@ -160,6 +160,42 @@ func (q *Queries) GetChannelGroup(ctx context.Context, id int64) (ChannelGroup, 
 	return i, err
 }
 
+const listChannelGroups = `-- name: ListChannelGroups :many
+SELECT id, name, position, visibility, created_at, updated_at, version FROM channel_groups
+ORDER BY position, created_at, id
+`
+
+func (q *Queries) ListChannelGroups(ctx context.Context) ([]ChannelGroup, error) {
+	rows, err := q.db.QueryContext(ctx, listChannelGroups)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChannelGroup
+	for rows.Next() {
+		var i ChannelGroup
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Position,
+			&i.Visibility,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Version,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listChannels = `-- name: ListChannels :many
 SELECT id, group_id, name, mode, "temporary", visibility, capacity, position, pinned, created_by, created_at, updated_at, version FROM channels
 ORDER BY position, created_at, id

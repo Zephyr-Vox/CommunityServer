@@ -71,6 +71,16 @@ func (s *ConfigStore) Channel(ctx context.Context, channelID int64) (*db.ScopePe
 	return &config, nil
 }
 
+// ListAll returns every local permission configuration in deterministic scope
+// order for an internal state projection.
+func (s *ConfigStore) ListAll(ctx context.Context) ([]db.ScopePermissionConfig, error) {
+	configs, err := s.q.ListPermissionConfigs(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return configs, nil
+}
+
 // PutGroup stores a local group config snapshot.
 func (s *ConfigStore) PutGroup(ctx context.Context, groupID int64, config string, version, now int64) (*db.ScopePermissionConfig, error) {
 	config, err := s.normalize(ctx, "group", config)

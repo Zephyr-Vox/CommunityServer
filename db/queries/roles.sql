@@ -54,6 +54,9 @@ ORDER BY scope_type, group_id, channel_id, role_key;
 -- name: ListRoleBindings :many
 SELECT * FROM user_role_bindings ORDER BY id LIMIT ? OFFSET ?;
 
+-- name: ListAllRoleBindings :many
+SELECT * FROM user_role_bindings ORDER BY id;
+
 -- name: ListUsersWithRoleBindings :many
 SELECT DISTINCT user_id FROM user_role_bindings ORDER BY user_id;
 

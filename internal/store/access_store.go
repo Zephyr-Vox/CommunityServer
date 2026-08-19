@@ -51,6 +51,16 @@ func (s *AccessStore) ListGroup(ctx context.Context, groupID int64) ([]db.GroupA
 	return entries, nil
 }
 
+// ListAllGroups returns every group ACL entry in ascending ID order for an
+// internal state projection.
+func (s *AccessStore) ListAllGroups(ctx context.Context) ([]db.GroupAccess, error) {
+	entries, err := s.q.ListAllGroupAccess(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return entries, nil
+}
+
 // AddChannel inserts a channel ACL entry. The database validates the
 // principal shape and uniqueness.
 func (s *AccessStore) AddChannel(ctx context.Context, channelID int64, principal AccessPrincipal) (*db.ChannelAccess, error) {
@@ -75,6 +85,16 @@ func (s *AccessStore) AddChannel(ctx context.Context, channelID int64, principal
 // ListChannel returns all ACL entries for a channel.
 func (s *AccessStore) ListChannel(ctx context.Context, channelID int64) ([]db.ChannelAccess, error) {
 	entries, err := s.q.ListChannelAccess(ctx, channelID)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return entries, nil
+}
+
+// ListAllChannels returns every channel ACL entry in ascending ID order for
+// an internal state projection.
+func (s *AccessStore) ListAllChannels(ctx context.Context) ([]db.ChannelAccess, error) {
+	entries, err := s.q.ListAllChannelAccess(ctx)
 	if err != nil {
 		return nil, mapError(err)
 	}

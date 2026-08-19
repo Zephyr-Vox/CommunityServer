@@ -152,6 +152,16 @@ func (s *UserStore) ListUsers(ctx context.Context, limit, offset int64) ([]db.Us
 	return users, nil
 }
 
+// ListAll returns every user in ascending ID order for a consistent internal
+// state projection. HTTP pagination must use ListUsers instead.
+func (s *UserStore) ListAll(ctx context.Context) ([]db.User, error) {
+	users, err := s.q.ListAllUsers(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return users, nil
+}
+
 // Delete removes a user row. Sessions and role bindings cascade; invites the
 // user created remain with created_by set to NULL.
 func (s *UserStore) Delete(ctx context.Context, id int64) error {

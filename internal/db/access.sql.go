@@ -84,6 +84,74 @@ func (q *Queries) InsertGroupAccess(ctx context.Context, arg InsertGroupAccessPa
 	return i, err
 }
 
+const listAllChannelAccess = `-- name: ListAllChannelAccess :many
+SELECT id, channel_id, principal_type, user_id, role_key, created_at FROM channel_access ORDER BY id
+`
+
+func (q *Queries) ListAllChannelAccess(ctx context.Context) ([]ChannelAccess, error) {
+	rows, err := q.db.QueryContext(ctx, listAllChannelAccess)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChannelAccess
+	for rows.Next() {
+		var i ChannelAccess
+		if err := rows.Scan(
+			&i.ID,
+			&i.ChannelID,
+			&i.PrincipalType,
+			&i.UserID,
+			&i.RoleKey,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAllGroupAccess = `-- name: ListAllGroupAccess :many
+SELECT id, group_id, principal_type, user_id, role_key, created_at FROM group_access ORDER BY id
+`
+
+func (q *Queries) ListAllGroupAccess(ctx context.Context) ([]GroupAccess, error) {
+	rows, err := q.db.QueryContext(ctx, listAllGroupAccess)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GroupAccess
+	for rows.Next() {
+		var i GroupAccess
+		if err := rows.Scan(
+			&i.ID,
+			&i.GroupID,
+			&i.PrincipalType,
+			&i.UserID,
+			&i.RoleKey,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listChannelAccess = `-- name: ListChannelAccess :many
 SELECT id, channel_id, principal_type, user_id, role_key, created_at FROM channel_access WHERE channel_id = ? ORDER BY id
 `

@@ -228,6 +228,41 @@ func (q *Queries) InsertRoleBinding(ctx context.Context, arg InsertRoleBindingPa
 	return i, err
 }
 
+const listAllRoleBindings = `-- name: ListAllRoleBindings :many
+SELECT id, user_id, role_key, scope_type, group_id, channel_id, created_at FROM user_role_bindings ORDER BY id
+`
+
+func (q *Queries) ListAllRoleBindings(ctx context.Context) ([]UserRoleBinding, error) {
+	rows, err := q.db.QueryContext(ctx, listAllRoleBindings)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []UserRoleBinding
+	for rows.Next() {
+		var i UserRoleBinding
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RoleKey,
+			&i.ScopeType,
+			&i.GroupID,
+			&i.ChannelID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRoleBindings = `-- name: ListRoleBindings :many
 SELECT id, user_id, role_key, scope_type, group_id, channel_id, created_at FROM user_role_bindings ORDER BY id LIMIT ? OFFSET ?
 `

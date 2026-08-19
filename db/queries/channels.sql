@@ -7,6 +7,10 @@ RETURNING *;
 -- name: GetChannelGroup :one
 SELECT * FROM channel_groups WHERE id = ?;
 
+-- name: ListChannelGroups :many
+SELECT * FROM channel_groups
+ORDER BY position, created_at, id;
+
 -- name: CreateChannel :one
 INSERT INTO channels
     (id, group_id, name, mode, temporary, visibility, capacity, position,

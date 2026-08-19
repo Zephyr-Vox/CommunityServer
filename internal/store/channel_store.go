@@ -45,6 +45,15 @@ func (s *ChannelStore) GetGroup(ctx context.Context, id int64) (*db.ChannelGroup
 	return &group, nil
 }
 
+// ListGroups returns all channel groups in stable display order.
+func (s *ChannelStore) ListGroups(ctx context.Context) ([]db.ChannelGroup, error) {
+	groups, err := s.q.ListChannelGroups(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return groups, nil
+}
+
 // Create creates a version-one channel. The schema enforces mode, lifecycle,
 // capacity, visibility and parent foreign-key invariants.
 func (s *ChannelStore) Create(ctx context.Context, input ChannelInput) (*db.Channel, error) {

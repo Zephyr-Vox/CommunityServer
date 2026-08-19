@@ -93,6 +93,41 @@ func (q *Queries) GetServerPermissionConfigRow(ctx context.Context) (ScopePermis
 	return i, err
 }
 
+const listPermissionConfigs = `-- name: ListPermissionConfigs :many
+SELECT scope_type, group_id, channel_id, config, updated_at, version FROM scope_permission_configs
+ORDER BY scope_type, group_id, channel_id
+`
+
+func (q *Queries) ListPermissionConfigs(ctx context.Context) ([]ScopePermissionConfig, error) {
+	rows, err := q.db.QueryContext(ctx, listPermissionConfigs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ScopePermissionConfig
+	for rows.Next() {
+		var i ScopePermissionConfig
+		if err := rows.Scan(
+			&i.ScopeType,
+			&i.GroupID,
+			&i.ChannelID,
+			&i.Config,
+			&i.UpdatedAt,
+			&i.Version,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateServerPermissionConfig = `-- name: UpdateServerPermissionConfig :one
 UPDATE scope_permission_configs
 SET config = ?,

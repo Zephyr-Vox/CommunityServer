@@ -144,6 +144,17 @@ func (s *RoleStore) ListAllBindings(ctx context.Context, limit, offset int64) ([
 	return bindings, nil
 }
 
+// ListEveryBinding returns every role binding in ascending ID order for a
+// consistent internal state projection. Management pagination must use
+// ListAllBindings instead.
+func (s *RoleStore) ListEveryBinding(ctx context.Context) ([]db.UserRoleBinding, error) {
+	bindings, err := s.q.ListAllRoleBindings(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return bindings, nil
+}
+
 // ListUsersWithBindings returns every user ID that currently has at least one
 // role binding. Permission-config mutations invalidate these principal caches.
 func (s *RoleStore) ListUsersWithBindings(ctx context.Context) ([]int64, error) {

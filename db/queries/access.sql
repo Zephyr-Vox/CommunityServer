@@ -7,6 +7,9 @@ RETURNING *;
 -- name: ListGroupAccess :many
 SELECT * FROM group_access WHERE group_id = ? ORDER BY id;
 
+-- name: ListAllGroupAccess :many
+SELECT * FROM group_access ORDER BY id;
+
 -- name: InsertChannelAccess :one
 INSERT INTO channel_access
     (id, channel_id, principal_type, user_id, role_key, created_at)
@@ -15,3 +18,6 @@ RETURNING *;
 
 -- name: ListChannelAccess :many
 SELECT * FROM channel_access WHERE channel_id = ? ORDER BY id;
+
+-- name: ListAllChannelAccess :many
+SELECT * FROM channel_access ORDER BY id;

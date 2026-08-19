@@ -46,5 +46,9 @@ SELECT * FROM users
 ORDER BY created_at DESC
 LIMIT ? OFFSET ?;
 
+-- name: ListAllUsers :many
+SELECT * FROM users
+ORDER BY id;
+
 -- name: DeleteUser :one
 DELETE FROM users WHERE id = ? RETURNING id;

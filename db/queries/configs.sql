@@ -18,6 +18,10 @@ WHERE scope_type = 'group' AND group_id = ?;
 SELECT * FROM scope_permission_configs
 WHERE scope_type = 'channel' AND channel_id = ?;
 
+-- name: ListPermissionConfigs :many
+SELECT * FROM scope_permission_configs
+ORDER BY scope_type, group_id, channel_id;
+
 -- name: UpsertGroupPermissionConfig :one
 INSERT INTO scope_permission_configs
     (scope_type, group_id, config, updated_at, version)

@@ -16,3 +16,6 @@ DELETE FROM moderation_mutes WHERE user_id = ?;
 
 -- name: ListMutesForUser :many
 SELECT * FROM moderation_mutes WHERE user_id = ? ORDER BY id;
+
+-- name: ListAllMutes :many
+SELECT * FROM moderation_mutes ORDER BY id;

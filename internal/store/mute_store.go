@@ -75,3 +75,13 @@ func (s *MuteStore) ListForUser(ctx context.Context, userID int64) ([]db.Moderat
 	}
 	return mutes, nil
 }
+
+// ListAll returns every persisted mute in ascending ID order for an internal
+// state projection.
+func (s *MuteStore) ListAll(ctx context.Context) ([]db.ModerationMute, error) {
+	mutes, err := s.q.ListAllMutes(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return mutes, nil
+}
