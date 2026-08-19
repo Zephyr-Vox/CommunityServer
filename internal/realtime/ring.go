@@ -16,6 +16,12 @@ const (
 	MaxStateRingBytes = 16 << 20
 	// MaxStateEventBytes is the fixed encoded size limit for one state event.
 	MaxStateEventBytes = 192 << 10
+	// MaxStateEventCursorBytes bounds an opaque cursor issued by CursorSigner.
+	// Ring entries omit that recipient-specific field, so this space is reserved
+	// before an event enters the ring.
+	MaxStateEventCursorBytes      = 256
+	stateEventCursorEnvelopeBytes = len(`,"cursor":""`)
+	maxStateEventRingBytes        = MaxStateEventBytes - MaxStateEventCursorBytes - stateEventCursorEnvelopeBytes
 )
 
 var (
@@ -59,6 +65,23 @@ type StateEvent struct {
 // returned bytes do not include a cursor and are safe for the caller to retain.
 func (e StateEvent) Encoded() []byte {
 	return append([]byte(nil), e.encoded...)
+}
+
+// EncodedWithCursor returns the final recipient event envelope for cursor. It
+// checks the wire size again after adding the required cursor field, preventing
+// an otherwise valid ring entry from exceeding the protocol event limit.
+func (e StateEvent) EncodedWithCursor(cursor string) ([]byte, error) {
+	if !validStateEventCursor(cursor) {
+		return nil, ErrInvalidStateEvent
+	}
+	encoded, err := json.Marshal(stateEventEnvelopeFromEvent(e, cursor))
+	if err != nil {
+		return nil, fmt.Errorf("realtime: encode state event: %w", err)
+	}
+	if len(encoded) > MaxStateEventBytes {
+		return nil, ErrStateEventTooLarge
+	}
+	return encoded, nil
 }
 
 // Size returns the byte count used by e in the state ring.
@@ -205,7 +228,7 @@ func (r *StateRing) validateAppendLocked(events []StateEvent) ([]StateEvent, err
 		if err != nil {
 			return nil, err
 		}
-		if len(normalized.encoded) > MaxStateEventBytes || len(normalized.encoded) > r.maxBytes {
+		if len(normalized.encoded) > maxStateEventRingBytes || len(normalized.encoded) > r.maxBytes {
 			return nil, ErrStateEventTooLarge
 		}
 		prepared[i] = normalized
@@ -241,7 +264,7 @@ func normalizeStateEvent(event StateEvent) (StateEvent, error) {
 		return StateEvent{}, ErrInvalidStateEvent
 	}
 	event.Data = append(json.RawMessage(nil), event.Data...)
-	encoded, err := json.Marshal(stateEventEnvelopeFromEvent(event))
+	encoded, err := json.Marshal(stateEventEnvelopeFromEvent(event, ""))
 	if err != nil {
 		return StateEvent{}, fmt.Errorf("realtime: encode state event: %w", err)
 	}
@@ -249,10 +272,12 @@ func normalizeStateEvent(event StateEvent) (StateEvent, error) {
 	return event, nil
 }
 
-// stateEventEnvelope is the cursor-free JSON form retained in the ring.
+// stateEventEnvelope is the event form retained in the ring without Cursor and
+// serialized for a recipient with Cursor.
 type stateEventEnvelope struct {
 	Type        string          `json:"type"`
 	GEID        string          `json:"geid"`
+	Cursor      string          `json:"cursor,omitempty"`
 	Class       string          `json:"class"`
 	Scope       eventScope      `json:"scope"`
 	EventType   string          `json:"event_type"`
@@ -261,12 +286,12 @@ type stateEventEnvelope struct {
 	Data        json.RawMessage `json:"data"`
 }
 
-// stateEventEnvelopeFromEvent creates the canonical cursor-free envelope for
-// event retained by the ring.
-func stateEventEnvelopeFromEvent(event StateEvent) stateEventEnvelope {
+// stateEventEnvelopeFromEvent creates the canonical event envelope for event.
+func stateEventEnvelopeFromEvent(event StateEvent, cursor string) stateEventEnvelope {
 	return stateEventEnvelope{
 		Type:        "state.event",
 		GEID:        strconv.FormatUint(event.GEID, 10),
+		Cursor:      cursor,
 		Class:       "state",
 		Scope:       stateEventScope(event.Scope),
 		EventType:   event.EventType,
@@ -274,6 +299,21 @@ func stateEventEnvelopeFromEvent(event StateEvent) stateEventEnvelope {
 		ServerTime:  event.ServerTime,
 		Data:        event.Data,
 	}
+}
+
+// validStateEventCursor accepts the base64url cursor grammar whose bounded
+// encoded length was reserved when the cursor-free event entered the ring.
+func validStateEventCursor(cursor string) bool {
+	if cursor == "" || len(cursor) > MaxStateEventCursorBytes {
+		return false
+	}
+	for _, character := range cursor {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // eventScope keeps IDs in the protocol's decimal-string representation.

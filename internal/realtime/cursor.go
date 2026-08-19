@@ -98,7 +98,11 @@ func (s *CursorSigner) Issue(userID int64, checkpoint Checkpoint, visibilityEpoc
 	_, _ = mac.Write(payload)
 	signature := mac.Sum(nil)
 	token := append(payload, signature...)
-	return base64.RawURLEncoding.EncodeToString(token), nil
+	encoded := base64.RawURLEncoding.EncodeToString(token)
+	if len(encoded) > MaxStateEventCursorBytes {
+		return "", ErrInvalidCursor
+	}
+	return encoded, nil
 }
 
 // Parse validates token for userID and returns its authenticated cursor fields.

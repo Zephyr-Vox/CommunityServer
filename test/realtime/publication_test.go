@@ -1,6 +1,7 @@
 package realtime_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -164,6 +165,50 @@ func TestStateRingEnforcesByteRetentionAndSingleEventLimit(t *testing.T) {
 	tooLarge.Data = []byte(`"` + strings.Repeat("x", realtime.MaxStateEventBytes) + `"`)
 	if err := ring.Append([]realtime.StateEvent{tooLarge}); !errors.Is(err, realtime.ErrStateEventTooLarge) {
 		t.Fatalf("oversized state event = %v", err)
+	}
+}
+
+func TestStateRingReservesCursorEnvelopeSpace(t *testing.T) {
+	signer, err := realtime.NewCursorSignerWithKey(testEpoch, bytes.Repeat([]byte{0x5a}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := signer.Issue(int64(^uint64(0)>>1), realtime.Checkpoint{StreamEpoch: testEpoch, GEID: ^uint64(0)}, ^uint64(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	low, high := 0, realtime.MaxStateEventBytes
+	var largest realtime.StateEvent
+	for low <= high {
+		middle := low + (high-low)/2
+		ring, err := realtime.NewStateRingWithLimits(1, realtime.MaxStateRingBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		event := realtime.StateEvent{
+			GEID:      1,
+			EventType: "server.updated",
+			Scope:     realtime.Scope{Type: "server"},
+			Data:      []byte(`"` + strings.Repeat("x", middle) + `"`),
+		}
+		if err := ring.Append([]realtime.StateEvent{event}); err != nil {
+			high = middle - 1
+			continue
+		}
+		events, _ := ring.Snapshot()
+		largest = events[0]
+		low = middle + 1
+	}
+	if largest.Size() == 0 {
+		t.Fatal("did not find a cursor-safe state event")
+	}
+	encoded, err := largest.EncodedWithCursor(cursor)
+	if err != nil || len(encoded) > realtime.MaxStateEventBytes {
+		t.Fatalf("final cursor envelope bytes=%d err=%v", len(encoded), err)
+	}
+	if largest.Size() >= realtime.MaxStateEventBytes {
+		t.Fatalf("ring failed to reserve cursor bytes: %d", largest.Size())
 	}
 }
 
