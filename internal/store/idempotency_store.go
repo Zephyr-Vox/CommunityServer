@@ -25,7 +25,15 @@ var (
 	// ErrInvalidIdempotencyRecord is returned when a caller tries to persist a
 	// result that cannot be safely replayed as a canonical HTTP command result.
 	ErrInvalidIdempotencyRecord = errors.New("store: invalid idempotency record")
-	idempotencyKeyRE            = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
+	// ErrCommandIdempotencyFull is returned when every durable retry slot is
+	// still inside its required retention window. Callers must roll back the
+	// enclosing mutation and return the protocol's global-capacity failure.
+	ErrCommandIdempotencyFull = errors.New("store: command idempotency capacity full")
+	// ErrCommandIdempotencyAdmission is returned when Save is not preceded by
+	// transaction-local Admit or when one transaction attempts multiple command
+	// records. A transaction represents exactly one sequenced durable command.
+	ErrCommandIdempotencyAdmission = errors.New("store: command idempotency admission required")
+	idempotencyKeyRE               = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
 )
 
 // IdempotencyHeaders contains the only resource response headers retained for
@@ -58,12 +66,14 @@ type CommandIdempotencyRecord struct {
 }
 
 // IdempotencyStore provides durable completed-command lookup and persistence.
-// Save requires a transaction-bound store so callers write the result inside
-// the same transaction as the domain mutation it makes replay-safe.
+// Admit and Save require a transaction-bound store so callers reserve capacity
+// before, then write the result inside, the domain mutation transaction.
 type IdempotencyStore struct {
 	q             *db.Queries
 	now           func() int64
 	transactional bool
+	admitted      bool
+	saved         bool
 }
 
 // Lookup returns a non-expired completed record for one principal and key, or
@@ -84,12 +94,12 @@ func (s *IdempotencyStore) Lookup(ctx context.Context, principalID int64, idempo
 	return commandIdempotencyRecordFromDB(row)
 }
 
-// Save prunes expired records, evicts enough oldest records to retain the hard
-// global cap, then stores record. The caller must use Stores.WithTx so this
-// insert rolls back with an unsuccessful domain mutation.
-func (s *IdempotencyStore) Save(ctx context.Context, record CommandIdempotencyRecord) error {
-	if !s.transactional {
-		return ErrInvalidIdempotencyRecord
+// Admit prunes expired records and reserves this transaction's one durable
+// command slot before the domain mutation begins. It never evicts a valid
+// 24-hour result; a full window returns ErrCommandIdempotencyFull.
+func (s *IdempotencyStore) Admit(ctx context.Context) error {
+	if !s.transactional || s.admitted || s.saved {
+		return ErrCommandIdempotencyAdmission
 	}
 	now := s.now()
 	if _, err := s.q.DeleteExpiredCommandIdempotency(ctx, now); err != nil {
@@ -100,10 +110,20 @@ func (s *IdempotencyStore) Save(ctx context.Context, record CommandIdempotencyRe
 		return mapError(err)
 	}
 	if count >= MaxCommandIdempotencyRecords {
-		if _, err := s.q.DeleteOldestCommandIdempotency(ctx, count-MaxCommandIdempotencyRecords+1); err != nil {
-			return mapError(err)
-		}
+		return ErrCommandIdempotencyFull
 	}
+	s.admitted = true
+	return nil
+}
+
+// Save stores record in a transaction previously admitted by Admit. The caller
+// must persist the exact final checkpoint and cursor returned by a publication
+// reservation before committing the transaction that contains its mutation.
+func (s *IdempotencyStore) Save(ctx context.Context, record CommandIdempotencyRecord) error {
+	if !s.transactional || !s.admitted || s.saved {
+		return ErrCommandIdempotencyAdmission
+	}
+	now := s.now()
 	if record.CreatedAt == 0 {
 		record.CreatedAt = now
 	}
@@ -133,6 +153,7 @@ func (s *IdempotencyStore) Save(ctx context.Context, record CommandIdempotencyRe
 	}); err != nil {
 		return mapError(err)
 	}
+	s.saved = true
 	return nil
 }
 

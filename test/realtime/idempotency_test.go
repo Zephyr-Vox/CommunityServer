@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/realtime"
+	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/store"
 )
 
@@ -49,7 +52,11 @@ func TestDurableIdempotencyCanonicalReplayAndEpochChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := durable.Save(ctx, stores.WithTx(tx), identity, key, result); err != nil {
+	txStores := stores.WithTx(tx)
+	if err := durable.Admit(ctx, txStores); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.Save(ctx, txStores, identity, key, result); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -86,7 +93,11 @@ func TestDurableIdempotencyCanonicalReplayAndEpochChange(t *testing.T) {
 	}
 	rolledBack := result
 	rolledBack.CommandID = 43
-	if err := durable.Save(ctx, stores.WithTx(tx), identity, rollbackKey, rolledBack); err != nil {
+	txStores = stores.WithTx(tx)
+	if err := durable.Admit(ctx, txStores); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.Save(ctx, txStores, identity, rollbackKey, rolledBack); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Rollback(); err != nil {
@@ -104,7 +115,11 @@ func TestDurableIdempotencyCanonicalReplayAndEpochChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := durable.Save(ctx, stores.WithTx(tx), identity, "durable-command-3", noContent); err != nil {
+	txStores = stores.WithTx(tx)
+	if err := durable.Admit(ctx, txStores); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.Save(ctx, txStores, identity, "durable-command-3", noContent); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -176,6 +191,191 @@ func TestRuntimeIdempotencyCacheCoalescesExpiresAndCapsPerUser(t *testing.T) {
 	oldest, err := cache.Claim(1, "runtime-key-0000", requestHMAC)
 	if err != nil || !oldest.Owner() {
 		t.Fatalf("oldest completed entry was not evicted: owner=%t err=%v", oldest != nil && oldest.Owner(), err)
+	}
+}
+
+func TestSequencerPersistsReservedResultWithDomainTransaction(t *testing.T) {
+	ctx := context.Background()
+	stores := newStores(t)
+	user, err := stores.Users.CreateUser(ctx, "alice", "hash", "Alice", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := realtime.NewStateStoreWithEpoch(ctx, stores, testEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := realtime.NewStatePublication(state, realtime.NewStateRing(), realtime.NewVisibilityResolver(), func() int64 { return 123 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fatal := make(chan error, 1)
+	sequencer, err := realtime.NewPostCommitSequencer(publication, idGen, func(err error) { fatal <- err })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sequencer.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	cursorSigner, err := realtime.NewCursorSignerWithKey(testEpoch, []byte(strings.Repeat("c", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestSigner, err := realtime.NewRequestIdentitySigner([]byte(strings.Repeat("s", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable, err := realtime.NewDurableIdempotency(stores, requestSigner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := realtime.HTTPCommandIdentity{
+		PrincipalID:   user.ID,
+		Method:        "POST",
+		RouteTemplate: "/api/v0/groups",
+		CanonicalDTO:  []byte(`{"name":"Reserved"}`),
+	}
+	key := "reserved-result-01"
+
+	completion, err := sequencer.Submit(ctx, realtime.PostCommitCommand{
+		QueueBytes: 1,
+		Execute: func(ctx context.Context, commandID int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+			tx, err := stores.BeginTx(ctx)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			committed := false
+			defer func() {
+				if !committed {
+					_ = tx.Rollback()
+				}
+			}()
+			txStores := stores.WithTx(tx)
+			if err := durable.Admit(ctx, txStores); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			group, err := txStores.Channels.CreateGroup(ctx, "Reserved", 1, "public")
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			candidate, err := state.BuildPersistentCandidateFrom(ctx, txStores)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			reserved, err := execution.Reserve(realtime.PublicationRequest{
+				Candidate: candidate,
+				Events: []realtime.StateEventTemplate{{
+					EventType: "group.created",
+					Scope:     realtime.Scope{Type: "server"},
+					Data:      []byte(fmt.Sprintf(`{"group_id":"%d"}`, group.ID)),
+				}},
+			})
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			cursor, err := cursorSigner.Issue(user.ID, reserved.Checkpoint, reserved.Version.VisibilityEpoch(user.ID))
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			if err := durable.Save(ctx, txStores, identity, key, realtime.CanonicalCommandResult{
+				CommandID:   commandID,
+				Status:      201,
+				Body:        []byte(fmt.Sprintf(`{"group":{"id":"%d","name":"Reserved"}}`, group.ID)),
+				Checkpoint:  reserved.Checkpoint,
+				StateCursor: cursor,
+			}); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			if _, err := execution.Commit(tx); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			committed = true
+			return realtime.CommandOutput{Value: group.ID}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-fatal:
+		t.Fatalf("unexpected sequencer failure: %v", err)
+	default:
+	}
+	if completion.CommandID == 0 || completion.Publication.Checkpoint.GEID != 1 {
+		t.Fatalf("completion = %+v", completion)
+	}
+	replay, found, err := durable.Lookup(ctx, identity, key, testEpoch)
+	if err != nil || !found {
+		t.Fatalf("durable lookup found=%t err=%v", found, err)
+	}
+	if replay.CommandID != completion.CommandID || replay.Checkpoint != completion.Publication.Checkpoint || replay.StateCursor == "" {
+		t.Fatalf("durable replay = %+v completion=%+v", replay, completion)
+	}
+	if _, exists := publication.Capture().Version.Group(completion.Value.(int64)); !exists {
+		t.Fatal("published candidate omitted transaction-created group")
+	}
+}
+
+func TestDurableIdempotencyRejectsFullLiveWindowWithoutEviction(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC).UnixMilli()
+	conn, err := store.Open(filepath.Join(t.TempDir(), "idempotency-cap.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, err := conn.Exec(db.SchemaSQL); err != nil {
+		t.Fatal(err)
+	}
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stores := store.New(conn, idGen, func() int64 { return now })
+	if err := stores.SeedAndVerify(ctx); err != nil {
+		t.Fatal(err)
+	}
+	user, err := stores.Users.CreateUser(ctx, "alice", "hash", "Alice", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, `
+WITH RECURSIVE sequence(number) AS (
+    VALUES(1)
+    UNION ALL
+    SELECT number + 1 FROM sequence WHERE number < ?
+)
+INSERT INTO command_idempotency (
+    principal_id, idempotency_key, endpoint, request_hmac, command_id, status,
+    result_body, stream_epoch, geid, state_cursor, created_at, expires_at
+)
+SELECT ?, printf('cap-fill-%08d', number), 'POST /cap', ?, number, 200,
+       '{}', ?, number, 'cursor', ?, ?
+FROM sequence;
+`, store.MaxCommandIdempotencyRecords, user.ID, strings.Repeat("a", 64), testEpoch, now, now+store.CommandIdempotencyTTL.Milliseconds()); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := stores.BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = stores.WithTx(tx).Idempotency.Admit(ctx)
+	if !errors.Is(err, store.ErrCommandIdempotencyFull) {
+		t.Fatalf("full live window admission = %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	record, err := stores.Idempotency.Lookup(ctx, user.ID, "cap-fill-00000001")
+	if err != nil || record.CommandID != 1 {
+		t.Fatalf("oldest live record was evicted: record=%+v err=%v", record, err)
 	}
 }
 

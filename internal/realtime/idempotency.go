@@ -96,8 +96,9 @@ func (s *RequestIdentitySigner) Sum(identity HTTPCommandIdentity) (string, error
 }
 
 // DurableIdempotency provides process-restart-safe completed HTTP command
-// lookup and persistence. Save must receive a transaction-bound Stores so the
-// idempotency fact commits or rolls back with its domain mutation.
+// lookup and persistence. Admit and Save receive one transaction-bound Stores
+// so capacity is checked before, and the idempotency fact commits or rolls back
+// with, its domain mutation.
 type DurableIdempotency struct {
 	stores *store.Stores
 	signer *RequestIdentitySigner
@@ -176,9 +177,10 @@ func (d *DurableIdempotency) Lookup(ctx context.Context, identity HTTPCommandIde
 	return replay, true, nil
 }
 
-// Save persists a completed result using txStores. The transaction-bound store
-// requirement guarantees a process crash after the domain commit still leaves
-// one replayable result, while a failed mutation leaves neither fact behind.
+// Save persists a completed result using txStores after Admit has reserved its
+// capacity. The transaction-bound store requirement guarantees a process crash
+// after the domain commit still leaves one replayable result, while a failed
+// mutation leaves neither fact behind.
 func (d *DurableIdempotency) Save(ctx context.Context, txStores *store.Stores, identity HTTPCommandIdentity, idempotencyKey string, result CanonicalCommandResult) error {
 	if d == nil || txStores == nil || txStores.Idempotency == nil || !IdempotencyKeyValid(idempotencyKey) {
 		return ErrInvalidRequestIdentity
@@ -204,6 +206,17 @@ func (d *DurableIdempotency) Save(ctx context.Context, txStores *store.Stores, i
 		GEID:           result.Checkpoint.GEID,
 		StateCursor:    result.StateCursor,
 	})
+}
+
+// Admit reserves one durable retry slot in txStores before a new command
+// mutates domain data. The caller must call Save once in that same transaction
+// after reserving its final publication result; a full window leaves the domain
+// mutation unstarted and returns store.ErrCommandIdempotencyFull.
+func (d *DurableIdempotency) Admit(ctx context.Context, txStores *store.Stores) error {
+	if d == nil || txStores == nil || txStores.Idempotency == nil {
+		return ErrInvalidRequestIdentity
+	}
+	return txStores.Idempotency.Admit(ctx)
 }
 
 // canonicalCommandResultFromRecord converts one store record through the same
