@@ -115,7 +115,8 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 }
 
 // UpdateManagedProfile changes a user's nickname after verifying that actorID
-// still has user:update within the write transaction. Self-service callers use
+// still has user:update within the write transaction. An omitted nickname
+// returns the target row without writing. Self-service callers use
 // UpdateProfile instead and require no management permission.
 func (s *UserService) UpdateManagedProfile(ctx context.Context, actorID, userID int64, nickname string) (*db.User, error) {
 	unlock := s.principals.LockMutation(actorID, userID)
@@ -128,6 +129,8 @@ func (s *UserService) UpdateManagedProfile(ctx context.Context, actorID, userID 
 		var err error
 		user, err = tx.Users.GetUserByID(ctx, userID)
 		if err != nil || nickname == "" {
+			// An omitted patch field is not a write. Returning the row read under
+			// this mutation barrier avoids overwriting a concurrent nickname change.
 			return err
 		}
 		user, err = tx.Users.UpdateNickname(ctx, userID, nickname)

@@ -198,6 +198,20 @@ func TestAdminPasswordResetRejectsOwner(t *testing.T) {
 	}
 }
 
+func TestManagedProfileEmptyPatchReturnsCurrentUser(t *testing.T) {
+	e := newEnv(t)
+	admin := e.createUser(t, "admin", "secret123", "admin")
+	target := e.createUser(t, "target", "secret123", "member")
+	users, _ := newUserService(t, e)
+	app, authz := newAuthedEcho(t, e)
+	app.PATCH("/api/v0/users/:id", auth.UpdateUserHandler(users), rbacecho.Require(authz, rbac.PermUserUpdate))
+
+	rec := requestMethodWithToken(t, app, http.MethodPatch, "/api/v0/users/"+strconv.FormatInt(target.ID, 10), loginToken(t, e, admin.Username, "secret123"), `{}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"nickname":"target"`) {
+		t.Fatalf("empty managed profile patch = %d %s, want 200 current user", rec.Code, rec.Body.String())
+	}
+}
+
 func TestManagedAuthMutationsRecheckPermissionsAfterOwnerTransfer(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
