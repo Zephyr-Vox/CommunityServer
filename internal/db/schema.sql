@@ -166,8 +166,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS moderation_mutes_channel_unique
     ON moderation_mutes(channel_id, user_id, kind) WHERE scope_type = 'channel';
 
 CREATE TABLE IF NOT EXISTS installation_state (
-    id          INTEGER PRIMARY KEY CHECK (id = 1),
-    initialized INTEGER NOT NULL DEFAULT 0 CHECK (initialized IN (0, 1))
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    installation_id TEXT    NOT NULL UNIQUE CHECK (length(installation_id) = 32 AND installation_id NOT GLOB '*[^0-9a-f]*'),
+    initialized     INTEGER NOT NULL DEFAULT 0 CHECK (initialized IN (0, 1))
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -228,3 +229,23 @@ CREATE TABLE IF NOT EXISTS command_idempotency (
 
 CREATE INDEX IF NOT EXISTS idx_command_idempotency_expires
     ON command_idempotency(expires_at, created_at);
+
+CREATE TABLE IF NOT EXISTS activation_idempotency (
+    installation_id      TEXT    NOT NULL REFERENCES installation_state(installation_id) ON DELETE CASCADE,
+    idempotency_key      TEXT    NOT NULL CHECK (length(idempotency_key) BETWEEN 16 AND 64),
+    activation_code_hash TEXT    NOT NULL CHECK (length(activation_code_hash) = 64 AND activation_code_hash NOT GLOB '*[^0-9a-f]*'),
+    request_hmac         TEXT    NOT NULL CHECK (length(request_hmac) = 64 AND request_hmac NOT GLOB '*[^0-9a-f]*'),
+    command_id           INTEGER NOT NULL UNIQUE CHECK (command_id > 0),
+    status               INTEGER NOT NULL CHECK (status BETWEEN 100 AND 599),
+    result_body          TEXT    NOT NULL CHECK (json_valid(result_body)),
+    etag                 TEXT,
+    location             TEXT,
+    cache_control        TEXT,
+    pragma               TEXT,
+    created_at           INTEGER NOT NULL CHECK (created_at >= 0),
+    expires_at           INTEGER NOT NULL CHECK (expires_at > created_at),
+    PRIMARY KEY (installation_id, idempotency_key)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_activation_idempotency_expires
+    ON activation_idempotency(expires_at, created_at);

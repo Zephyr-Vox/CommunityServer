@@ -98,21 +98,34 @@ func (s *IdempotencyStore) Lookup(ctx context.Context, principalID int64, idempo
 // command slot before the domain mutation begins. It never evicts a valid
 // 24-hour result; a full window returns ErrCommandIdempotencyFull.
 func (s *IdempotencyStore) Admit(ctx context.Context) error {
-	if !s.transactional || s.admitted || s.saved {
+	if err := admitDurableIdempotency(ctx, s.q, s.now, s.transactional, s.admitted, s.saved); err != nil {
+		return err
+	}
+	s.admitted = true
+	return nil
+}
+
+// admitDurableIdempotency performs the shared transaction-local capacity check
+// for principal and installation-scoped records. Expired records are removed;
+// live results remain replayable for the full retention window.
+func admitDurableIdempotency(ctx context.Context, q *db.Queries, now func() int64, transactional, admitted, saved bool) error {
+	if !transactional || admitted || saved {
 		return ErrCommandIdempotencyAdmission
 	}
-	now := s.now()
-	if _, err := s.q.DeleteExpiredCommandIdempotency(ctx, now); err != nil {
+	current := now()
+	if _, err := q.DeleteExpiredCommandIdempotency(ctx, current); err != nil {
 		return mapError(err)
 	}
-	count, err := s.q.CountCommandIdempotency(ctx)
+	if _, err := q.DeleteExpiredActivationIdempotency(ctx, current); err != nil {
+		return mapError(err)
+	}
+	count, err := q.CountDurableIdempotency(ctx)
 	if err != nil {
 		return mapError(err)
 	}
 	if count >= MaxCommandIdempotencyRecords {
 		return ErrCommandIdempotencyFull
 	}
-	s.admitted = true
 	return nil
 }
 
@@ -157,14 +170,20 @@ func (s *IdempotencyStore) Save(ctx context.Context, record CommandIdempotencyRe
 	return nil
 }
 
-// Prune removes all records whose durable retry window has expired and returns
-// the number removed. It may be called by bounded maintenance work.
+// Prune removes all principal and installation-scoped records whose durable
+// retry window has expired and returns the combined number removed. It may be
+// called by bounded maintenance work.
 func (s *IdempotencyStore) Prune(ctx context.Context) (int64, error) {
-	n, err := s.q.DeleteExpiredCommandIdempotency(ctx, s.now())
+	now := s.now()
+	commands, err := s.q.DeleteExpiredCommandIdempotency(ctx, now)
 	if err != nil {
 		return 0, mapError(err)
 	}
-	return n, nil
+	activations, err := s.q.DeleteExpiredActivationIdempotency(ctx, now)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return commands + activations, nil
 }
 
 // commandIdempotencyRecordFromDB converts generated nullable resource headers

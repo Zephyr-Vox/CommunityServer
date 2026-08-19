@@ -1,9 +1,11 @@
 package realtime
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,6 +43,27 @@ const (
 // or SetHook on the same publication.
 type PublicationHook func(PublicationStage)
 
+// PublicationCaptureStage identifies a deterministic capture hook point. The
+// before stage runs immediately before Capture attempts the publication read
+// lock; the after stage runs after that lock has been acquired.
+type PublicationCaptureStage uint8
+
+const (
+	// PublicationBeforeCaptureLock runs immediately before Capture calls RLock.
+	PublicationBeforeCaptureLock PublicationCaptureStage = iota
+	// PublicationAfterCaptureLock runs while Capture holds the read lock.
+	PublicationAfterCaptureLock
+)
+
+// PublicationCaptureHook observes Capture's read-lock progress. It exists for
+// deterministic concurrency tests; the after-lock callback must not call
+// Capture or Commit on the same publication.
+type PublicationCaptureHook func(PublicationCaptureStage)
+
+type publicationCaptureHookValue struct {
+	hook PublicationCaptureHook
+}
+
 // PublicationRequest supplies the complete unpublished state and event work
 // for one linearized state command. VisibilityUserIDs must contain every user
 // whose visible-scope set may change for this mutation.
@@ -63,7 +86,7 @@ type PublicationResult struct {
 // event IDs, visibility epochs, and the successor checkpoint have been
 // calculated. Persistent commands use Result while their database transaction
 // is still rollbackable, then publish only after that transaction commits.
-// Exactly one of Publish or Abort releases the reservation.
+// Exactly one of Publish, PublishRuntime, or Abort releases the reservation.
 type PublicationReservation struct {
 	publication *StatePublication
 	result      PublicationResult
@@ -90,8 +113,9 @@ type StatePublication struct {
 	visibility *VisibilityResolver
 	now        func() int64
 
-	mu   sync.RWMutex
-	hook PublicationHook
+	mu          sync.RWMutex
+	hook        PublicationHook
+	captureHook atomic.Pointer[publicationCaptureHookValue]
 }
 
 // NewStatePublication creates the state commit boundary over state and ring.
@@ -116,6 +140,17 @@ func (p *StatePublication) SetHook(hook PublicationHook) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.hook = hook
+}
+
+// SetCaptureHook installs a deterministic read-side hook. It is safe to call
+// concurrently with Capture; an in-flight capture keeps the hook value it
+// loaded before attempting the publication lock.
+func (p *StatePublication) SetCaptureHook(hook PublicationCaptureHook) {
+	if hook == nil {
+		p.captureHook.Store(nil)
+		return
+	}
+	p.captureHook.Store(&publicationCaptureHookValue{hook: hook})
 }
 
 // Commit reserves and immediately publishes request as the immediate successor
@@ -169,6 +204,24 @@ func (r *PublicationReservation) Abort() {
 // visible as one atomic publication. It must run only after the enclosing
 // persistent transaction commits; callers treat an error as process-fatal.
 func (r *PublicationReservation) Publish() (PublicationResult, error) {
+	return r.publish(context.TODO(), false)
+}
+
+// PublishRuntime publishes a runtime-only reservation unless ctx was canceled
+// before the first ring mutation. The cancellation check immediately before
+// ring append is the runtime command's commit linearization point; cancellation
+// after that point cannot roll back an already-started atomic publication.
+func (r *PublicationReservation) PublishRuntime(ctx context.Context) (PublicationResult, error) {
+	if ctx == nil {
+		return PublicationResult{}, ErrInvalidPublication
+	}
+	return r.publish(ctx, true)
+}
+
+// publish completes one reservation. Runtime contexts are checked after the
+// before-append test hook and immediately before any externally observable
+// mutation; persistent publications do not use their TODO context.
+func (r *PublicationReservation) publish(runtimeCtx context.Context, checkRuntimeContext bool) (PublicationResult, error) {
 	if !r.claimCompletion() {
 		return PublicationResult{}, ErrInvalidPublication
 	}
@@ -176,6 +229,11 @@ func (r *PublicationReservation) Publish() (PublicationResult, error) {
 
 	p := r.publication
 	p.callHook(PublicationBeforeRingAppend)
+	if checkRuntimeContext {
+		if err := runtimeCtx.Err(); err != nil {
+			return PublicationResult{}, err
+		}
+	}
 	if err := p.ring.Append(r.result.Events); err != nil {
 		return PublicationResult{}, err
 	}
@@ -260,8 +318,15 @@ func (p *StatePublication) reserveLocked(request PublicationRequest) (Publicatio
 // Snapshot and replay callers must use it instead of separately reading
 // StateStore.Current and StateRing.Snapshot.
 func (p *StatePublication) Capture() PublicationSnapshot {
+	hookValue := p.captureHook.Load()
+	if hookValue != nil {
+		hookValue.hook(PublicationBeforeCaptureLock)
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	if hookValue != nil {
+		hookValue.hook(PublicationAfterCaptureLock)
+	}
 	events, highWater := p.ring.Snapshot()
 	return PublicationSnapshot{Version: p.state.Current(), Events: events, HighWater: highWater}
 }

@@ -22,8 +22,9 @@ const (
 )
 
 var (
-	// ErrRuntimeIdempotencyFull is returned when no completed entry can be
-	// evicted to honor the required global or per-user hard cap.
+	// ErrRuntimeIdempotencyFull is returned when every global or per-user retry
+	// slot is still inside its required retention window. A live completed result
+	// is never evicted before its TTL ends.
 	ErrRuntimeIdempotencyFull = errors.New("realtime: runtime idempotency cache full")
 	// ErrRuntimeIdempotencyAborted is returned to waiters when the owner fails
 	// before completing its reserved command result.
@@ -52,13 +53,14 @@ type RuntimeCommandResult struct {
 type RuntimeIdempotencyCache struct {
 	mu sync.Mutex
 
-	entries  map[runtimeIdempotencyKey]*runtimeIdempotencyEntry
-	byUser   map[int64]int
-	order    *list.List
-	now      func() time.Time
-	ttl      time.Duration
-	maxTotal int
-	maxUser  int
+	entries    map[runtimeIdempotencyKey]*runtimeIdempotencyEntry
+	byUser     map[int64]int
+	order      *list.List
+	now        func() time.Time
+	ttl        time.Duration
+	maxTotal   int
+	maxUser    int
+	nextExpiry time.Time
 }
 
 // runtimeIdempotencyKey identifies the retry slot shared by retries of one
@@ -189,6 +191,9 @@ func (c *RuntimeIdempotencyClaim) Complete(result RuntimeCommandResult) error {
 	c.entry.result = canonical
 	c.entry.completed = true
 	c.entry.expiresAt = c.cache.now().Add(c.cache.ttl)
+	if c.cache.nextExpiry.IsZero() || c.entry.expiresAt.Before(c.cache.nextExpiry) {
+		c.cache.nextExpiry = c.entry.expiresAt
+	}
 	close(c.entry.done)
 	return nil
 }
@@ -233,43 +238,21 @@ func (c *RuntimeIdempotencyCache) Len() int {
 	return len(c.entries)
 }
 
-// makeRoomLocked evicts oldest completed entries until both required hard caps
-// hold. It never removes in-flight work because another caller may still own
-// the only command execution for that retry key.
+// makeRoomLocked reports whether a new retry reservation fits after
+// pruneLocked has removed expired completed entries. It never evicts a live
+// result because doing so would allow a TTL-valid retry to execute its side
+// effect a second time.
 func (c *RuntimeIdempotencyCache) makeRoomLocked(principalID int64) bool {
-	for c.byUser[principalID] >= c.maxUser {
-		if !c.evictOldestCompletedLocked(principalID) {
-			return false
-		}
-	}
-	for len(c.entries) >= c.maxTotal {
-		if !c.evictOldestCompletedLocked(0) {
-			return false
-		}
-	}
-	return true
-}
-
-// evictOldestCompletedLocked removes one oldest completed entry, optionally
-// constrained to a principal. It returns false when only in-flight entries fit.
-func (c *RuntimeIdempotencyCache) evictOldestCompletedLocked(principalID int64) bool {
-	for element := c.order.Front(); element != nil; element = element.Next() {
-		key := element.Value.(runtimeIdempotencyKey)
-		if principalID != 0 && key.principalID != principalID {
-			continue
-		}
-		entry := c.entries[key]
-		if entry.completed {
-			c.removeLocked(key, entry)
-			return true
-		}
-	}
-	return false
+	return c.byUser[principalID] < c.maxUser && len(c.entries) < c.maxTotal
 }
 
 // pruneLocked removes only expired completed entries. Callers hold c.mu.
 func (c *RuntimeIdempotencyCache) pruneLocked(now time.Time) int {
+	if c.nextExpiry.IsZero() || now.Before(c.nextExpiry) {
+		return 0
+	}
 	removed := 0
+	nextExpiry := time.Time{}
 	for element := c.order.Front(); element != nil; {
 		next := element.Next()
 		key := element.Value.(runtimeIdempotencyKey)
@@ -277,9 +260,12 @@ func (c *RuntimeIdempotencyCache) pruneLocked(now time.Time) int {
 		if entry.completed && !now.Before(entry.expiresAt) {
 			c.removeLocked(key, entry)
 			removed++
+		} else if entry.completed && (nextExpiry.IsZero() || entry.expiresAt.Before(nextExpiry)) {
+			nextExpiry = entry.expiresAt
 		}
 		element = next
 	}
+	c.nextExpiry = nextExpiry
 	return removed
 }
 

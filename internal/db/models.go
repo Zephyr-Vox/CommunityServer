@@ -8,6 +8,22 @@ import (
 	"database/sql"
 )
 
+type ActivationIdempotency struct {
+	InstallationID     string         `json:"installation_id"`
+	IdempotencyKey     string         `json:"idempotency_key"`
+	ActivationCodeHash string         `json:"activation_code_hash"`
+	RequestHmac        string         `json:"request_hmac"`
+	CommandID          int64          `json:"command_id"`
+	Status             int64          `json:"status"`
+	ResultBody         string         `json:"result_body"`
+	Etag               sql.NullString `json:"etag"`
+	Location           sql.NullString `json:"location"`
+	CacheControl       sql.NullString `json:"cache_control"`
+	Pragma             sql.NullString `json:"pragma"`
+	CreatedAt          int64          `json:"created_at"`
+	ExpiresAt          int64          `json:"expires_at"`
+}
+
 type Channel struct {
 	ID         int64         `json:"id"`
 	GroupID    sql.NullInt64 `json:"group_id"`
@@ -72,8 +88,9 @@ type GroupAccess struct {
 }
 
 type InstallationState struct {
-	ID          int64 `json:"id"`
-	Initialized int64 `json:"initialized"`
+	ID             int64  `json:"id"`
+	InstallationID string `json:"installation_id"`
+	Initialized    int64  `json:"initialized"`
 }
 
 type Invite struct {

@@ -293,7 +293,7 @@ func TestPostCommitSequencerPreservesPublicationOrder(t *testing.T) {
 	}
 }
 
-func TestPostCommitSequencerCompletesAfterRequestCancellation(t *testing.T) {
+func TestPostCommitSequencerAbortsRuntimeCommandBeforePublicationOnCancellation(t *testing.T) {
 	loader := &staticProjectionLoader{projection: &store.StateProjection{}}
 	state, err := realtime.NewStateStoreWithEpoch(context.Background(), loader, testEpoch)
 	if err != nil {
@@ -316,51 +316,133 @@ func TestPostCommitSequencerCompletesAfterRequestCancellation(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	published := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	beforeAppend := make(chan struct{})
+	releaseAppend := make(chan struct{})
 	publication.SetHook(func(stage realtime.PublicationStage) {
-		if stage == realtime.PublicationAfterStateSwap {
-			close(published)
+		if stage == realtime.PublicationBeforeRingAppend {
+			close(beforeAppend)
+			<-releaseAppend
+		}
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, submitErr := sequencer.Submit(ctx, realtime.PostCommitCommand{
+			QueueBytes: 1,
+			Execute: func(ctx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+				candidate, err := state.BuildPersistentCandidate(ctx)
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				if _, err := execution.Reserve(realtime.PublicationRequest{Candidate: candidate}); err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				if err := execution.MarkRuntimeReady(); err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				return realtime.CommandOutput{}, nil
+			},
+		})
+		done <- submitErr
+	}()
+	select {
+	case <-beforeAppend:
+	case <-time.After(time.Second):
+		t.Fatal("runtime publication did not reach pre-append barrier")
+	}
+	cancel()
+	close(releaseAppend)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("runtime cancellation = %v, want context cancellation", err)
+	}
+	if err := sequencer.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := publication.Capture(); snapshot.Version.Number() != 0 || snapshot.HighWater != 0 {
+		t.Fatalf("canceled runtime command published state: %+v", snapshot)
+	}
+}
+
+func TestPostCommitSequencerFinishesRuntimePublicationAfterCommitPointCancellation(t *testing.T) {
+	loader := &staticProjectionLoader{projection: &store.StateProjection{}}
+	state, err := realtime.NewStateStoreWithEpoch(context.Background(), loader, testEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := realtime.NewStatePublication(state, realtime.NewStateRing(), realtime.NewVisibilityResolver(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := realtime.NewPostCommitSequencer(publication, idGen, func(error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sequencer.Close(context.Background()); err != nil {
+			t.Error(err)
 		}
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, err = sequencer.Submit(ctx, realtime.PostCommitCommand{
-		QueueBytes: 1,
-		Execute: func(ctx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
-			candidate, err := state.BuildPersistentCandidate(ctx)
-			if err != nil {
-				return realtime.CommandOutput{}, err
-			}
-			if _, err := execution.Reserve(realtime.PublicationRequest{Candidate: candidate}); err != nil {
-				return realtime.CommandOutput{}, err
-			}
-			completionCtx, err := execution.MarkRuntimeCommitted()
-			if err != nil {
-				return realtime.CommandOutput{}, err
-			}
+	cache := realtime.NewRuntimeIdempotencyCache()
+	claim, err := cache.Claim(1, "runtime-commit-0001", strings.Repeat("a", 64))
+	if err != nil || !claim.Owner() {
+		t.Fatalf("runtime claim owner=%t err=%v", claim != nil && claim.Owner(), err)
+	}
+	published := make(chan struct{})
+	publication.SetHook(func(stage realtime.PublicationStage) {
+		switch stage {
+		case realtime.PublicationAfterRingAppend:
 			cancel()
-			if completionCtx.Err() != nil {
-				return realtime.CommandOutput{}, completionCtx.Err()
-			}
-			return realtime.CommandOutput{}, nil
-		},
+		case realtime.PublicationAfterStateSwap:
+			close(published)
+		}
 	})
-	if err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("submit after completion cancellation = %v", err)
+	completion, err := sequencer.Submit(ctx, sequencedCommand(state, "runtime.committed", nil, nil))
+	if err != nil {
+		t.Fatalf("runtime result after commit-point cancellation = %v", err)
 	}
 	select {
 	case <-published:
 	case <-time.After(time.Second):
-		t.Fatal("committed command did not publish after request cancellation")
+		t.Fatal("runtime command did not finish publication after its commit point")
 	}
-	if publication.Capture().Version.Number() != 1 {
-		t.Fatal("committed command did not advance state")
+	if err := sequencer.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := publication.Capture(); snapshot.Version.Number() != 1 || snapshot.HighWater != 1 || len(snapshot.Events) != 1 {
+		t.Fatalf("post-commit runtime publication = %+v", snapshot)
+	}
+	if completion.CommandID <= 0 || completion.Publication.Checkpoint.GEID != 1 {
+		t.Fatalf("runtime completion = %+v", completion)
+	}
+	if err := claim.Complete(realtime.RuntimeCommandResult{
+		CommandID:   completion.CommandID,
+		Status:      200,
+		Body:        []byte(`{"committed":true}`),
+		Checkpoint:  completion.Publication.Checkpoint,
+		StateCursor: "runtime-cursor",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := cache.Claim(1, "runtime-commit-0001", strings.Repeat("a", 64))
+	if err != nil || replay.Owner() {
+		t.Fatalf("runtime replay owner=%t err=%v", replay != nil && replay.Owner(), err)
+	}
+	replayed, err := replay.Wait(context.Background())
+	if err != nil || replayed.CommandID != completion.CommandID || replayed.Checkpoint != completion.Publication.Checkpoint {
+		t.Fatalf("runtime replay result=%+v err=%v", replayed, err)
 	}
 }
 
 func TestPostCommitSequencerFailsFastAfterCommittedPanic(t *testing.T) {
-	loader := &staticProjectionLoader{projection: &store.StateProjection{}}
-	state, err := realtime.NewStateStoreWithEpoch(context.Background(), loader, testEpoch)
+	stores := newStores(t)
+	state, err := realtime.NewStateStoreWithEpoch(context.Background(), stores, testEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,14 +467,23 @@ func TestPostCommitSequencerFailsFastAfterCommittedPanic(t *testing.T) {
 	_, err = sequencer.Submit(context.Background(), realtime.PostCommitCommand{
 		QueueBytes: 1,
 		Execute: func(ctx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
-			candidate, err := state.BuildPersistentCandidate(ctx)
+			tx, err := stores.BeginTx(ctx)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			defer tx.Rollback()
+			txStores := stores.WithTx(tx)
+			if _, err := txStores.Channels.CreateGroup(ctx, "Committed", 1, "public"); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			candidate, err := state.BuildPersistentCandidateFrom(ctx, txStores)
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
 			if _, err := execution.Reserve(realtime.PublicationRequest{Candidate: candidate}); err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			if _, err := execution.MarkRuntimeCommitted(); err != nil {
+			if _, err := execution.Commit(tx); err != nil {
 				return realtime.CommandOutput{}, err
 			}
 			panic("after commit")
@@ -400,6 +491,10 @@ func TestPostCommitSequencerFailsFastAfterCommittedPanic(t *testing.T) {
 	})
 	if !errors.Is(err, realtime.ErrCommandPanic) {
 		t.Fatalf("post-commit panic = %v", err)
+	}
+	groups, listErr := stores.Channels.ListGroups(context.Background())
+	if listErr != nil || len(groups) != 1 || groups[0].Name != "Committed" || state.Current().Number() != 0 {
+		t.Fatalf("panic boundary database=%+v state_version=%d err=%v", groups, state.Current().Number(), listErr)
 	}
 	select {
 	case err := <-fatal:
@@ -442,7 +537,7 @@ func sequencedCommand(state *realtime.StateStore, eventType string, started chan
 			}); err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			if _, err := execution.MarkRuntimeCommitted(); err != nil {
+			if err := execution.MarkRuntimeReady(); err != nil {
 				return realtime.CommandOutput{}, err
 			}
 			return realtime.CommandOutput{}, nil

@@ -22,6 +22,13 @@ import (
 // command adapters. Keeping it local avoids coupling realtime policy to store.
 var idempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
 
+// installationIdentityPattern matches the persisted 128-bit installation ID.
+var installationIdentityPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// activationCodeHashPattern matches the digest used in the public bootstrap
+// exception. Plaintext activation codes never cross this identity boundary.
+var activationCodeHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 var (
 	// ErrInvalidIdempotencyKey is returned when a client retry key does not use
 	// the protocol's fixed portable token grammar.
@@ -61,6 +68,17 @@ type HTTPCommandIdentity struct {
 	CanonicalDTO        json.RawMessage
 	PreconditionHeaders []CanonicalField
 	ControlConnectionID string
+}
+
+// InstallationCommandIdentity is the stable identity of the unauthenticated
+// first-owner activation command. InstallationID and ActivationCodeHash are
+// required because no principal exists before the command succeeds.
+type InstallationCommandIdentity struct {
+	InstallationID     string
+	ActivationCodeHash string
+	Method             string
+	RouteTemplate      string
+	CanonicalDTO       json.RawMessage
 }
 
 // RequestIdentitySigner computes the HMAC of canonical authenticated request
@@ -104,6 +122,32 @@ type DurableIdempotency struct {
 	signer *RequestIdentitySigner
 }
 
+// DurableActivationIdempotency provides restart-safe deduplication for the
+// first-owner activation exception. It uses a separate store shape because the
+// command creates the principal referenced by ordinary durable records.
+type DurableActivationIdempotency struct {
+	stores *store.Stores
+	signer *RequestIdentitySigner
+}
+
+// ActivationCommandResult is the canonical response stored for a bootstrap
+// activation. State checkpoint fields are intentionally absent until this
+// pre-realtime HTTP mutation becomes a StateStore consumer.
+type ActivationCommandResult struct {
+	CommandID int64
+	Status    int
+	Body      json.RawMessage
+	Headers   store.IdempotencyHeaders
+}
+
+// ActivationReplay is the response reconstructed from a completed activation.
+type ActivationReplay struct {
+	CommandID int64
+	Status    int
+	Body      json.RawMessage
+	Headers   store.IdempotencyHeaders
+}
+
 // DurableReplay is the canonical response reconstructed from a completed
 // durable command. SyncRequired suppresses old epoch checkpoint fields while
 // preserving the original status, result and allowed resource headers.
@@ -135,6 +179,86 @@ func NewDurableIdempotency(stores *store.Stores, signer *RequestIdentitySigner) 
 		return nil, ErrInvalidRequestIdentity
 	}
 	return &DurableIdempotency{stores: stores, signer: signer}, nil
+}
+
+// NewDurableActivationIdempotency creates installation-scoped retry support.
+func NewDurableActivationIdempotency(stores *store.Stores, signer *RequestIdentitySigner) (*DurableActivationIdempotency, error) {
+	if stores == nil || stores.ActivationIdempotency == nil || signer == nil {
+		return nil, ErrInvalidRequestIdentity
+	}
+	return &DurableActivationIdempotency{stores: stores, signer: signer}, nil
+}
+
+// Lookup returns a completed matching activation result or found=false. A
+// matching idempotency key with a different code/request identity is reported
+// as ErrIdempotencyMismatch before any activation state is inspected.
+func (d *DurableActivationIdempotency) Lookup(ctx context.Context, identity InstallationCommandIdentity, idempotencyKey string) (replay ActivationReplay, found bool, err error) {
+	if d == nil || !IdempotencyKeyValid(idempotencyKey) {
+		return ActivationReplay{}, false, ErrInvalidRequestIdentity
+	}
+	requestHMAC, err := d.signer.SumInstallation(identity)
+	if err != nil {
+		return ActivationReplay{}, false, err
+	}
+	record, err := d.stores.ActivationIdempotency.Lookup(ctx, identity.InstallationID, idempotencyKey)
+	if errors.Is(err, store.ErrNotFound) {
+		return ActivationReplay{}, false, nil
+	}
+	if err != nil {
+		return ActivationReplay{}, false, err
+	}
+	if !equalHexDigest(record.ActivationCodeHash, identity.ActivationCodeHash) || !equalHexDigest(record.RequestHMAC, requestHMAC) {
+		return ActivationReplay{}, true, ErrIdempotencyMismatch
+	}
+	result, err := canonicalizeActivationCommandResult(ActivationCommandResult{
+		CommandID: record.CommandID,
+		Status:    int(record.Status),
+		Body:      record.ResultBody,
+		Headers:   record.Headers,
+	})
+	if err != nil {
+		return ActivationReplay{}, true, err
+	}
+	return ActivationReplay{
+		CommandID: result.CommandID,
+		Status:    result.Status,
+		Body:      append(json.RawMessage(nil), result.Body...),
+		Headers:   result.Headers,
+	}, true, nil
+}
+
+// Admit reserves a shared durable retry slot in the activation transaction.
+func (d *DurableActivationIdempotency) Admit(ctx context.Context, txStores *store.Stores) error {
+	if d == nil || txStores == nil || txStores.ActivationIdempotency == nil {
+		return ErrInvalidRequestIdentity
+	}
+	return txStores.ActivationIdempotency.Admit(ctx)
+}
+
+// Save persists one activation response in the transaction that creates the
+// first owner. The response never stores plaintext code or password fields.
+func (d *DurableActivationIdempotency) Save(ctx context.Context, txStores *store.Stores, identity InstallationCommandIdentity, idempotencyKey string, result ActivationCommandResult) error {
+	if d == nil || txStores == nil || txStores.ActivationIdempotency == nil || !IdempotencyKeyValid(idempotencyKey) {
+		return ErrInvalidRequestIdentity
+	}
+	requestHMAC, err := d.signer.SumInstallation(identity)
+	if err != nil {
+		return err
+	}
+	result, err = canonicalizeActivationCommandResult(result)
+	if err != nil {
+		return err
+	}
+	return txStores.ActivationIdempotency.Save(ctx, store.ActivationIdempotencyRecord{
+		InstallationID:     identity.InstallationID,
+		IdempotencyKey:     idempotencyKey,
+		ActivationCodeHash: identity.ActivationCodeHash,
+		RequestHMAC:        requestHMAC,
+		CommandID:          result.CommandID,
+		Status:             int64(result.Status),
+		ResultBody:         result.Body,
+		Headers:            result.Headers,
+	})
 }
 
 // Lookup returns a completed matching retry result or found=false. A matching
@@ -285,6 +409,58 @@ func canonicalHTTPCommandIdentity(identity HTTPCommandIdentity) ([]byte, error) 
 	return []byte(builder.String()), nil
 }
 
+// canonicalInstallationCommandIdentity normalizes the bootstrap identity while
+// keeping its code/password values out of durable storage.
+func canonicalInstallationCommandIdentity(identity InstallationCommandIdentity) ([]byte, error) {
+	if !installationIdentityPattern.MatchString(identity.InstallationID) || !activationCodeHashPattern.MatchString(identity.ActivationCodeHash) || identity.Method == "" || identity.Method != strings.ToUpper(identity.Method) || identity.RouteTemplate == "" || len(identity.RouteTemplate) > 256 || hasControlCharacters(identity.RouteTemplate) {
+		return nil, ErrInvalidRequestIdentity
+	}
+	dto, err := canonicalJSONValue(identity.CanonicalDTO)
+	if err != nil {
+		return nil, ErrInvalidRequestIdentity
+	}
+	var builder strings.Builder
+	appendIdentityPart(&builder, "installation", identity.InstallationID)
+	appendIdentityPart(&builder, "activation_code_hash", identity.ActivationCodeHash)
+	appendIdentityPart(&builder, "method", identity.Method)
+	appendIdentityPart(&builder, "route", identity.RouteTemplate)
+	appendIdentityPart(&builder, "dto", string(dto))
+	return []byte(builder.String()), nil
+}
+
+// SumInstallation returns the HMAC of an installation-scoped activation
+// identity. The canonical bytes include the activation-code digest and
+// validated account DTO; durable storage receives only the keyed digest.
+func (s *RequestIdentitySigner) SumInstallation(identity InstallationCommandIdentity) (string, error) {
+	if s == nil || len(s.key) < sha256.Size {
+		return "", ErrInvalidRequestIdentity
+	}
+	canonical, err := canonicalInstallationCommandIdentity(identity)
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, s.key)
+	_, _ = mac.Write(canonical)
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+// canonicalizeActivationCommandResult normalizes the JSON response and checks
+// the limited headers retained for a public activation replay.
+func canonicalizeActivationCommandResult(result ActivationCommandResult) (ActivationCommandResult, error) {
+	if result.CommandID <= 0 || result.Status < 100 || result.Status > 599 || invalidResourceHeaders(result.Headers) {
+		return ActivationCommandResult{}, ErrInvalidCommandResult
+	}
+	if result.Status == 204 && len(result.Body) == 0 {
+		result.Body = json.RawMessage("null")
+	}
+	body, err := canonicalJSONValue(result.Body)
+	if err != nil {
+		return ActivationCommandResult{}, ErrInvalidCommandResult
+	}
+	result.Body = body
+	return result, nil
+}
+
 // canonicalFields sorts named command identity components and rejects duplicate
 // names. Adapters must merge duplicate HTTP headers before this boundary.
 func canonicalFields(fields []CanonicalField) ([]CanonicalField, error) {
@@ -372,6 +548,11 @@ func commandEndpoint(identity HTTPCommandIdentity) string {
 
 // equalRequestHMAC compares fixed hexadecimal digest text in constant time.
 func equalRequestHMAC(left, right string) bool {
+	return equalHexDigest(left, right)
+}
+
+// equalHexDigest compares fixed hexadecimal digests in constant time.
+func equalHexDigest(left, right string) bool {
 	leftBytes, leftErr := hex.DecodeString(left)
 	rightBytes, rightErr := hex.DecodeString(right)
 	return leftErr == nil && rightErr == nil && hmac.Equal(leftBytes, rightBytes)

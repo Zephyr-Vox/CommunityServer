@@ -85,7 +85,7 @@ SELECT COUNT(*) AS count FROM user_role_bindings WHERE role_key = 'owner';
 SELECT * FROM installation_state WHERE id = 1;
 
 -- name: SeedInstallationState :execrows
-INSERT OR IGNORE INTO installation_state (id, initialized) VALUES (1, 0);
+INSERT OR IGNORE INTO installation_state (id, installation_id, initialized) VALUES (1, ?, 0);
 
 -- name: SetInstallationInitialized :execrows
 UPDATE installation_state

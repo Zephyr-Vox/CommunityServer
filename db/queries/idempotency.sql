@@ -12,14 +12,24 @@ INSERT INTO command_idempotency (
 -- name: DeleteExpiredCommandIdempotency :execrows
 DELETE FROM command_idempotency WHERE expires_at <= ?;
 
--- name: CountCommandIdempotency :one
-SELECT COUNT(*) FROM command_idempotency;
+-- name: CountDurableIdempotency :one
+SELECT
+    (SELECT COUNT(*) FROM command_idempotency) +
+    (SELECT COUNT(*) FROM activation_idempotency);
 
--- name: DeleteOldestCommandIdempotency :execrows
-DELETE FROM command_idempotency
-WHERE (principal_id, idempotency_key) IN (
-    SELECT principal_id, idempotency_key
-    FROM command_idempotency
-    ORDER BY created_at ASC, principal_id ASC, idempotency_key ASC
-    LIMIT ?
-);
+-- name: DeleteExpiredActivationIdempotency :execrows
+DELETE FROM activation_idempotency WHERE expires_at <= ?;
+
+-- name: GetActivationIdempotency :one
+SELECT installation_id, idempotency_key, activation_code_hash, request_hmac,
+       command_id, status, result_body, etag, location, cache_control, "pragma",
+       created_at, expires_at
+FROM activation_idempotency
+WHERE installation_id = ? AND idempotency_key = ? AND expires_at > ?;
+
+-- name: InsertActivationIdempotency :exec
+INSERT INTO activation_idempotency (
+    installation_id, idempotency_key, activation_code_hash, request_hmac,
+    command_id, status, result_body, etag, location, cache_control, pragma,
+    created_at, expires_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);

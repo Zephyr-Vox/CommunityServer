@@ -34,14 +34,15 @@ var (
 	// always fatal because it may have occurred after the database commit.
 	ErrCommandPanic = errors.New("realtime: command callback panic")
 	// ErrCommandNotCommitted is returned when a command returns without calling
-	// Commit or MarkRuntimeCommitted for its reserved publication.
+	// Commit or MarkRuntimeReady for its reserved publication.
 	ErrCommandNotCommitted = errors.New("realtime: command did not commit")
 )
 
 // PostCommitCommand is one state-changing operation accepted by the single
 // writer. QueueBytes is its validated admission size. Execute receives the
 // request context for rollbackable work and a CommandExecution for reserving
-// final publication data before committing a persistent transaction.
+// final publication data before committing a persistent transaction or marking
+// a runtime-only candidate ready for its cancellable publication point.
 type PostCommitCommand struct {
 	QueueBytes int
 	Execute    func(context.Context, int64, *CommandExecution) (CommandOutput, error)
@@ -71,10 +72,12 @@ type CommandExecution struct {
 	commandID     int64
 	completionCtx context.Context
 
-	mu          sync.Mutex
-	reservation *PublicationReservation
-	committing  bool
-	committed   bool
+	mu           sync.Mutex
+	reservation  *PublicationReservation
+	committing   bool
+	persistent   bool
+	runtimeReady bool
+	published    bool
 }
 
 // Reserve assigns commandID to request events and reserves their final GEIDs,
@@ -86,7 +89,7 @@ func (e *CommandExecution) Reserve(request PublicationRequest) (PublicationResul
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.reservation != nil || e.committed {
+	if e.reservation != nil || e.persistent || e.runtimeReady || e.published {
 		return PublicationResult{}, ErrInvalidSequencer
 	}
 	request.Events = append([]StateEventTemplate(nil), request.Events...)
@@ -111,7 +114,7 @@ func (e *CommandExecution) Commit(tx *sql.Tx) (context.Context, error) {
 		return nil, ErrInvalidSequencer
 	}
 	e.mu.Lock()
-	if e.reservation == nil || e.committing || e.committed {
+	if e.reservation == nil || e.committing || e.persistent || e.runtimeReady || e.published {
 		e.mu.Unlock()
 		return nil, ErrCommandNotCommitted
 	}
@@ -126,58 +129,61 @@ func (e *CommandExecution) Commit(tx *sql.Tx) (context.Context, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.committing = false
-	e.committed = true
+	e.persistent = true
 	return e.completionCtx, nil
 }
 
-// MarkRuntimeCommitted enters the post-commit phase for a runtime-only
-// command. It must be called only after all reversible preparation has
-// completed; StatePublication.Publish is that command's commit point.
-func (e *CommandExecution) MarkRuntimeCommitted() (context.Context, error) {
+// MarkRuntimeReady marks a runtime-only command as fully prepared. It does not
+// commit the command: PublicationReservation.PublishRuntime remains the runtime
+// command's sole commit point, and cancellation before it mutates the ring
+// aborts the reservation.
+func (e *CommandExecution) MarkRuntimeReady() error {
 	if e == nil {
-		return nil, ErrInvalidSequencer
+		return ErrInvalidSequencer
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.reservation == nil || e.committing || e.committed {
-		return nil, ErrCommandNotCommitted
+	if e.reservation == nil || e.committing || e.persistent || e.runtimeReady || e.published {
+		return ErrCommandNotCommitted
 	}
-	e.committed = true
-	return e.completionCtx, nil
+	e.runtimeReady = true
+	return nil
 }
 
-// CompletionContext returns the internal context allowed after Commit or
-// MarkRuntimeCommitted. It has the request's values but ignores request
-// cancellation and deadlines.
+// CompletionContext returns the internal context allowed after a persistent
+// Commit. It has the request's values but ignores request cancellation and
+// deadlines; runtime commands remain cancellable until Publish succeeds.
 func (e *CommandExecution) CompletionContext() (context.Context, error) {
 	if e == nil {
 		return nil, ErrInvalidSequencer
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.committed {
+	if !e.persistent {
 		return nil, ErrCommandNotCommitted
 	}
 	return e.completionCtx, nil
 }
 
-// committedReservation returns e's one committed reservation for publication.
-func (e *CommandExecution) committedReservation() (*PublicationReservation, bool) {
+// publicationState returns the reservation and whether its enclosing command
+// has either durably committed or become runtime-ready.
+func (e *CommandExecution) publicationState() (*PublicationReservation, bool, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.reservation, e.committed
+	return e.reservation, e.persistent, e.runtimeReady
 }
 
 // abort releases an uncommitted publication reservation after an ordinary
-// pre-commit command error. A committed reservation is deliberately retained
-// for fail-fast recovery rather than silently discarding durable state.
+// pre-commit or runtime-ready command error. A persistent committed reservation
+// is deliberately retained for fail-fast recovery rather than silently
+// discarding durable state.
 func (e *CommandExecution) abort() {
 	if e == nil {
 		return
 	}
 	e.mu.Lock()
 	reservation := e.reservation
-	committed := e.committing || e.committed
+	committed := e.committing || e.persistent || e.published
 	e.mu.Unlock()
 	if reservation != nil && !committed {
 		reservation.Abort()
@@ -237,8 +243,10 @@ func NewPostCommitSequencer(publication *StatePublication, idGen *snowflake.IDGe
 }
 
 // Submit admits command when both ordinary queue limits permit and waits for
-// its ordered completion. A canceled context before dequeue prevents execution;
-// callers must let a command that already committed finish its publication.
+// the worker's ordered terminal result. The worker observes ctx before a
+// runtime publication and aborts a canceled candidate; once any command reaches
+// its commit point, waiting for its completion lets the caller finish response
+// and idempotency bookkeeping with the final command ID and checkpoint.
 func (s *PostCommitSequencer) Submit(ctx context.Context, command PostCommitCommand) (CommandCompletion, error) {
 	if ctx == nil || command.Execute == nil || command.QueueBytes <= 0 || command.QueueBytes > MaxSequencerQueueBytes {
 		return CommandCompletion{}, ErrInvalidSequencer
@@ -251,12 +259,8 @@ func (s *PostCommitSequencer) Submit(ctx context.Context, command PostCommitComm
 	if err := s.enqueue(pending); err != nil {
 		return CommandCompletion{}, err
 	}
-	select {
-	case reply := <-pending.completion:
-		return reply.completion, reply.err
-	case <-ctx.Done():
-		return CommandCompletion{}, ctx.Err()
-	}
+	reply := <-pending.completion
+	return reply.completion, reply.err
 }
 
 // Close stops ordinary admission, drains commands already accepted, and waits
@@ -359,7 +363,11 @@ func (s *PostCommitSequencer) execute(pending *queuedCommand) (completion Comman
 	execution.commandID = commandID
 	output, err := pending.command.Execute(pending.ctx, commandID, execution)
 	if err != nil {
-		if _, committed := execution.committedReservation(); committed {
+		if _, persistent, runtimeReady := execution.publicationState(); persistent || runtimeReady {
+			if runtimeReady && !persistent {
+				execution.abort()
+				return CommandCompletion{}, err
+			}
 			err = fmt.Errorf("%w: %v", ErrSequencerFailed, err)
 			s.fail(err)
 			return CommandCompletion{}, err
@@ -367,17 +375,34 @@ func (s *PostCommitSequencer) execute(pending *queuedCommand) (completion Comman
 		execution.abort()
 		return CommandCompletion{}, err
 	}
-	reservation, committed := execution.committedReservation()
-	if !committed || reservation == nil {
+	reservation, persistent, runtimeReady := execution.publicationState()
+	if (!persistent && !runtimeReady) || reservation == nil {
 		execution.abort()
 		return CommandCompletion{}, ErrCommandNotCommitted
 	}
-	publication, err := reservation.Publish()
+	if runtimeReady && !persistent {
+		if err := pending.ctx.Err(); err != nil {
+			execution.abort()
+			return CommandCompletion{}, err
+		}
+	}
+	var publication PublicationResult
+	if runtimeReady && !persistent {
+		publication, err = reservation.PublishRuntime(pending.ctx)
+	} else {
+		publication, err = reservation.Publish()
+	}
 	if err != nil {
+		if runtimeReady && !persistent && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			return CommandCompletion{}, err
+		}
 		err = fmt.Errorf("%w: %v", ErrSequencerFailed, err)
 		s.fail(err)
 		return CommandCompletion{}, err
 	}
+	execution.mu.Lock()
+	execution.published = true
+	execution.mu.Unlock()
 	return CommandCompletion{CommandID: commandID, Publication: publication, Value: output.Value}, nil
 }
 

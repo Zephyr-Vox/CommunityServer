@@ -108,13 +108,13 @@ func (q *Queries) DeleteServerRoleBindingsForUser(ctx context.Context, userID in
 }
 
 const getInstallationState = `-- name: GetInstallationState :one
-SELECT id, initialized FROM installation_state WHERE id = 1
+SELECT id, installation_id, initialized FROM installation_state WHERE id = 1
 `
 
 func (q *Queries) GetInstallationState(ctx context.Context) (InstallationState, error) {
 	row := q.db.QueryRowContext(ctx, getInstallationState)
 	var i InstallationState
-	err := row.Scan(&i.ID, &i.Initialized)
+	err := row.Scan(&i.ID, &i.InstallationID, &i.Initialized)
 	return i, err
 }
 
@@ -404,11 +404,11 @@ func (q *Queries) ListUsersWithRoleBindings(ctx context.Context) ([]int64, error
 }
 
 const seedInstallationState = `-- name: SeedInstallationState :execrows
-INSERT OR IGNORE INTO installation_state (id, initialized) VALUES (1, 0)
+INSERT OR IGNORE INTO installation_state (id, installation_id, initialized) VALUES (1, ?, 0)
 `
 
-func (q *Queries) SeedInstallationState(ctx context.Context) (int64, error) {
-	result, err := q.db.ExecContext(ctx, seedInstallationState)
+func (q *Queries) SeedInstallationState(ctx context.Context, installationID string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, seedInstallationState, installationID)
 	if err != nil {
 		return 0, err
 	}

@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 
 	"zephyr.vox/server/ce/internal/db"
 )
@@ -23,11 +25,26 @@ func (s *InstallationStore) Get(ctx context.Context) (*db.InstallationState, err
 // Seed creates the singleton marker when this is a new database and reports
 // whether this call inserted it.
 func (s *InstallationStore) Seed(ctx context.Context) (bool, error) {
-	rows, err := s.q.SeedInstallationState(ctx)
+	installationID, err := newInstallationID()
+	if err != nil {
+		return false, err
+	}
+	rows, err := s.q.SeedInstallationState(ctx, installationID)
 	if err != nil {
 		return false, mapError(err)
 	}
 	return rows == 1, nil
+}
+
+// newInstallationID returns the stable 128-bit identity stored with the
+// singleton installation row. It is generated for every seed attempt, but
+// INSERT OR IGNORE preserves the first value across restarts and retries.
+func newInstallationID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
 }
 
 // SetInitialized changes the marker only when it still has expected value.

@@ -201,6 +201,77 @@ func TestVisibilityResolverEnforcesParentGateAndScopedRoleACL(t *testing.T) {
 	}
 }
 
+func TestVisibilityEpochRemainsMonotonicAcrossRevokeAndRegrant(t *testing.T) {
+	base := &store.StateProjection{
+		Users:  []db.User{{ID: 1, Username: "alice", Nickname: "Alice"}},
+		Groups: []db.ChannelGroup{{ID: 200, Name: "Private", Visibility: "private", Version: 1}},
+	}
+	loader := &staticProjectionLoader{projection: base}
+	state, err := realtime.NewStateStoreWithEpoch(context.Background(), loader, testEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := realtime.NewStatePublication(state, realtime.NewStateRing(), realtime.NewVisibilityResolver(), func() int64 { return 321 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loader.projection = projectionWithParentGrant(base, 1, 200)
+	grantCandidate, err := state.BuildPersistentCandidate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := publication.Commit(realtime.PublicationRequest{
+		Candidate:         grantCandidate,
+		VisibilityUserIDs: []int64{1},
+		Events:            []realtime.StateEventTemplate{{EventType: "visibility.granted", Scope: realtime.Scope{Type: "group", ID: 200}, Data: []byte(`{}`)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grant.Version.VisibilityEpoch(1) != 1 || len(grant.VisibilityChanges[1].Granted) != 1 || len(grant.VisibilityChanges[1].Revoked) != 0 || grant.Checkpoint.GEID != 1 {
+		t.Fatalf("grant publication = %+v", grant)
+	}
+	grantVersion := grant.Version
+
+	loader.projection = base
+	revokeCandidate, err := state.BuildPersistentCandidate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoke, err := publication.Commit(realtime.PublicationRequest{
+		Candidate:         revokeCandidate,
+		VisibilityUserIDs: []int64{1},
+		Events:            []realtime.StateEventTemplate{{EventType: "visibility.revoked", Scope: realtime.Scope{Type: "group", ID: 200}, Data: []byte(`{}`)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoke.Version.VisibilityEpoch(1) != 2 || len(revoke.VisibilityChanges[1].Granted) != 0 || len(revoke.VisibilityChanges[1].Revoked) != 1 || revoke.Checkpoint.GEID != 2 {
+		t.Fatalf("revoke publication = %+v", revoke)
+	}
+
+	loader.projection = projectionWithParentGrant(base, 1, 200)
+	regrantCandidate, err := state.BuildPersistentCandidate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	regrant, err := publication.Commit(realtime.PublicationRequest{
+		Candidate:         regrantCandidate,
+		VisibilityUserIDs: []int64{1},
+		Events:            []realtime.StateEventTemplate{{EventType: "visibility.granted", Scope: realtime.Scope{Type: "group", ID: 200}, Data: []byte(`{}`)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regrant.Version.VisibilityEpoch(1) != 3 || len(regrant.VisibilityChanges[1].Granted) != 1 || len(regrant.VisibilityChanges[1].Revoked) != 0 || regrant.Checkpoint.GEID != 3 {
+		t.Fatalf("regrant publication = %+v", regrant)
+	}
+	if grantVersion.VisibilityEpoch(1) != 1 || state.Current() != regrant.Version || state.Current().Number() != 3 {
+		t.Fatalf("immutable visibility versions changed: grant=%d current=%d", grantVersion.VisibilityEpoch(1), state.Current().Number())
+	}
+}
+
 func TestETagAndCursorContracts(t *testing.T) {
 	entity, err := realtime.NumericEntityETag("channel", 42, 7)
 	if err != nil || entity != `"channel:42:7"` {

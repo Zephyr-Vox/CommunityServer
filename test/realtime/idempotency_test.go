@@ -131,6 +131,74 @@ func TestDurableIdempotencyCanonicalReplayAndEpochChange(t *testing.T) {
 	}
 }
 
+func TestActivationIdempotencyUsesInstallationIdentityWithoutPlaintext(t *testing.T) {
+	stores := newStores(t)
+	ctx := context.Background()
+	installation, err := stores.Installation.Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := realtime.NewRequestIdentitySigner([]byte(strings.Repeat("s", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable, err := realtime.NewDurableActivationIdempotency(stores, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := realtime.InstallationCommandIdentity{
+		InstallationID:     installation.InstallationID,
+		ActivationCodeHash: strings.Repeat("a", 64),
+		Method:             "POST",
+		RouteTemplate:      "/api/v0/admin/activate",
+		CanonicalDTO:       []byte(`{"username":"boss","password":"secret123","nickname":"Boss"}`),
+	}
+	key := "activation-key-0001"
+	result := realtime.ActivationCommandResult{
+		CommandID: 77,
+		Status:    200,
+		Body:      []byte(`{"user":{"id":"42","username":"boss","nickname":"Boss","avatar":""}}`),
+	}
+	tx, err := stores.BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txStores := stores.WithTx(tx)
+	if err := durable.Admit(ctx, txStores); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.Save(ctx, txStores, identity, key, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	replay, found, err := durable.Lookup(ctx, identity, key)
+	if err != nil || !found || replay.CommandID != result.CommandID || replay.Status != result.Status {
+		t.Fatalf("activation replay=%+v found=%t err=%v", replay, found, err)
+	}
+	changedCode := identity
+	changedCode.ActivationCodeHash = strings.Repeat("b", 64)
+	if _, found, err := durable.Lookup(ctx, changedCode, key); !found || !errors.Is(err, realtime.ErrIdempotencyMismatch) {
+		t.Fatalf("activation code mismatch found=%t err=%v", found, err)
+	}
+	changedPassword := identity
+	changedPassword.CanonicalDTO = []byte(`{"username":"boss","password":"other123","nickname":"Boss"}`)
+	if _, found, err := durable.Lookup(ctx, changedPassword, key); !found || !errors.Is(err, realtime.ErrIdempotencyMismatch) {
+		t.Fatalf("activation request mismatch found=%t err=%v", found, err)
+	}
+
+	record, err := stores.ActivationIdempotency.Lookup(ctx, installation.InstallationID, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := strings.Join([]string{record.ActivationCodeHash, record.RequestHMAC, string(record.ResultBody)}, "\n")
+	if strings.Contains(stored, "secret123") || strings.Contains(stored, "BossPassword") || record.RequestHMAC == "" {
+		t.Fatalf("activation record retained plaintext request data: %+v", record)
+	}
+}
+
 func TestRuntimeIdempotencyCacheCoalescesExpiresAndCapsPerUser(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 	cache := realtime.NewRuntimeIdempotencyCacheWithClock(func() time.Time { return now })
@@ -184,13 +252,50 @@ func TestRuntimeIdempotencyCacheCoalescesExpiresAndCapsPerUser(t *testing.T) {
 	if cache.Len() != realtime.MaxRuntimeIdempotencyRecordsPerUser {
 		t.Fatalf("per-user record count = %d", cache.Len())
 	}
-	extra, err := cache.Claim(1, "runtime-key-9999", requestHMAC)
-	if err != nil || !extra.Owner() || cache.Len() != realtime.MaxRuntimeIdempotencyRecordsPerUser {
-		t.Fatalf("cap eviction owner=%t len=%d err=%v", extra != nil && extra.Owner(), cache.Len(), err)
+	if _, err := cache.Claim(1, "runtime-key-9999", requestHMAC); !errors.Is(err, realtime.ErrRuntimeIdempotencyFull) {
+		t.Fatalf("live per-user cap claim = %v, want ErrRuntimeIdempotencyFull", err)
 	}
 	oldest, err := cache.Claim(1, "runtime-key-0000", requestHMAC)
-	if err != nil || !oldest.Owner() {
-		t.Fatalf("oldest completed entry was not evicted: owner=%t err=%v", oldest != nil && oldest.Owner(), err)
+	if err != nil || oldest.Owner() {
+		t.Fatalf("live oldest result was evicted: owner=%t err=%v", oldest != nil && oldest.Owner(), err)
+	}
+	replayed, err := oldest.Wait(context.Background())
+	if err != nil || replayed.CommandID != 2 {
+		t.Fatalf("oldest replay = %+v, err=%v", replayed, err)
+	}
+}
+
+func TestRuntimeIdempotencyGlobalCapPreservesLiveResults(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	cache := realtime.NewRuntimeIdempotencyCacheWithClock(func() time.Time { return now })
+	requestHMAC := strings.Repeat("a", 64)
+	for index := 0; index < realtime.MaxRuntimeIdempotencyRecords; index++ {
+		principalID := int64(index/realtime.MaxRuntimeIdempotencyRecordsPerUser + 1)
+		key := fmt.Sprintf("global-key-%08d", index%realtime.MaxRuntimeIdempotencyRecordsPerUser)
+		claim, err := cache.Claim(principalID, key, requestHMAC)
+		if err != nil || !claim.Owner() {
+			t.Fatalf("global claim %d owner=%t err=%v", index, claim != nil && claim.Owner(), err)
+		}
+		if err := claim.Complete(runtimeResult(int64(index + 1))); err != nil {
+			t.Fatalf("complete global claim %d: %v", index, err)
+		}
+	}
+	if _, err := cache.Claim(10_000, "global-key-extra", requestHMAC); !errors.Is(err, realtime.ErrRuntimeIdempotencyFull) {
+		t.Fatalf("global cap claim = %v, want ErrRuntimeIdempotencyFull", err)
+	}
+	oldest, err := cache.Claim(1, "global-key-00000000", requestHMAC)
+	if err != nil || oldest.Owner() {
+		t.Fatalf("oldest global result was evicted: owner=%t err=%v", oldest != nil && oldest.Owner(), err)
+	}
+	result, err := oldest.Wait(context.Background())
+	if err != nil || result.CommandID != 1 {
+		t.Fatalf("oldest global replay=%+v err=%v", result, err)
+	}
+
+	now = now.Add(realtime.RuntimeIdempotencyTTL)
+	claim, err := cache.Claim(10_000, "global-key-extra", requestHMAC)
+	if err != nil || !claim.Owner() {
+		t.Fatalf("post-expiry global claim owner=%t err=%v", claim != nil && claim.Owner(), err)
 	}
 }
 
@@ -273,7 +378,7 @@ func TestSequencerPersistsReservedResultWithDomainTransaction(t *testing.T) {
 				Events: []realtime.StateEventTemplate{{
 					EventType: "group.created",
 					Scope:     realtime.Scope{Type: "server"},
-					Data:      []byte(fmt.Sprintf(`{"group_id":"%d"}`, group.ID)),
+					Data:      fmt.Appendf(nil, `{"group_id":"%d"}`, group.ID),
 				}},
 			})
 			if err != nil {
@@ -286,7 +391,7 @@ func TestSequencerPersistsReservedResultWithDomainTransaction(t *testing.T) {
 			if err := durable.Save(ctx, txStores, identity, key, realtime.CanonicalCommandResult{
 				CommandID:   commandID,
 				Status:      201,
-				Body:        []byte(fmt.Sprintf(`{"group":{"id":"%d","name":"Reserved"}}`, group.ID)),
+				Body:        fmt.Appendf(nil, `{"group":{"id":"%d","name":"Reserved"}}`, group.ID),
 				Checkpoint:  reserved.Checkpoint,
 				StateCursor: cursor,
 			}); err != nil {

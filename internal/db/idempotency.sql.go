@@ -10,15 +10,29 @@ import (
 	"database/sql"
 )
 
-const countCommandIdempotency = `-- name: CountCommandIdempotency :one
-SELECT COUNT(*) FROM command_idempotency
+const countDurableIdempotency = `-- name: CountDurableIdempotency :one
+SELECT
+    (SELECT COUNT(*) FROM command_idempotency) +
+    (SELECT COUNT(*) FROM activation_idempotency)
 `
 
-func (q *Queries) CountCommandIdempotency(ctx context.Context) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countCommandIdempotency)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
+func (q *Queries) CountDurableIdempotency(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countDurableIdempotency)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const deleteExpiredActivationIdempotency = `-- name: DeleteExpiredActivationIdempotency :execrows
+DELETE FROM activation_idempotency WHERE expires_at <= ?
+`
+
+func (q *Queries) DeleteExpiredActivationIdempotency(ctx context.Context, expiresAt int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteExpiredActivationIdempotency, expiresAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const deleteExpiredCommandIdempotency = `-- name: DeleteExpiredCommandIdempotency :execrows
@@ -33,22 +47,39 @@ func (q *Queries) DeleteExpiredCommandIdempotency(ctx context.Context, expiresAt
 	return result.RowsAffected()
 }
 
-const deleteOldestCommandIdempotency = `-- name: DeleteOldestCommandIdempotency :execrows
-DELETE FROM command_idempotency
-WHERE (principal_id, idempotency_key) IN (
-    SELECT principal_id, idempotency_key
-    FROM command_idempotency
-    ORDER BY created_at ASC, principal_id ASC, idempotency_key ASC
-    LIMIT ?
-)
+const getActivationIdempotency = `-- name: GetActivationIdempotency :one
+SELECT installation_id, idempotency_key, activation_code_hash, request_hmac,
+       command_id, status, result_body, etag, location, cache_control, "pragma",
+       created_at, expires_at
+FROM activation_idempotency
+WHERE installation_id = ? AND idempotency_key = ? AND expires_at > ?
 `
 
-func (q *Queries) DeleteOldestCommandIdempotency(ctx context.Context, limit int64) (int64, error) {
-	result, err := q.db.ExecContext(ctx, deleteOldestCommandIdempotency, limit)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
+type GetActivationIdempotencyParams struct {
+	InstallationID string `json:"installation_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	ExpiresAt      int64  `json:"expires_at"`
+}
+
+func (q *Queries) GetActivationIdempotency(ctx context.Context, arg GetActivationIdempotencyParams) (ActivationIdempotency, error) {
+	row := q.db.QueryRowContext(ctx, getActivationIdempotency, arg.InstallationID, arg.IdempotencyKey, arg.ExpiresAt)
+	var i ActivationIdempotency
+	err := row.Scan(
+		&i.InstallationID,
+		&i.IdempotencyKey,
+		&i.ActivationCodeHash,
+		&i.RequestHmac,
+		&i.CommandID,
+		&i.Status,
+		&i.ResultBody,
+		&i.Etag,
+		&i.Location,
+		&i.CacheControl,
+		&i.Pragma,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+	)
+	return i, err
 }
 
 const getCommandIdempotency = `-- name: GetCommandIdempotency :one
@@ -84,6 +115,49 @@ func (q *Queries) GetCommandIdempotency(ctx context.Context, arg GetCommandIdemp
 		&i.ExpiresAt,
 	)
 	return i, err
+}
+
+const insertActivationIdempotency = `-- name: InsertActivationIdempotency :exec
+INSERT INTO activation_idempotency (
+    installation_id, idempotency_key, activation_code_hash, request_hmac,
+    command_id, status, result_body, etag, location, cache_control, pragma,
+    created_at, expires_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`
+
+type InsertActivationIdempotencyParams struct {
+	InstallationID     string         `json:"installation_id"`
+	IdempotencyKey     string         `json:"idempotency_key"`
+	ActivationCodeHash string         `json:"activation_code_hash"`
+	RequestHmac        string         `json:"request_hmac"`
+	CommandID          int64          `json:"command_id"`
+	Status             int64          `json:"status"`
+	ResultBody         string         `json:"result_body"`
+	Etag               sql.NullString `json:"etag"`
+	Location           sql.NullString `json:"location"`
+	CacheControl       sql.NullString `json:"cache_control"`
+	Pragma             sql.NullString `json:"pragma"`
+	CreatedAt          int64          `json:"created_at"`
+	ExpiresAt          int64          `json:"expires_at"`
+}
+
+func (q *Queries) InsertActivationIdempotency(ctx context.Context, arg InsertActivationIdempotencyParams) error {
+	_, err := q.db.ExecContext(ctx, insertActivationIdempotency,
+		arg.InstallationID,
+		arg.IdempotencyKey,
+		arg.ActivationCodeHash,
+		arg.RequestHmac,
+		arg.CommandID,
+		arg.Status,
+		arg.ResultBody,
+		arg.Etag,
+		arg.Location,
+		arg.CacheControl,
+		arg.Pragma,
+		arg.CreatedAt,
+		arg.ExpiresAt,
+	)
+	return err
 }
 
 const insertCommandIdempotency = `-- name: InsertCommandIdempotency :exec

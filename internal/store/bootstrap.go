@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/rbac"
@@ -82,6 +84,12 @@ func verifyInstallation(ctx context.Context, s *Stores) error {
 	state, err := s.Installation.Get(ctx)
 	if err != nil {
 		return fmt.Errorf("store: installation state: %w", err)
+	}
+	if len(state.InstallationID) != 32 || state.InstallationID != strings.ToLower(state.InstallationID) {
+		return errors.New("store: invalid installation identity")
+	}
+	if _, err := hex.DecodeString(state.InstallationID); err != nil {
+		return fmt.Errorf("store: invalid installation identity: %w", err)
 	}
 	roles, err := s.Roles.List(ctx)
 	if err != nil {

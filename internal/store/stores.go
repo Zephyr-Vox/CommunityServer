@@ -32,6 +32,9 @@ type Stores struct {
 	Invites *InviteStore
 	// Idempotency manages durable completed HTTP command results.
 	Idempotency *IdempotencyStore
+	// ActivationIdempotency manages durable first-owner activation results before
+	// a principal exists.
+	ActivationIdempotency *ActivationIdempotencyStore
 }
 
 // New builds the stores over a connection. The idGen supplies snowflake IDs
@@ -40,17 +43,18 @@ func New(conn *sql.DB, idGen *snowflake.IDGenerator, now func() int64) *Stores {
 	q := db.New(conn)
 	roles := &RoleStore{q: q, idGen: idGen, now: now}
 	return &Stores{
-		conn:         conn,
-		Users:        &UserStore{conn: conn, q: q, idGen: idGen, now: now},
-		Roles:        roles,
-		Installation: &InstallationStore{q: q},
-		Channels:     &ChannelStore{q: q, idGen: idGen, now: now},
-		Access:       &AccessStore{q: q, idGen: idGen, now: now},
-		Configs:      &ConfigStore{q: q, roles: roles, now: now},
-		Mutes:        &MuteStore{q: q, idGen: idGen, now: now},
-		Sessions:     &SessionStore{q: q, idGen: idGen, now: now},
-		Invites:      &InviteStore{q: q, idGen: idGen, now: now},
-		Idempotency:  &IdempotencyStore{q: q, now: now},
+		conn:                  conn,
+		Users:                 &UserStore{conn: conn, q: q, idGen: idGen, now: now},
+		Roles:                 roles,
+		Installation:          &InstallationStore{q: q},
+		Channels:              &ChannelStore{q: q, idGen: idGen, now: now},
+		Access:                &AccessStore{q: q, idGen: idGen, now: now},
+		Configs:               &ConfigStore{q: q, roles: roles, now: now},
+		Mutes:                 &MuteStore{q: q, idGen: idGen, now: now},
+		Sessions:              &SessionStore{q: q, idGen: idGen, now: now},
+		Invites:               &InviteStore{q: q, idGen: idGen, now: now},
+		Idempotency:           &IdempotencyStore{q: q, now: now},
+		ActivationIdempotency: &ActivationIdempotencyStore{q: q, now: now},
 	}
 }
 
@@ -72,16 +76,17 @@ func (s *Stores) WithTx(tx *sql.Tx) *Stores {
 	q := db.New(tx)
 	roles := &RoleStore{q: q, idGen: s.Roles.idGen, now: s.Roles.now}
 	return &Stores{
-		conn:         nil,
-		Users:        &UserStore{conn: nil, q: q, idGen: s.Users.idGen, now: s.Users.now},
-		Roles:        roles,
-		Installation: &InstallationStore{q: q},
-		Channels:     &ChannelStore{q: q, idGen: s.Channels.idGen, now: s.Channels.now},
-		Access:       &AccessStore{q: q, idGen: s.Access.idGen, now: s.Access.now},
-		Configs:      &ConfigStore{q: q, roles: roles, now: s.Configs.now},
-		Mutes:        &MuteStore{q: q, idGen: s.Mutes.idGen, now: s.Mutes.now},
-		Sessions:     &SessionStore{q: q, idGen: s.Sessions.idGen, now: s.Sessions.now},
-		Invites:      &InviteStore{q: q, idGen: s.Invites.idGen, now: s.Invites.now},
-		Idempotency:  &IdempotencyStore{q: q, now: s.Idempotency.now, transactional: true},
+		conn:                  nil,
+		Users:                 &UserStore{conn: nil, q: q, idGen: s.Users.idGen, now: s.Users.now},
+		Roles:                 roles,
+		Installation:          &InstallationStore{q: q},
+		Channels:              &ChannelStore{q: q, idGen: s.Channels.idGen, now: s.Channels.now},
+		Access:                &AccessStore{q: q, idGen: s.Access.idGen, now: s.Access.now},
+		Configs:               &ConfigStore{q: q, roles: roles, now: s.Configs.now},
+		Mutes:                 &MuteStore{q: q, idGen: s.Mutes.idGen, now: s.Mutes.now},
+		Sessions:              &SessionStore{q: q, idGen: s.Sessions.idGen, now: s.Sessions.now},
+		Invites:               &InviteStore{q: q, idGen: s.Invites.idGen, now: s.Invites.now},
+		Idempotency:           &IdempotencyStore{q: q, now: s.Idempotency.now, transactional: true},
+		ActivationIdempotency: &ActivationIdempotencyStore{q: q, now: s.ActivationIdempotency.now, transactional: true},
 	}
 }
