@@ -251,6 +251,10 @@ func (s *Service) CreateBinding(ctx context.Context, actorID int64, input Bindin
 	if err := s.checkBindingAuthority(ctx, txStores, actorID, input); err != nil {
 		return nil, false, err
 	}
+	// The lookup fast-path makes repeated requests idempotent. InsertBinding's
+	// unique constraint remains the authority for requests that race outside this
+	// process's principal barrier, so an ErrConflict below is recovered by the
+	// same lookup before reporting failure.
 	if existing, err := matchingBinding(ctx, txStores, input); err != nil {
 		return nil, false, err
 	} else if existing != nil {
@@ -281,6 +285,9 @@ func (s *Service) CreateBinding(ctx context.Context, actorID int64, input Bindin
 // DeleteBinding removes one non-owner binding after strict actor/target rank
 // validation. Owner bindings are rejected by the store and must use transfer.
 func (s *Service) DeleteBinding(ctx context.Context, actorID, bindingID int64) error {
+	// Discover the target before acquiring locks so deletion serializes with
+	// mutations for both actor and target. The binding is read again inside the
+	// transaction because it may have changed or been deleted while waiting.
 	binding, err := s.stores.Roles.GetBinding(ctx, bindingID)
 	if err != nil {
 		return err
@@ -384,6 +391,8 @@ func (s *Service) UpdateConfig(ctx context.Context, actorID int64, input ConfigI
 			return nil, err
 		}
 	}
+	// Capture affected users in the same transaction as the config write. Cache
+	// invalidation follows commit so readers never reload from rolled-back state.
 	userIDs, err := txStores.Roles.ListUsersWithBindings(ctx)
 	if err != nil {
 		return nil, err
@@ -426,6 +435,8 @@ func (s *Service) ResetConfig(ctx context.Context, actorID int64, scope store.Co
 			return nil, err
 		}
 	}
+	// See UpdateConfig: this snapshot and the config reset commit together; only
+	// committed permission changes may invalidate principal cache entries.
 	userIDs, err := txStores.Roles.ListUsersWithBindings(ctx)
 	if err != nil {
 		return nil, err

@@ -63,7 +63,10 @@ func NewPrincipalCache(stores *store.Stores, ttl time.Duration) *PrincipalCache 
 	}
 }
 
-// Get returns the cached snapshot, resolving it from the store on a miss.
+// Get returns the cached snapshot, resolving it from the store on a miss. Its
+// read lock is the reader side of LockMutation: writers retain the matching
+// write lock through commit and cache invalidation, so this read cannot observe
+// a principal snapshot across a mutation boundary.
 func (p *PrincipalCache) Get(ctx context.Context, userID int64) (PrincipalSnapshot, error) {
 	unlock := p.locks.rLock(userID)
 	defer unlock()
