@@ -41,7 +41,7 @@ func NewInviteService(stores *store.Stores, principals *PrincipalCache, now func
 }
 
 // Create generates an 8-character [0-9A-Z] code and stores its digest.
-// Defaults: role = default_role, uses = 1, expires in DefaultInviteTTL. An
+// Defaults: role = member, uses = 1, expires in DefaultInviteTTL. An
 // explicit expiresAt must be in the future.
 func (s *InviteService) Create(ctx context.Context, createdBy int64, roleKey string, uses int64, expiresAt *int64) (string, *db.Invite, error) {
 	// Validate request-local fields before generating the one-time secret.

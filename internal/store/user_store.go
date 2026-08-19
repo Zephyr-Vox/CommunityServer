@@ -153,6 +153,7 @@ func (s *UserStore) ListUsers(ctx context.Context, limit, offset int64) ([]db.Us
 }
 
 // Delete removes a user row. Sessions and role bindings cascade; invites the
+// user created remain with created_by set to NULL.
 func (s *UserStore) Delete(ctx context.Context, id int64) error {
 	_, err := s.q.DeleteUser(ctx, id)
 	return mapError(err)

@@ -59,7 +59,7 @@ func (s *RoleStore) Update(ctx context.Context, key, displayName string, rank in
 
 // Delete removes an unreferenced role. Callers that need reference checking and
 // deletion to be indivisible must use it through a transaction-bound store.
-// Built-in role protection and actor rank checks are control-plane policy.
+// It rejects built-in roles; actor rank checks remain control-plane policy.
 func (s *RoleStore) Delete(ctx context.Context, key string) error {
 	role, err := s.q.GetRoleByKey(ctx, key)
 	if err != nil {
