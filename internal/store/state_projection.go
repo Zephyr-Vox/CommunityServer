@@ -32,10 +32,17 @@ type StateProjection struct {
 	Mutes []db.ModerationMute
 }
 
-// LoadStateProjection reads all persistent state from one read transaction.
-// The returned database rows are copied by the StateStore before publication,
-// so callers must not retain them as mutable shared state.
+// LoadStateProjection reads all persistent state from one coherent transaction
+// view. Root stores open a read transaction, while transaction-bound stores
+// read their caller-owned view including its uncommitted writes. The returned
+// rows are copied by the StateStore before publication.
 func (s *Stores) LoadStateProjection(ctx context.Context) (*StateProjection, error) {
+	if s == nil {
+		return nil, ErrInvalidStore
+	}
+	if s.conn == nil {
+		return s.loadStateProjection(ctx)
+	}
 	tx, err := s.BeginReadTx(ctx)
 	if err != nil {
 		return nil, err
@@ -43,46 +50,57 @@ func (s *Stores) LoadStateProjection(ctx context.Context) (*StateProjection, err
 	defer tx.Rollback()
 	txStores := s.WithTx(tx)
 
-	users, err := txStores.Users.ListAll(ctx)
-	if err != nil {
-		return nil, err
-	}
-	roles, err := txStores.Roles.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	groups, err := txStores.Channels.ListGroups(ctx)
-	if err != nil {
-		return nil, err
-	}
-	channels, err := txStores.Channels.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	groupAccess, err := txStores.Access.ListAllGroups(ctx)
-	if err != nil {
-		return nil, err
-	}
-	channelAccess, err := txStores.Access.ListAllChannels(ctx)
-	if err != nil {
-		return nil, err
-	}
-	bindings, err := txStores.Roles.ListEveryBinding(ctx)
-	if err != nil {
-		return nil, err
-	}
-	configs, err := txStores.Configs.ListAll(ctx)
-	if err != nil {
-		return nil, err
-	}
-	mutes, err := txStores.Mutes.ListAll(ctx)
+	projection, err := txStores.loadStateProjection(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	return projection, nil
+}
 
+// loadStateProjection reads every synchronized table through s's existing
+// connection or transaction. Transaction-bound callers observe their own
+// uncommitted mutation, which lets realtime reserve a durable result before
+// committing that same transaction.
+func (s *Stores) loadStateProjection(ctx context.Context) (*StateProjection, error) {
+	users, err := s.Users.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	roles, err := s.Roles.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	groups, err := s.Channels.ListGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	channels, err := s.Channels.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	groupAccess, err := s.Access.ListAllGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	channelAccess, err := s.Access.ListAllChannels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	bindings, err := s.Roles.ListEveryBinding(ctx)
+	if err != nil {
+		return nil, err
+	}
+	configs, err := s.Configs.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	mutes, err := s.Mutes.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return &StateProjection{
 		Users:         users,
 		Roles:         roles,

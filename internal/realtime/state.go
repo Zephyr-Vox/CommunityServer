@@ -379,8 +379,19 @@ func (s *StateStore) Current() *StateVersion {
 // unpublished version derived from the current runtime state. StatePublication
 // will later verify candidate.Base against Current before making it visible.
 func (s *StateStore) BuildPersistentCandidate(ctx context.Context) (*StateCandidate, error) {
+	return s.BuildPersistentCandidateFrom(ctx, s.loader)
+}
+
+// BuildPersistentCandidateFrom loads an unpublished persistent version using
+// loader while retaining s's current runtime state. Persistent commands pass a
+// transaction-bound store so the candidate, its reserved checkpoint, and the
+// durable idempotency result all describe the same rollbackable database view.
+func (s *StateStore) BuildPersistentCandidateFrom(ctx context.Context, loader ProjectionLoader) (*StateCandidate, error) {
+	if s == nil || loader == nil {
+		return nil, ErrInvalidProjection
+	}
 	base := s.Current()
-	projection, err := s.loader.LoadStateProjection(ctx)
+	projection, err := loader.LoadStateProjection(ctx)
 	if err != nil {
 		return nil, err
 	}

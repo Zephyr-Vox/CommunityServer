@@ -40,6 +40,9 @@ var (
 	// ErrInvalidPermissionConfig is returned when a config references an
 	// unknown role/permission or violates scope and owner constraints.
 	ErrInvalidPermissionConfig = errors.New("store: invalid permission config")
+	// ErrInvalidStore is returned when a store operation receives a nil Stores
+	// receiver.
+	ErrInvalidStore = errors.New("store: invalid stores")
 )
 
 // SQLite extended result code for SQLITE_CONSTRAINT_UNIQUE.

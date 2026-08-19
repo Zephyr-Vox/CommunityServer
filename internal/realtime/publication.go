@@ -59,6 +59,19 @@ type PublicationResult struct {
 	VisibilityChanges map[int64]VisibilityChange
 }
 
+// PublicationReservation holds StatePublication's commit lock after all final
+// event IDs, visibility epochs, and the successor checkpoint have been
+// calculated. Persistent commands use Result while their database transaction
+// is still rollbackable, then publish only after that transaction commits.
+// Exactly one of Publish or Abort releases the reservation.
+type PublicationReservation struct {
+	publication *StatePublication
+	result      PublicationResult
+
+	mu        sync.Mutex
+	completed bool
+}
+
 // PublicationSnapshot is one coherent capture of StateStore and ring state.
 // It is the required read path for snapshot and replay code that must not pair
 // a version with a different ring high-water mark.
@@ -105,13 +118,95 @@ func (p *StatePublication) SetHook(hook PublicationHook) {
 	p.hook = hook
 }
 
-// Commit publishes request as the immediate successor to StateStore's current
-// version. It allocates contiguous GEIDs, advances visibility epochs only for
-// real visible-scope transitions, appends the ring, and swaps the state pointer
-// without exposing a forward version that lacks its replayable events.
+// Commit reserves and immediately publishes request as the immediate successor
+// to StateStore's current version. Persistent commands must instead Reserve
+// before their database commit so their durable result can contain this exact
+// checkpoint and a cursor signed from the final visibility epoch.
 func (p *StatePublication) Commit(request PublicationRequest) (PublicationResult, error) {
+	reservation, err := p.Reserve(request)
+	if err != nil {
+		return PublicationResult{}, err
+	}
+	return reservation.Publish()
+}
+
+// Reserve calculates request's final StatePublication result and keeps the
+// publication lock held without making it visible. The caller must use the
+// returned result only to persist facts that belong to the same database
+// transaction, then call Publish after commit or Abort on every rollback path.
+func (p *StatePublication) Reserve(request PublicationRequest) (*PublicationReservation, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	result, err := p.reserveLocked(request)
+	if err != nil {
+		p.mu.Unlock()
+		return nil, err
+	}
+	return &PublicationReservation{publication: p, result: result}, nil
+}
+
+// Result returns an independent copy of the final, still-unpublished result.
+// Its Version carries the final visibility epochs needed to issue response
+// cursors in the enclosing rollbackable transaction.
+func (r *PublicationReservation) Result() PublicationResult {
+	if r == nil {
+		return PublicationResult{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return clonePublicationResult(r.result)
+}
+
+// Abort discards r's unpublished work and releases its publication lock. It is
+// idempotent so transaction rollback defers may safely call it after errors.
+func (r *PublicationReservation) Abort() {
+	if !r.claimCompletion() {
+		return
+	}
+	r.publication.mu.Unlock()
+}
+
+// Publish makes r's precomputed state, ring entries, and visibility epochs
+// visible as one atomic publication. It must run only after the enclosing
+// persistent transaction commits; callers treat an error as process-fatal.
+func (r *PublicationReservation) Publish() (PublicationResult, error) {
+	if !r.claimCompletion() {
+		return PublicationResult{}, ErrInvalidPublication
+	}
+	defer r.publication.mu.Unlock()
+
+	p := r.publication
+	p.callHook(PublicationBeforeRingAppend)
+	if err := p.ring.Append(r.result.Events); err != nil {
+		return PublicationResult{}, err
+	}
+	p.callHook(PublicationAfterRingAppend)
+	p.callHook(PublicationBeforeStateSwap)
+	p.state.current.Store(r.result.Version)
+	p.callHook(PublicationAfterStateSwap)
+	return clonePublicationResult(r.result), nil
+}
+
+// claimCompletion grants the one release operation for r. The corresponding
+// StatePublication lock is intentionally acquired by Reserve and released by
+// the winning caller, preventing another state command from changing its final
+// checkpoint between durable persistence and publication.
+func (r *PublicationReservation) claimCompletion() bool {
+	if r == nil || r.publication == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.completed {
+		return false
+	}
+	r.completed = true
+	return true
+}
+
+// reserveLocked calculates one final publication while p.mu is held. It leaves
+// the calculated version unpublished so a transaction can atomically persist a
+// response containing its final checkpoint before Publish exposes it.
+func (p *StatePublication) reserveLocked(request PublicationRequest) (PublicationResult, error) {
 
 	if request.Candidate == nil || request.Candidate.base == nil || request.Candidate.version == nil {
 		return PublicationResult{}, ErrInvalidPublication
@@ -150,15 +245,9 @@ func (p *StatePublication) Commit(request PublicationRequest) (PublicationResult
 	if len(events) != 0 {
 		after.checkpoint.GEID = events[len(events)-1].GEID
 	}
-	p.callHook(PublicationBeforeRingAppend)
-	if err := p.ring.Append(events); err != nil {
+	if err := p.ring.ValidateAppend(events); err != nil {
 		return PublicationResult{}, err
 	}
-	p.callHook(PublicationAfterRingAppend)
-	p.callHook(PublicationBeforeStateSwap)
-	p.state.current.Store(after)
-	p.callHook(PublicationAfterStateSwap)
-
 	return PublicationResult{
 		Version:           after,
 		Checkpoint:        after.checkpoint,
@@ -249,4 +338,15 @@ func cloneVisibilityChanges(changes map[int64]VisibilityChange) map[int64]Visibi
 		}
 	}
 	return cloned
+}
+
+// clonePublicationResult copies collection fields that callers may retain or
+// mutate. StateVersion is immutable by contract and is therefore shared.
+func clonePublicationResult(result PublicationResult) PublicationResult {
+	return PublicationResult{
+		Version:           result.Version,
+		Checkpoint:        result.Checkpoint,
+		Events:            cloneStateEvents(result.Events),
+		VisibilityChanges: cloneVisibilityChanges(result.VisibilityChanges),
+	}
 }

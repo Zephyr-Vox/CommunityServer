@@ -105,6 +105,17 @@ func (r *StateRing) Append(events []StateEvent) error {
 	return r.appendLocked(events)
 }
 
+// ValidateAppend reports whether events could be appended to r at its current
+// high-water mark without changing retention. StatePublication uses it while
+// reserving a final checkpoint before the associated database transaction
+// commits; Append repeats the validation at the actual commit boundary.
+func (r *StateRing) ValidateAppend(events []StateEvent) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, err := r.validateAppendLocked(events)
+	return err
+}
+
 // EventsAfter returns every retained event with GEID greater than geid and
 // whether the complete interval from geid is still replayable. A false result
 // means the caller must require a full snapshot rather than replay a suffix.
@@ -165,21 +176,9 @@ func (r *StateRing) Bytes() int {
 // appendLocked validates a whole batch before mutating the ring. Callers hold
 // r.mu so a failed validation can never leave a partially appended sequence.
 func (r *StateRing) appendLocked(events []StateEvent) error {
-	prepared := make([]StateEvent, len(events))
-	expected := r.highWater + 1
-	for i, event := range events {
-		if event.GEID != expected {
-			return ErrStateRingSequence
-		}
-		normalized, err := normalizeStateEvent(event)
-		if err != nil {
-			return err
-		}
-		if len(normalized.encoded) > MaxStateEventBytes || len(normalized.encoded) > r.maxBytes {
-			return ErrStateEventTooLarge
-		}
-		prepared[i] = normalized
-		expected++
+	prepared, err := r.validateAppendLocked(events)
+	if err != nil {
+		return err
 	}
 	for _, event := range prepared {
 		r.events = append(r.events, event)
@@ -191,6 +190,28 @@ func (r *StateRing) appendLocked(events []StateEvent) error {
 		}
 	}
 	return nil
+}
+
+// validateAppendLocked normalizes a complete contiguous batch without
+// modifying r. Callers hold either r.mu or r.mu.RLock.
+func (r *StateRing) validateAppendLocked(events []StateEvent) ([]StateEvent, error) {
+	prepared := make([]StateEvent, len(events))
+	expected := r.highWater + 1
+	for i, event := range events {
+		if event.GEID != expected {
+			return nil, ErrStateRingSequence
+		}
+		normalized, err := normalizeStateEvent(event)
+		if err != nil {
+			return nil, err
+		}
+		if len(normalized.encoded) > MaxStateEventBytes || len(normalized.encoded) > r.maxBytes {
+			return nil, ErrStateEventTooLarge
+		}
+		prepared[i] = normalized
+		expected++
+	}
+	return prepared, nil
 }
 
 // stateEventFromTemplate assigns the publication-owned GEID and timestamp to a
@@ -220,16 +241,7 @@ func normalizeStateEvent(event StateEvent) (StateEvent, error) {
 		return StateEvent{}, ErrInvalidStateEvent
 	}
 	event.Data = append(json.RawMessage(nil), event.Data...)
-	encoded, err := json.Marshal(stateEventEnvelope{
-		Type:        "state.event",
-		GEID:        strconv.FormatUint(event.GEID, 10),
-		Class:       "state",
-		Scope:       stateEventScope(event.Scope),
-		EventType:   event.EventType,
-		CausationID: commandIDText(event.CausationID),
-		ServerTime:  event.ServerTime,
-		Data:        event.Data,
-	})
+	encoded, err := json.Marshal(stateEventEnvelopeFromEvent(event))
 	if err != nil {
 		return StateEvent{}, fmt.Errorf("realtime: encode state event: %w", err)
 	}
@@ -247,6 +259,21 @@ type stateEventEnvelope struct {
 	CausationID string          `json:"causation_id,omitempty"`
 	ServerTime  int64           `json:"server_time"`
 	Data        json.RawMessage `json:"data"`
+}
+
+// stateEventEnvelopeFromEvent creates the canonical cursor-free envelope for
+// event retained by the ring.
+func stateEventEnvelopeFromEvent(event StateEvent) stateEventEnvelope {
+	return stateEventEnvelope{
+		Type:        "state.event",
+		GEID:        strconv.FormatUint(event.GEID, 10),
+		Class:       "state",
+		Scope:       stateEventScope(event.Scope),
+		EventType:   event.EventType,
+		CausationID: commandIDText(event.CausationID),
+		ServerTime:  event.ServerTime,
+		Data:        event.Data,
+	}
 }
 
 // eventScope keeps IDs in the protocol's decimal-string representation.
