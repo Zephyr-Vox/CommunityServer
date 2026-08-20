@@ -39,14 +39,22 @@ type LoginResult struct {
 // It never reads roles: those are resolved per request through the principal
 // cache by the resolver.
 type AuthService struct {
-	stores     *store.Stores
-	users      *store.UserStore
-	sessions   *store.SessionStore
-	principals *PrincipalCache
-	secret     []byte
-	accessTTL  time.Duration
-	refreshTTL time.Duration
-	now        func() int64 // Unix milliseconds, injectable for tests
+	stores      *store.Stores
+	users       *store.UserStore
+	sessions    *store.SessionStore
+	principals  *PrincipalCache
+	secret      []byte
+	accessTTL   time.Duration
+	refreshTTL  time.Duration
+	now         func() int64 // Unix milliseconds, injectable for tests
+	connections ConnectionRevoker
+}
+
+// SetConnectionRevoker installs the lifecycle owner notified by session and
+// account revocations. Server assembly calls it before routes accept requests;
+// a nil value leaves the service usable for HTTP-only tests.
+func (s *AuthService) SetConnectionRevoker(revoker ConnectionRevoker) {
+	s.connections = revoker
 }
 
 // NewAuthService returns an AuthService. The now function supplies Unix
@@ -114,8 +122,25 @@ func (s *AuthService) Refresh(ctx context.Context, refreshToken string) (*TokenP
 	}
 	now := s.now()
 	s.cleanupExpired(ctx, now)
-	sess, err := s.sessions.Rotate(ctx, sha256Hex(refreshToken), sha256Hex(newRefresh), now+s.refreshTTL.Milliseconds())
+	oldTokenHash := sha256Hex(refreshToken)
+	previous, err := s.sessions.GetByAnyTokenHash(ctx, oldTokenHash)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, ErrInvalidRefresh
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// A refresh-token reuse can delete the session. Holding the same user write
+	// barrier as WS admission ensures its connection set is later scanned from a
+	// single lifecycle linearization point rather than missing an opening socket.
+	unlock := s.principals.LockMutation(previous.UserID)
+	defer unlock()
+	sess, err := s.sessions.Rotate(ctx, oldTokenHash, sha256Hex(newRefresh), now+s.refreshTTL.Milliseconds())
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrSessionReused) {
+		if errors.Is(err, store.ErrSessionReused) {
+			s.disconnectLoginSession(previous.UserID, previous.ID, "refresh_reused")
+		}
 		return nil, ErrInvalidRefresh
 	}
 	if err != nil {
@@ -127,13 +152,14 @@ func (s *AuthService) Refresh(ctx context.Context, refreshToken string) (*TokenP
 		// The account vanished or was banned after the session was created:
 		// revoke the session and reject the refresh.
 		_ = s.sessions.Delete(ctx, sess.ID)
+		s.disconnectLoginSession(sess.UserID, sess.ID, "auth_revoked")
 		return nil, ErrInvalidRefresh
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	access, err := SignAccess(s.secret, sess.UserID, user.AuthVersion, s.accessTTL, time.UnixMilli(now))
+	access, err := SignAccess(s.secret, sess.UserID, user.AuthVersion, sess.ID, s.accessTTL, time.UnixMilli(now))
 	if err != nil {
 		return nil, err
 	}
@@ -147,9 +173,23 @@ func (s *AuthService) Refresh(ctx context.Context, refreshToken string) (*TokenP
 // Logout revokes the session behind the refresh token. Logging out with an
 // unknown token is a no-op (idempotent).
 func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
-	err := s.sessions.DeleteByTokenHash(ctx, sha256Hex(refreshToken))
+	tokenHash := sha256Hex(refreshToken)
+	sess, err := s.sessions.GetByTokenHash(ctx, tokenHash)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	unlock := s.principals.LockMutation(sess.UserID)
+	defer unlock()
+	err = s.sessions.DeleteByTokenHash(ctx, tokenHash)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err == nil {
+		s.disconnectLoginSession(sess.UserID, sess.ID, "logged_out")
 	}
 	return err
 }
@@ -168,6 +208,7 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID int64, newPassw
 	}); err != nil {
 		return err
 	}
+	s.disconnectUser(userID, "password_changed")
 	s.principals.Invalidate(userID)
 	return nil
 }
@@ -201,6 +242,7 @@ func (s *AuthService) ResetPassword(ctx context.Context, actorID, userID int64, 
 	}); err != nil {
 		return err
 	}
+	s.disconnectUser(userID, "password_reset")
 	s.principals.Invalidate(userID)
 	return nil
 }
@@ -243,7 +285,8 @@ func runTx(ctx context.Context, stores *store.Stores, fn func(*store.Stores) err
 	return tx.Commit()
 }
 
-// issue creates and persists a refresh token with its matching access token.
+// issue creates and persists a refresh token before signing an access token
+// bound to the returned login-session ID.
 func (s *AuthService) issue(ctx context.Context, userID, authVersion int64, deviceID string) (*TokenPair, error) {
 	refresh, err := randomHex(32)
 	if err != nil {
@@ -251,11 +294,12 @@ func (s *AuthService) issue(ctx context.Context, userID, authVersion int64, devi
 	}
 	now := s.now()
 
-	access, err := SignAccess(s.secret, userID, authVersion, s.accessTTL, time.UnixMilli(now))
+	sess, err := s.sessions.Upsert(ctx, userID, deviceID, sha256Hex(refresh), now+s.refreshTTL.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.sessions.Upsert(ctx, userID, deviceID, sha256Hex(refresh), now+s.refreshTTL.Milliseconds()); err != nil {
+	access, err := SignAccess(s.secret, userID, authVersion, sess.ID, s.accessTTL, time.UnixMilli(now))
+	if err != nil {
 		return nil, err
 	}
 	return &TokenPair{
@@ -268,4 +312,20 @@ func (s *AuthService) issue(ctx context.Context, userID, authVersion int64, devi
 // cleanupExpired removes expired refresh-token sessions on a best-effort basis.
 func (s *AuthService) cleanupExpired(ctx context.Context, now int64) {
 	_, _ = s.sessions.DeleteExpired(ctx, now)
+}
+
+// disconnectLoginSession delegates the post-revocation lifecycle transition
+// while the caller still holds the corresponding principal mutation barrier.
+func (s *AuthService) disconnectLoginSession(userID, loginSessionID int64, reason string) {
+	if s.connections != nil {
+		s.connections.DisconnectLoginSession(userID, loginSessionID, reason)
+	}
+}
+
+// disconnectUser delegates an account-wide lifecycle transition while the
+// caller still holds the target user's principal mutation barrier.
+func (s *AuthService) disconnectUser(userID int64, reason string) {
+	if s.connections != nil {
+		s.connections.DisconnectUser(userID, reason)
+	}
 }

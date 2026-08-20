@@ -185,6 +185,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_prev_token_hash
+    ON sessions(prev_token_hash) WHERE prev_token_hash IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS invites (
     id         INTEGER PRIMARY KEY CHECK (id > 0),

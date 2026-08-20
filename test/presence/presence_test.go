@@ -225,7 +225,7 @@ func (e *env) createUser(t *testing.T, username string) *db.User {
 
 func (e *env) token(t *testing.T, u *db.User) string {
 	t.Helper()
-	tok, err := auth.SignAccess(e.secret, u.ID, u.AuthVersion, time.Hour, time.Now())
+	tok, err := auth.SignAccess(e.secret, u.ID, u.AuthVersion, 1, time.Hour, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

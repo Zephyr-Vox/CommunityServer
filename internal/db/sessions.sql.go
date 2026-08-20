@@ -61,6 +61,26 @@ func (q *Queries) DeleteUserSessions(ctx context.Context, userID int64) error {
 	return err
 }
 
+const getSessionByAnyTokenHash = `-- name: GetSessionByAnyTokenHash :one
+SELECT id, user_id, device_id, token_hash, prev_token_hash, expires_at, last_used_at, created_at FROM sessions WHERE token_hash = ?1 OR prev_token_hash = ?1
+`
+
+func (q *Queries) GetSessionByAnyTokenHash(ctx context.Context, tokenHash string) (Session, error) {
+	row := q.db.QueryRowContext(ctx, getSessionByAnyTokenHash, tokenHash)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.DeviceID,
+		&i.TokenHash,
+		&i.PrevTokenHash,
+		&i.ExpiresAt,
+		&i.LastUsedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getSessionByID = `-- name: GetSessionByID :one
 SELECT id, user_id, device_id, token_hash, prev_token_hash, expires_at, last_used_at, created_at FROM sessions WHERE id = ?
 `

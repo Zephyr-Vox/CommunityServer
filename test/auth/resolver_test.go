@@ -51,7 +51,7 @@ func TestResolverAuthenticatesValidToken(t *testing.T) {
 	e := newEnv(t)
 	u := e.createUser(t, "alice", "secret123", "member", "moderator")
 
-	token, err := auth.SignAccess(e.secret, u.ID, 0, time.Hour, time.Now())
+	token, err := auth.SignAccess(e.secret, u.ID, 0, 1, time.Hour, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestResolverRejectsBannedUser(t *testing.T) {
 	}
 	e.principals.Invalidate(u.ID)
 
-	token, err := auth.SignAccess(e.secret, u.ID, 0, time.Hour, time.Now())
+	token, err := auth.SignAccess(e.secret, u.ID, 0, 1, time.Hour, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestResolverRejectsRevokedToken(t *testing.T) {
 	ctx := context.Background()
 	u := e.createUser(t, "alice", "secret123", "member")
 
-	token, err := auth.SignAccess(e.secret, u.ID, 0, time.Hour, time.Now())
+	token, err := auth.SignAccess(e.secret, u.ID, 0, 1, time.Hour, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestResolverRejectsRevokedToken(t *testing.T) {
 func TestResolverRolePropagation(t *testing.T) {
 	e := newEnv(t)
 	u := e.createUser(t, "alice", "secret123", "member")
-	token, err := auth.SignAccess(e.secret, u.ID, 0, time.Hour, time.Now())
+	token, err := auth.SignAccess(e.secret, u.ID, 0, 1, time.Hour, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

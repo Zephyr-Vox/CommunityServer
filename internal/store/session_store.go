@@ -51,6 +51,17 @@ func (s *SessionStore) GetByTokenHash(ctx context.Context, tokenHash string) (*d
 	return &sess, nil
 }
 
+// GetByAnyTokenHash returns the session whose current or immediately previous
+// refresh-token hash matches tokenHash, or ErrNotFound. Refresh reuse handling
+// uses it to identify the user before acquiring that user's mutation barrier.
+func (s *SessionStore) GetByAnyTokenHash(ctx context.Context, tokenHash string) (*db.Session, error) {
+	sess, err := s.q.GetSessionByAnyTokenHash(ctx, tokenHash)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &sess, nil
+}
+
 // GetByID returns the session with the given ID, or ErrNotFound.
 func (s *SessionStore) GetByID(ctx context.Context, id int64) (*db.Session, error) {
 	sess, err := s.q.GetSessionByID(ctx, id)

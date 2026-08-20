@@ -51,6 +51,13 @@ type UserService struct {
 	principals    *PrincipalCache
 	presence      PresenceRevoker
 	avatarCleaner AvatarCleaner
+	connections   ConnectionRevoker
+}
+
+// SetConnectionRevoker installs the lifecycle owner notified after kick, ban,
+// and account deletion. Server assembly calls it before routes accept requests.
+func (s *UserService) SetConnectionRevoker(revoker ConnectionRevoker) {
+	s.connections = revoker
 }
 
 // NewUserService returns a UserService. avatarCleaner may be nil, in which
@@ -204,6 +211,7 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 	}); err != nil {
 		return err
 	}
+	s.disconnectUser(userID, "kicked")
 	s.principals.Invalidate(userID)
 	s.presence.Remove(userID)
 	return nil
@@ -236,6 +244,7 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 	}); err != nil {
 		return err
 	}
+	s.disconnectUser(userID, "banned")
 	s.principals.Invalidate(userID)
 	s.presence.Remove(userID)
 	return nil
@@ -259,6 +268,14 @@ func (s *UserService) Unban(ctx context.Context, actorID, userID int64) error {
 	}
 	s.principals.Invalidate(userID)
 	return nil
+}
+
+// disconnectUser delegates an account-wide lifecycle transition while the
+// caller still holds the target user's principal mutation barrier.
+func (s *UserService) disconnectUser(userID int64, reason string) {
+	if s.connections != nil {
+		s.connections.DisconnectUser(userID, reason)
+	}
 }
 
 // Delete hard-deletes a user. Sessions and role bindings cascade; invites the user
@@ -294,6 +311,7 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	}); err != nil {
 		return err
 	}
+	s.disconnectUser(userID, "account_deleted")
 	s.principals.Invalidate(userID)
 	s.presence.Remove(userID)
 	if s.avatarCleaner != nil && avatarName != "" {

@@ -70,6 +70,23 @@ func NewPrincipalCache(stores *store.Stores, ttl time.Duration) *PrincipalCache 
 func (p *PrincipalCache) Get(ctx context.Context, userID int64) (PrincipalSnapshot, error) {
 	unlock := p.locks.rLock(userID)
 	defer unlock()
+	return p.GetUnderBarrier(ctx, userID)
+}
+
+// WithReadBarrier runs fn while the user's principal mutation read barrier is
+// held. It lets connection admission extend validation through a coordinator
+// reservation, preventing a session or account mutation from interleaving
+// between those two steps.
+func (p *PrincipalCache) WithReadBarrier(userID int64, fn func() error) error {
+	unlock := p.locks.rLock(userID)
+	defer unlock()
+	return fn()
+}
+
+// GetUnderBarrier returns the cached snapshot without acquiring a read lock.
+// Callers must already hold the matching barrier through WithReadBarrier or an
+// internal sequencer-owned equivalent.
+func (p *PrincipalCache) GetUnderBarrier(ctx context.Context, userID int64) (PrincipalSnapshot, error) {
 	snap, ok, err := p.c.Get(ctx, userID)
 	if err != nil {
 		return PrincipalSnapshot{}, err

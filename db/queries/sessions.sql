@@ -11,6 +11,9 @@ RETURNING *;
 -- name: GetSessionByTokenHash :one
 SELECT * FROM sessions WHERE token_hash = ?;
 
+-- name: GetSessionByAnyTokenHash :one
+SELECT * FROM sessions WHERE token_hash = ?1 OR prev_token_hash = ?1;
+
 -- name: GetSessionByID :one
 SELECT * FROM sessions WHERE id = ?;
 

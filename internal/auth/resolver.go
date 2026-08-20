@@ -30,7 +30,7 @@ func NewPrincipalResolver(principals *PrincipalCache) rbacecho.PrincipalResolver
 			return nil, err
 		}
 		if claims.Ver != snap.AuthVersion {
-			return nil, errors.New("auth: token revoked")
+			return nil, ErrTokenRevoked
 		}
 		if snap.Banned {
 			return nil, echo.NewHTTPError(http.StatusForbidden, "user banned")

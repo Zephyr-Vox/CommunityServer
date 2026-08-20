@@ -7,26 +7,51 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+var (
+	// ErrInvalidAccessClaims is returned when a signed token omits a required
+	// identity claim or carries an invalid identity value.
+	ErrInvalidAccessClaims = errors.New("auth: invalid access token claims")
+)
+
 // Claims is the access token payload. It deliberately carries only the user
-// identity; roles and ban state are resolved server-side per request.
+// identity and login-session identity; roles and ban state are resolved
+// server-side per request.
 type Claims struct {
 	jwt.RegisteredClaims
 	UserID int64 `json:"uid"`
+	// LoginSessionID binds the access token to one persisted login session.
+	// WebSocket connection admission verifies that this session still belongs to
+	// UserID before reserving a control connection.
+	LoginSessionID int64 `json:"sid"`
 	// Ver is the user's auth_version at signing time. Resolvers reject tokens
 	// whose version is behind the current one, which is how password changes
 	// revoke previously issued access tokens.
 	Ver int64 `json:"ver"`
 }
 
-// SignAccess issues an HS256 access token for the user valid for ttl.
-func SignAccess(secret []byte, userID, authVersion int64, ttl time.Duration, now time.Time) (string, error) {
+// Validate enforces the application claims that every access token must carry.
+// jwt.Parser invokes it alongside RegisteredClaims time validation.
+func (c Claims) Validate() error {
+	if c.UserID <= 0 || c.LoginSessionID <= 0 || c.Ver < 0 || c.ExpiresAt == nil {
+		return ErrInvalidAccessClaims
+	}
+	return nil
+}
+
+// SignAccess issues an HS256 access token for userID and loginSessionID valid
+// for ttl. The session must already be persisted before calling this function.
+func SignAccess(secret []byte, userID, authVersion, loginSessionID int64, ttl time.Duration, now time.Time) (string, error) {
 	claims := Claims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 		},
-		UserID: userID,
-		Ver:    authVersion,
+		UserID:         userID,
+		LoginSessionID: loginSessionID,
+		Ver:            authVersion,
+	}
+	if err := claims.Validate(); err != nil {
+		return "", err
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(secret)
 }

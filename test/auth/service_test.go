@@ -38,6 +38,9 @@ func TestLoginSuccess(t *testing.T) {
 	if sess.DeviceID != "dev-1" {
 		t.Fatalf("session device = %q, want dev-1", sess.DeviceID)
 	}
+	if claims.LoginSessionID != sess.ID {
+		t.Fatalf("access token sid = %d, want %d", claims.LoginSessionID, sess.ID)
+	}
 }
 
 func TestLoginWrongPassword(t *testing.T) {
@@ -80,6 +83,10 @@ func TestRefreshRotates(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstRefresh := login.RefreshToken
+	initialClaims, err := auth.ParseAccess(e.secret, login.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	pair, err := e.svc.Refresh(ctx, firstRefresh)
 	if err != nil {
@@ -87,6 +94,13 @@ func TestRefreshRotates(t *testing.T) {
 	}
 	if pair.RefreshToken == firstRefresh {
 		t.Fatal("refresh token must rotate")
+	}
+	refreshedClaims, err := auth.ParseAccess(e.secret, pair.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshedClaims.LoginSessionID != initialClaims.LoginSessionID {
+		t.Fatalf("refresh access sid = %d, want %d", refreshedClaims.LoginSessionID, initialClaims.LoginSessionID)
 	}
 
 	// Before any reuse, the new token rotates again normally.
