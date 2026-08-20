@@ -65,15 +65,19 @@ func newAuthedEcho(t *testing.T, e *env) (*echo.Echo, *rbac.Authorizer) {
 
 func TestFirstOwnerActivation(t *testing.T) {
 	e := newEnv(t)
-	mgr := auth.NewActivationManager(e.stores)
+	mgr, err := auth.NewActivationManager(e.stores, e.secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 	code, pending, err := mgr.EnsureCode(context.Background())
 	if err != nil || !pending || len(code) != 16 {
 		t.Fatalf("EnsureCode = (%q, %v, %v)", code, pending, err)
 	}
-	owner, err := mgr.Activate(context.Background(), code, "boss", "secret123", "")
+	activation, err := mgr.Activate(context.Background(), "activation-owner-0001", code, "boss", "secret123", "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	owner := activation.User
 	bindings, err := e.stores.Roles.ListBindings(context.Background(), owner.ID)
 	if err != nil || len(bindings) != 1 || bindings[0].RoleKey != "owner" || bindings[0].ScopeType != "server" {
 		t.Fatalf("owner bindings = %v, err = %v", bindings, err)
@@ -89,7 +93,10 @@ func TestFirstOwnerActivation(t *testing.T) {
 
 func TestFirstOwnerActivationConcurrent(t *testing.T) {
 	e := newEnv(t)
-	mgr := auth.NewActivationManager(e.stores)
+	mgr, err := auth.NewActivationManager(e.stores, e.secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 	code, _, err := mgr.EnsureCode(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +106,7 @@ func TestFirstOwnerActivationConcurrent(t *testing.T) {
 	successes := 0
 	for i := 0; i < 8; i++ {
 		wg.Go(func() {
-			if _, err := mgr.Activate(context.Background(), code, "boss"+time.Now().Format("150405.000000000"), "secret123", ""); err == nil {
+			if _, err := mgr.Activate(context.Background(), "activation-concurrent-"+strconv.Itoa(i), code, "boss"+strconv.Itoa(i), "secret123", ""); err == nil {
 				mu.Lock()
 				successes++
 				mu.Unlock()
@@ -154,15 +161,19 @@ func TestDBAuthorizerUsesServerBindings(t *testing.T) {
 
 func TestOwnerCannotBeBannedOrDeleted(t *testing.T) {
 	e := newEnv(t)
-	mgr := auth.NewActivationManager(e.stores)
+	mgr, err := auth.NewActivationManager(e.stores, e.secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 	code, _, err := mgr.EnsureCode(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner, err := mgr.Activate(context.Background(), code, "boss", "secret123", "")
+	activation, err := mgr.Activate(context.Background(), "activation-owner-0002", code, "boss", "secret123", "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	owner := activation.User
 	actor := e.createUser(t, "admin", "secret123", "admin")
 	svc, _ := newUserService(t, e)
 	if err := svc.Ban(context.Background(), actor.ID, owner.ID); !errors.Is(err, auth.ErrOwnerProtected) {
@@ -179,15 +190,19 @@ func TestOwnerCannotBeBannedOrDeleted(t *testing.T) {
 func TestAdminPasswordResetRejectsOwner(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
-	activate := auth.NewActivationManager(e.stores)
+	activate, err := auth.NewActivationManager(e.stores, e.secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 	code, _, err := activate.EnsureCode(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner, err := activate.Activate(ctx, code, "boss", "secret123", "")
+	activation, err := activate.Activate(ctx, "activation-owner-0003", code, "boss", "secret123", "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	owner := activation.User
 	admin := e.createUser(t, "admin", "secret123", "admin")
 	app, authz := newAuthedEcho(t, e)
 	app.POST("/api/v0/users/:id/password", auth.ResetUserPasswordHandler(e.svc), rbacecho.Require(authz, rbac.PermUserUpdate))
@@ -215,15 +230,19 @@ func TestManagedProfileEmptyPatchReturnsCurrentUser(t *testing.T) {
 func TestManagedAuthMutationsRecheckPermissionsAfterOwnerTransfer(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
-	activate := auth.NewActivationManager(e.stores)
+	activate, err := auth.NewActivationManager(e.stores, e.secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 	code, _, err := activate.EnsureCode(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldOwner, err := activate.Activate(ctx, code, "oldowner", "secret123", "")
+	activation, err := activate.Activate(ctx, "activation-owner-0004", code, "oldowner", "secret123", "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	oldOwner := activation.User
 	newOwner := e.createUser(t, "newowner", "secret123", "member")
 	if err := e.stores.TransferOwner(ctx, oldOwner.ID, newOwner.ID); err != nil {
 		t.Fatal(err)

@@ -30,7 +30,7 @@ const (
 	// SnapshotSchemaVersion is bound into every cursor so incompatible snapshot
 	// DTO changes force a full resynchronization.
 	SnapshotSchemaVersion uint16 = 1
-	cursorKeyBytes        int    = 32
+	cursorKeyBytes               = 32
 )
 
 // Cursor contains the authenticated state checkpoint and visibility epoch

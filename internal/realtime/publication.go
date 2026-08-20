@@ -71,12 +71,6 @@ type PublicationRequest struct {
 	Candidate         *StateCandidate
 	Events            []StateEventTemplate
 	VisibilityUserIDs []int64
-	// CommitRuntime applies staged coordinator/transport deltas while the
-	// publication lock excludes readers from observing a pointer/ring boundary.
-	// It must not perform socket I/O, UDP sends, or waits. The returned cleanup
-	// runs after publication unlocks and is intended for old-session revocation
-	// work that may wait on a transport send mutex.
-	CommitRuntime func() (cleanup func(), err error)
 }
 
 // PublicationResult describes the immutable state and replayable events made
@@ -94,9 +88,8 @@ type PublicationResult struct {
 // is still rollbackable, then publish only after that transaction commits.
 // Exactly one of Publish, PublishRuntime, or Abort releases the reservation.
 type PublicationReservation struct {
-	publication   *StatePublication
-	result        PublicationResult
-	runtimeCommit func() (cleanup func(), err error)
+	publication *StatePublication
+	result      PublicationResult
 
 	mu        sync.Mutex
 	completed bool
@@ -183,7 +176,7 @@ func (p *StatePublication) Reserve(request PublicationRequest) (*PublicationRese
 		p.mu.Unlock()
 		return nil, err
 	}
-	return &PublicationReservation{publication: p, result: result, runtimeCommit: request.CommitRuntime}, nil
+	return &PublicationReservation{publication: p, result: result}, nil
 }
 
 // Result returns an independent copy of the final, still-unpublished result.
@@ -211,7 +204,7 @@ func (r *PublicationReservation) Abort() {
 // visible as one atomic publication. It must run only after the enclosing
 // persistent transaction commits; callers treat an error as process-fatal.
 func (r *PublicationReservation) Publish() (PublicationResult, error) {
-	return r.publish(context.TODO(), false)
+	return r.publish(nil)
 }
 
 // PublishRuntime publishes a runtime-only reservation unless ctx was canceled
@@ -222,46 +215,33 @@ func (r *PublicationReservation) PublishRuntime(ctx context.Context) (Publicatio
 	if ctx == nil {
 		return PublicationResult{}, ErrInvalidPublication
 	}
-	return r.publish(ctx, true)
+	return r.publish(ctx)
 }
 
-// publish completes one reservation. Runtime contexts are checked after the
+// publish completes one reservation. A non-nil runtimeCtx is checked after the
 // before-append test hook and immediately before any externally observable
-// mutation; persistent publications do not use their TODO context.
-func (r *PublicationReservation) publish(runtimeCtx context.Context, checkRuntimeContext bool) (result PublicationResult, err error) {
+// mutation; persistent publications pass nil because their DB commit is final.
+func (r *PublicationReservation) publish(runtimeCtx context.Context) (PublicationResult, error) {
 	if !r.claimCompletion() {
 		return PublicationResult{}, ErrInvalidPublication
 	}
+	defer r.publication.mu.Unlock()
 
 	p := r.publication
-	var cleanup func()
-	defer func() {
-		p.mu.Unlock()
-		if err == nil && cleanup != nil {
-			cleanup()
-		}
-	}()
 	p.callHook(PublicationBeforeRingAppend)
-	if checkRuntimeContext {
-		if err = runtimeCtx.Err(); err != nil {
+	if runtimeCtx != nil {
+		if err := runtimeCtx.Err(); err != nil {
 			return PublicationResult{}, err
 		}
 	}
-	if r.runtimeCommit != nil {
-		cleanup, err = r.runtimeCommit()
-		if err != nil {
-			return PublicationResult{}, err
-		}
-	}
-	if err = p.ring.Append(r.result.Events); err != nil {
+	if err := p.ring.Append(r.result.Events); err != nil {
 		return PublicationResult{}, err
 	}
 	p.callHook(PublicationAfterRingAppend)
 	p.callHook(PublicationBeforeStateSwap)
 	p.state.current.Store(r.result.Version)
 	p.callHook(PublicationAfterStateSwap)
-	result = clonePublicationResult(r.result)
-	return result, nil
+	return clonePublicationResult(r.result), nil
 }
 
 // claimCompletion grants the one release operation for r. The corresponding

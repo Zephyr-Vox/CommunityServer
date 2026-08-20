@@ -70,6 +70,16 @@ func (s *Stores) BeginReadTx(ctx context.Context) (*sql.Tx, error) {
 	return s.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 }
 
+// NextID allocates a process-unique positive ID from the generator shared by
+// every store. Application-level command records use the same sequence as
+// persisted domain entities so their IDs remain unique within the process.
+func (s *Stores) NextID() (int64, error) {
+	if s == nil || s.Users == nil || s.Users.idGen == nil {
+		return 0, ErrInvalidStore
+	}
+	return s.Users.idGen.Next()
+}
+
 // WithTx returns stores bound to tx. The returned stores share idGen and clock
 // but not the root conn.
 func (s *Stores) WithTx(tx *sql.Tx) *Stores {
@@ -89,14 +99,4 @@ func (s *Stores) WithTx(tx *sql.Tx) *Stores {
 		Idempotency:           &IdempotencyStore{q: q, now: s.Idempotency.now, transactional: true},
 		ActivationIdempotency: &ActivationIdempotencyStore{q: q, now: s.ActivationIdempotency.now, transactional: true},
 	}
-}
-
-// IDGenerator returns the process-wide snowflake generator shared by the
-// stores. Realtime's post-commit sequencer uses the same generator so command
-// IDs and persisted resource IDs remain in one server-local ID domain.
-func (s *Stores) IDGenerator() *snowflake.IDGenerator {
-	if s == nil || s.Users == nil {
-		return nil
-	}
-	return s.Users.idGen
 }

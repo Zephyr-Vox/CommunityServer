@@ -378,7 +378,7 @@ func TestSequencerPersistsReservedResultWithDomainTransaction(t *testing.T) {
 				Events: []realtime.StateEventTemplate{{
 					EventType: "group.created",
 					Scope:     realtime.Scope{Type: "server"},
-					Data:      fmt.Appendf(nil, `{"group_id":"%d"}`, group.ID),
+					Data:      []byte(fmt.Sprintf(`{"group_id":"%d"}`, group.ID)),
 				}},
 			})
 			if err != nil {
@@ -391,7 +391,7 @@ func TestSequencerPersistsReservedResultWithDomainTransaction(t *testing.T) {
 			if err := durable.Save(ctx, txStores, identity, key, realtime.CanonicalCommandResult{
 				CommandID:   commandID,
 				Status:      201,
-				Body:        fmt.Appendf(nil, `{"group":{"id":"%d","name":"Reserved"}}`, group.ID),
+				Body:        []byte(fmt.Sprintf(`{"group":{"id":"%d","name":"Reserved"}}`, group.ID)),
 				Checkpoint:  reserved.Checkpoint,
 				StateCursor: cursor,
 			}); err != nil {

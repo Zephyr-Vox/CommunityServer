@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/labstack/echo/v5"
 
@@ -26,7 +27,8 @@ const maxSyncReplayBytes = 256 << 10
 // separately captured StateVersion and ring high-water values.
 type StateSyncStrategy interface {
 	CaptureSnapshot(userID int64) (StateSnapshot, error)
-	OnHello(userID int64, cursor string) (SyncHello, error)
+	OnHello(connection StateSyncConnection, cursor string) (SyncHello, error)
+	OnDisconnect(ref ControlConnectionRef)
 }
 
 // StateSnapshot is the complete replace-style v1 state response for one user.
@@ -126,27 +128,59 @@ type SnapshotVoiceMembership struct {
 	JoinedAt  int64  `json:"joined_at"`
 }
 
-// SyncHello contains either replay/complete frames or a sync.required reason.
-// Frames are already encoded wire messages for direct writer-pump delivery.
+// SyncHello reports whether a hello requires a replacement HTTP snapshot. A
+// successful result has an empty reason because the strategy has already
+// atomically admitted replay, sync.complete and post-replay state to the sink.
 type SyncHello struct {
 	RequiredReason string
-	Frames         [][]byte
 }
+
+// SyncStage identifies a deterministic hook point in replay/live handoff tests.
+type SyncStage uint8
+
+const (
+	// SyncAfterRegistration runs after the connection is registered as syncing
+	// and StatePublication has released its capture lock, but before replay is
+	// encoded. Publications at this point must enter post-replay delivery.
+	SyncAfterRegistration SyncStage = iota + 1
+)
+
+// SyncHook observes a deterministic sync stage. It exists for concurrency
+// tests and must not call OnHello for the same connection.
+type SyncHook func(SyncStage)
 
 // FullSnapshotSyncStrategy implements v1 full HTTP snapshots and ring replay.
 type FullSnapshotSyncStrategy struct {
 	publication *StatePublication
 	signer      *CursorSigner
 	visibility  *VisibilityResolver
+	eventBus    *EventBus
+
+	hookMu sync.RWMutex
+	hook   SyncHook
 }
 
 // NewFullSnapshotSyncStrategy creates a v1 strategy backed by one process
-// publication boundary and its matching cursor signer.
-func NewFullSnapshotSyncStrategy(publication *StatePublication, signer *CursorSigner, visibility *VisibilityResolver) (*FullSnapshotSyncStrategy, error) {
-	if publication == nil || signer == nil || visibility == nil {
+// publication boundary, EventBus and their matching cursor signer.
+func NewFullSnapshotSyncStrategy(publication *StatePublication, signer *CursorSigner, visibility *VisibilityResolver, eventBus *EventBus) (*FullSnapshotSyncStrategy, error) {
+	if publication == nil || signer == nil || visibility == nil || eventBus == nil || publication.visibility != visibility || eventBus.signer != signer || eventBus.visibility != visibility {
 		return nil, ErrInvalidStateSync
 	}
-	return &FullSnapshotSyncStrategy{publication: publication, signer: signer, visibility: visibility}, nil
+	if err := publication.BindEventBus(eventBus); err != nil {
+		return nil, err
+	}
+	return &FullSnapshotSyncStrategy{publication: publication, signer: signer, visibility: visibility, eventBus: eventBus}, nil
+}
+
+// SetHook replaces the deterministic replay/live handoff test hook. It is safe
+// to update concurrently; an in-flight hello keeps the hook it loaded.
+func (s *FullSnapshotSyncStrategy) SetHook(hook SyncHook) {
+	if s == nil {
+		return
+	}
+	s.hookMu.Lock()
+	s.hook = hook
+	s.hookMu.Unlock()
 }
 
 // CaptureSnapshot serializes one user-visible projection from a single
@@ -176,49 +210,107 @@ func (s *FullSnapshotSyncStrategy) CaptureSnapshot(userID int64) (StateSnapshot,
 	}, nil
 }
 
-// OnHello validates cursor against one publication capture. A valid cursor
-// replays every still-retained visible event followed by sync.complete; any
-// epoch/schema/principal/visibility/ring mismatch requires a fresh snapshot.
-func (s *FullSnapshotSyncStrategy) OnHello(userID int64, cursor string) (SyncHello, error) {
-	if s == nil || userID <= 0 {
+// OnHello validates cursor and registers connection under one publication
+// capture. A valid cursor atomically queues retained replay, sync.complete and
+// any live events published while replay was encoded. Cursor mismatches require
+// a fresh snapshot without installing a subscription.
+func (s *FullSnapshotSyncStrategy) OnHello(connection StateSyncConnection, cursor string) (SyncHello, error) {
+	if s == nil || connection == nil {
 		return SyncHello{}, ErrInvalidStateSync
 	}
+	ref := connection.ControlRef()
+	if !validConnectionRef(ref) {
+		return SyncHello{}, ErrInvalidConnection
+	}
+	userID := ref.UserID
 	parsed, err := s.signer.Parse(userID, cursor)
 	if err != nil {
 		return SyncHello{RequiredReason: syncRequiredReason(err)}, nil
 	}
-	capture := s.publication.Capture()
-	if capture.Version == nil || parsed.VisibilityEpoch != capture.Version.VisibilityEpoch(userID) {
-		return SyncHello{RequiredReason: "visibility_changed"}, nil
-	}
-	if parsed.Checkpoint.GEID > capture.HighWater {
-		return SyncHello{RequiredReason: "invalid_cursor"}, nil
-	}
-	events, replayable := eventsAfterCapture(capture.Events, capture.HighWater, parsed.Checkpoint.GEID)
-	if !replayable {
-		return SyncHello{RequiredReason: "ring_miss"}, nil
-	}
-	frames, err := s.replayFrames(userID, capture.Version, events)
+	capture, attempt, requiredReason, err := s.beginSync(connection, parsed)
 	if err != nil {
 		return SyncHello{}, err
 	}
-	completeCursor, err := s.signer.Issue(userID, capture.Version.Checkpoint(), capture.Version.VisibilityEpoch(userID))
+	if requiredReason != "" {
+		return SyncHello{RequiredReason: requiredReason}, nil
+	}
+	defer func() {
+		if attempt != nil {
+			s.eventBus.abortSync(attempt)
+		}
+	}()
+	s.callHook(SyncAfterRegistration)
+	frames, err := s.replayFrames(userID, capture.version, capture.events)
+	if err != nil {
+		if errors.Is(err, ErrEventConsumerSlow) {
+			connection.DisconnectSlowConsumer()
+		}
+		return SyncHello{}, err
+	}
+	completeCursor, err := s.signer.Issue(userID, Checkpoint{StreamEpoch: capture.version.Checkpoint().StreamEpoch, GEID: capture.highWater}, capture.visibilityEpoch)
 	if err != nil {
 		return SyncHello{}, err
 	}
-	complete, err := json.Marshal(struct {
-		Type string `json:"type"`
-		Data struct {
-			Cursor string `json:"cursor"`
-		} `json:"data"`
-	}{Type: "sync.complete", Data: struct {
-		Cursor string `json:"cursor"`
-	}{Cursor: completeCursor}})
+	complete, err := syncCompleteFrame(completeCursor)
 	if err != nil {
 		return SyncHello{}, err
 	}
 	frames = append(frames, complete)
-	return SyncHello{Frames: frames}, nil
+	if err := s.eventBus.completeSync(attempt, frames); err != nil {
+		return SyncHello{}, err
+	}
+	attempt = nil
+	return SyncHello{}, nil
+}
+
+// OnDisconnect removes exactly ref's syncing or live EventBus subscription.
+// It is idempotent and cannot affect another connection for the same user.
+func (s *FullSnapshotSyncStrategy) OnDisconnect(ref ControlConnectionRef) {
+	if s == nil || s.eventBus == nil {
+		return
+	}
+	s.eventBus.unsubscribe(ref)
+}
+
+type syncPublicationCapture struct {
+	version         *StateVersion
+	events          []StateEvent
+	highWater       uint64
+	visibilityEpoch uint64
+}
+
+// beginSync validates state-dependent cursor fields and installs the syncing
+// subscription before releasing StatePublication's read lock. A concurrent
+// Commit therefore falls entirely before replay capture or into pending live
+// delivery.
+func (s *FullSnapshotSyncStrategy) beginSync(connection StateSyncConnection, cursor Cursor) (syncPublicationCapture, *eventSyncAttempt, string, error) {
+	s.publication.mu.RLock()
+	defer s.publication.mu.RUnlock()
+	if s.publication.eventBus != s.eventBus {
+		return syncPublicationCapture{}, nil, "", ErrInvalidStateSync
+	}
+	version := s.publication.state.Current()
+	events, highWater := s.publication.ring.snapshotRefs()
+	if version == nil || version.Checkpoint().GEID != highWater {
+		return syncPublicationCapture{}, nil, "", ErrInvalidStateSync
+	}
+	userID := connection.ControlRef().UserID
+	visibilityEpoch := version.VisibilityEpoch(userID)
+	if cursor.VisibilityEpoch != visibilityEpoch {
+		return syncPublicationCapture{}, nil, "visibility_changed", nil
+	}
+	if cursor.Checkpoint.GEID > highWater {
+		return syncPublicationCapture{}, nil, "invalid_cursor", nil
+	}
+	replay, replayable := eventsAfterCapture(events, highWater, cursor.Checkpoint.GEID)
+	if !replayable {
+		return syncPublicationCapture{}, nil, "ring_miss", nil
+	}
+	attempt, err := s.eventBus.beginSync(connection, version)
+	if err != nil {
+		return syncPublicationCapture{}, nil, "", err
+	}
+	return syncPublicationCapture{version: version, events: replay, highWater: highWater, visibilityEpoch: visibilityEpoch}, attempt, "", nil
 }
 
 // replayFrames groups materialized events into bounded sync.replay frames.
@@ -226,27 +318,29 @@ func (s *FullSnapshotSyncStrategy) replayFrames(userID int64, version *StateVers
 	var frames [][]byte
 	var batch []json.RawMessage
 	var from, to uint64
+	batchBytes := 0
+	frameBytes := 0
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
-		encoded, err := json.Marshal(struct {
-			Type string `json:"type"`
-			Data struct {
-				FromGEID string            `json:"from_geid"`
-				ToGEID   string            `json:"to_geid"`
-				Events   []json.RawMessage `json:"events"`
-			} `json:"data"`
-		}{Type: "sync.replay", Data: struct {
-			FromGEID string            `json:"from_geid"`
-			ToGEID   string            `json:"to_geid"`
-			Events   []json.RawMessage `json:"events"`
-		}{FromGEID: strconv.FormatUint(from, 10), ToGEID: strconv.FormatUint(to, 10), Events: batch}})
+		encoded, err := syncReplayFrame(from, to, batch)
 		if err != nil {
 			return err
 		}
+		if len(encoded) > maxSyncReplayBytes {
+			return ErrStateEventTooLarge
+		}
+		// Reserve one queue item for sync.complete. Pending live events share the
+		// remaining budget and make completeSync reject the connection if they fill
+		// it while replay is encoded.
+		if len(frames)+1 >= MaxWebSocketStateItems || frameBytes+len(encoded) > MaxWebSocketStateBytes {
+			return ErrEventConsumerSlow
+		}
 		frames = append(frames, encoded)
+		frameBytes += len(encoded)
 		batch = nil
+		batchBytes = 0
 		return nil
 	}
 	for _, event := range events {
@@ -261,28 +355,84 @@ func (s *FullSnapshotSyncStrategy) replayFrames(userID int64, version *StateVers
 		if err != nil {
 			return nil, err
 		}
-		candidate := append(append([]json.RawMessage(nil), batch...), json.RawMessage(encoded))
-		probe, err := json.Marshal(struct {
-			Events []json.RawMessage `json:"events"`
-		}{Events: candidate})
-		if err != nil {
-			return nil, err
+		candidateFrom := from
+		if len(batch) == 0 {
+			candidateFrom = event.GEID
 		}
-		if len(batch) != 0 && len(probe) > maxSyncReplayBytes {
+		candidateBytes := batchBytes + len(encoded)
+		candidateCount := len(batch) + 1
+		if len(batch) != 0 && syncReplayFrameSize(candidateFrom, event.GEID, candidateBytes, candidateCount) > maxSyncReplayBytes {
 			if err := flush(); err != nil {
 				return nil, err
 			}
+			candidateFrom = event.GEID
+			candidateBytes = len(encoded)
+			candidateCount = 1
+		}
+		if syncReplayFrameSize(candidateFrom, event.GEID, candidateBytes, candidateCount) > maxSyncReplayBytes {
+			return nil, ErrStateEventTooLarge
 		}
 		if len(batch) == 0 {
-			from = event.GEID
+			from = candidateFrom
 		}
 		batch = append(batch, json.RawMessage(encoded))
+		batchBytes = candidateBytes
 		to = event.GEID
 	}
 	if err := flush(); err != nil {
 		return nil, err
 	}
 	return frames, nil
+}
+
+// syncReplayFrameSize returns the exact compact JSON size produced by
+// syncReplayFrame for already-encoded event values.
+func syncReplayFrameSize(from, to uint64, eventBytes, eventCount int) int {
+	const fixed = len(`{"type":"sync.replay","data":{"from_geid":"","to_geid":"","events":[]}}`)
+	commas := 0
+	if eventCount > 1 {
+		commas = eventCount - 1
+	}
+	return fixed + len(strconv.FormatUint(from, 10)) + len(strconv.FormatUint(to, 10)) + eventBytes + commas
+}
+
+// syncReplayFrame serializes one complete bounded wire chunk. Size probes use
+// this exact envelope so from/to fields and outer framing cannot exceed 256 KiB.
+func syncReplayFrame(from, to uint64, events []json.RawMessage) ([]byte, error) {
+	return json.Marshal(struct {
+		Type string `json:"type"`
+		Data struct {
+			FromGEID string            `json:"from_geid"`
+			ToGEID   string            `json:"to_geid"`
+			Events   []json.RawMessage `json:"events"`
+		} `json:"data"`
+	}{Type: "sync.replay", Data: struct {
+		FromGEID string            `json:"from_geid"`
+		ToGEID   string            `json:"to_geid"`
+		Events   []json.RawMessage `json:"events"`
+	}{FromGEID: strconv.FormatUint(from, 10), ToGEID: strconv.FormatUint(to, 10), Events: events}})
+}
+
+// syncCompleteFrame serializes the durable cursor at replay high-water.
+func syncCompleteFrame(cursor string) ([]byte, error) {
+	return json.Marshal(struct {
+		Type string `json:"type"`
+		Data struct {
+			Cursor string `json:"cursor"`
+		} `json:"data"`
+	}{Type: "sync.complete", Data: struct {
+		Cursor string `json:"cursor"`
+	}{Cursor: cursor}})
+}
+
+// callHook invokes the sync hook without retaining its configuration lock.
+func (s *FullSnapshotSyncStrategy) callHook(stage SyncStage) {
+	s.hookMu.RLock()
+	hook := s.hook
+	s.hookMu.RUnlock()
+	if hook != nil {
+		hook(stage)
+	}
 }
 
 // SnapshotHandler handles authenticated GET /api/v0/state/snapshot.

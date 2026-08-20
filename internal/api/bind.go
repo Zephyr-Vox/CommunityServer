@@ -15,6 +15,13 @@ type ValidationError struct {
 	Fields map[string]string
 }
 
+// InvalidField returns a structured validation error for one request location.
+// It is used for required headers and path/query values validated outside the
+// JSON struct-tag binder.
+func InvalidField(field, message string) *ValidationError {
+	return &ValidationError{Fields: map[string]string{field: message}}
+}
+
 // Error returns the uniform client-facing validation message.
 func (e *ValidationError) Error() string {
 	return MessageInvalidRequest

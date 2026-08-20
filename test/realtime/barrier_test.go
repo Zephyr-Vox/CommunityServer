@@ -410,7 +410,7 @@ func persistentGroupCommand(stores *store.Stores, state *realtime.StateStore, du
 				Events: []realtime.StateEventTemplate{{
 					EventType: "group.created",
 					Scope:     realtime.Scope{Type: "server"},
-					Data:      fmt.Appendf(nil, `{"group_id":"%d"}`, group.ID),
+					Data:      []byte(fmt.Sprintf(`{"group_id":"%d"}`, group.ID)),
 				}},
 			})
 			if err != nil {
@@ -427,7 +427,7 @@ func persistentGroupCommand(stores *store.Stores, state *realtime.StateStore, du
 			if err := durable.Save(ctx, txStores, identity, key, realtime.CanonicalCommandResult{
 				CommandID:   commandID,
 				Status:      201,
-				Body:        fmt.Appendf(nil, `{"group":{"id":"%d","name":"%s"}}`, group.ID, name),
+				Body:        []byte(fmt.Sprintf(`{"group":{"id":"%d","name":"%s"}}`, group.ID, name)),
 				Headers:     store.IdempotencyHeaders{ETag: etag, Location: "/api/v0/groups/" + fmt.Sprint(group.ID)},
 				Checkpoint:  reserved.Checkpoint,
 				StateCursor: cursor,

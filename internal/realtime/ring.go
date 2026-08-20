@@ -174,6 +174,16 @@ func (r *StateRing) Snapshot() ([]StateEvent, uint64) {
 	return cloneStateEvents(r.events), r.highWater
 }
 
+// snapshotRefs returns shallow immutable event references for a caller already
+// operating inside StatePublication's capture boundary. Ring entries and their
+// byte slices are never mutated after append; retaining these refs across
+// eviction is safe, but callers must not expose or modify their slices.
+func (r *StateRing) snapshotRefs() ([]StateEvent, uint64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]StateEvent(nil), r.events...), r.highWater
+}
+
 // HighWater returns the greatest GEID ever appended to r, including events
 // that have since been evicted by its retention limits.
 func (r *StateRing) HighWater() uint64 {

@@ -69,7 +69,7 @@ const (
 	syncPhaseLive
 )
 
-// WebSocketHandler is the future GET /api/v0/ws adapter. It reserves
+// WebSocketHandler is the GET /api/v0/ws adapter. It reserves
 // global/user/source admission before upgrading, authenticates and reserves
 // opening state inside the principal read barrier, then maintains auth lease,
 // sync-hello and liveness deadlines until the coordinator owns a terminal close
@@ -126,6 +126,7 @@ func WebSocketHandler(authenticator *auth.ConnectionAuthenticator, coordinator *
 			reservation.Abort()
 			return nil
 		}
+		syncConnection := &webSocketSyncConnection{ref: ref, pump: pump, coordinator: coordinator}
 
 		conn.SetReadLimit(MaxInboundWebSocketMessage)
 		if err := conn.SetReadDeadline(time.Now().Add(websocketLivenessWindow)); err != nil {
@@ -167,6 +168,7 @@ func WebSocketHandler(authenticator *auth.ConnectionAuthenticator, coordinator *
 			close(stopPing)
 			syncDeadline.Stop()
 			leaseTimer.Stop()
+			strategy.OnDisconnect(ref)
 			coordinator.BeginDisconnect(ref, int(websocket.CloseNormalClosure), "closed")
 			<-pump.Done()
 			coordinator.FinishDisconnect(ref)
@@ -216,8 +218,11 @@ func WebSocketHandler(authenticator *auth.ConnectionAuthenticator, coordinator *
 					coordinator.BeginDisconnect(ref, websocketCloseAbuse, "command rate limited")
 					return nil
 				}
-				result, err := strategy.OnHello(ref.UserID, cursor)
+				result, err := strategy.OnHello(syncConnection, cursor)
 				if err != nil {
+					if errors.Is(err, ErrEventConsumerSlow) || errors.Is(err, ErrSyncAttemptClosed) {
+						return nil
+					}
 					coordinator.BeginDisconnect(ref, websocketCloseProtocol, "state sync failure")
 					return nil
 				}
@@ -231,10 +236,6 @@ func WebSocketHandler(authenticator *auth.ConnectionAuthenticator, coordinator *
 						return nil
 					}
 					continue
-				}
-				if !enqueueSyncFrames(pump, result.Frames) {
-					coordinator.BeginDisconnect(ref, websocketCloseSlow, "writer unavailable")
-					return nil
 				}
 				phase = syncPhaseLive
 				syncDeadline.Stop()
@@ -516,10 +517,7 @@ func runWebSocketPings(pump *webSocketWritePump, stop <-chan struct{}) {
 	}
 }
 
-// validSyncHello requires a JSON object with a string cursor. The initial
-// lifecycle implementation always responds sync.required because snapshot and
-// replay adapters have not yet been installed, but the hello itself establishes
-// the connection's required liveness state.
+// syncHelloCursor requires a JSON object with a string cursor.
 func syncHelloCursor(data json.RawMessage) (string, bool) {
 	var hello struct {
 		Cursor *string `json:"cursor"`
@@ -581,18 +579,6 @@ func webSocketSyncRequiredFrame(reason string) []byte {
 		}{Reason: reason},
 	})
 	return encoded
-}
-
-// enqueueSyncFrames queues a complete replay/complete handoff in wire order.
-// The v1 writer queue is bounded; failure marks only this connection slow and
-// leaves the publication/ring authoritative for a later snapshot retry.
-func enqueueSyncFrames(pump *webSocketWritePump, frames [][]byte) bool {
-	for _, frame := range frames {
-		if !pump.Enqueue(frame) {
-			return false
-		}
-	}
-	return true
 }
 
 // webSocketAuthUpdatedFrame serializes auth.update's successful connection
@@ -697,6 +683,37 @@ type webSocketWritePump struct {
 	force     sync.Once
 }
 
+// webSocketSyncConnection adapts one write pump and coordinator generation to
+// EventBus's bounded state sink. It performs no socket I/O in EventBus callers.
+type webSocketSyncConnection struct {
+	ref         ControlConnectionRef
+	pump        *webSocketWritePump
+	coordinator *ConnectionCoordinator
+}
+
+// ControlRef returns the exact coordinator generation owned by this sink.
+func (c *webSocketSyncConnection) ControlRef() ControlConnectionRef {
+	if c == nil {
+		return ControlConnectionRef{}
+	}
+	return c.ref
+}
+
+// ApplyStateBatch atomically prunes revoked scope work and appends one replay or
+// live publication batch.
+func (c *webSocketSyncConnection) ApplyStateBatch(revoked []Scope, items []StateQueueItem) bool {
+	return c != nil && c.pump != nil && c.pump.ApplyStateBatch(revoked, items)
+}
+
+// DisconnectSlowConsumer converges EventBus backpressure on the coordinator's
+// once-only close path after StatePublication has released its lock.
+func (c *webSocketSyncConnection) DisconnectSlowConsumer() {
+	if c == nil || c.coordinator == nil {
+		return
+	}
+	c.coordinator.BeginDisconnect(c.ref, websocketCloseSlow, "slow consumer")
+}
+
 type webSocketTerminal struct {
 	status int
 	reason string
@@ -730,43 +747,99 @@ type webSocketResponseSlot struct {
 // and bytes. It deliberately has no blocking enqueue: publication/relay code
 // must disconnect this one slow connection instead of holding a global writer.
 type webSocketStateLane struct {
-	mu    sync.Mutex
-	items int
-	bytes int
-	queue chan webSocketStateFrame
+	mu     sync.Mutex
+	items  int
+	bytes  int
+	queue  []webSocketStateFrame
+	ready  chan struct{}
+	closed bool
 }
 
 type webSocketStateFrame struct {
-	frame []byte
+	item  StateQueueItem
 	bytes int
 }
 
 // newWebSocketStateLane returns the v1 regular state/control delivery lane.
 func newWebSocketStateLane() *webSocketStateLane {
-	return &webSocketStateLane{queue: make(chan webSocketStateFrame, MaxWebSocketStateItems)}
+	return &webSocketStateLane{ready: make(chan struct{}, 1)}
 }
 
 // enqueue copies frame and reserves its byte/item capacity atomically.
-func (l *webSocketStateLane) enqueue(frame []byte, done <-chan struct{}) bool {
-	if l == nil || len(frame) == 0 || len(frame) > MaxWebSocketStateBytes {
+func (l *webSocketStateLane) enqueue(frame []byte) bool {
+	return l.applyBatch(nil, []StateQueueItem{{Frame: frame, Policy: StateDeliveryControl}})
+}
+
+// applyBatch prunes revoked ordinary scope payload and appends every item under
+// one queue lock after validating the complete item/byte reservation. The
+// writer cannot claim between privacy prune and transition append, nor claim a
+// replay prefix when the complete handoff exceeds either hard limit.
+func (l *webSocketStateLane) applyBatch(revoked []Scope, items []StateQueueItem) bool {
+	if l == nil || (len(items) != 0 && !stateItemBatchWithinLimits(items)) {
 		return false
 	}
-	copyFrame := append([]byte(nil), frame...)
+	batch := make([]webSocketStateFrame, len(items))
+	batchBytes := 0
+	for index, item := range cloneStateQueueItems(items) {
+		batch[index] = webSocketStateFrame{item: item, bytes: len(item.Frame)}
+		batchBytes += len(item.Frame)
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.items >= MaxWebSocketStateItems || l.bytes+len(copyFrame) > MaxWebSocketStateBytes {
+	if l.closed {
 		return false
 	}
-	select {
-	case <-done:
-		return false
-	case l.queue <- webSocketStateFrame{frame: copyFrame, bytes: len(copyFrame)}:
-		l.items++
-		l.bytes += len(copyFrame)
-		return true
-	default:
+	l.pruneLocked(revoked)
+	if l.items+len(batch) > MaxWebSocketStateItems || l.bytes+batchBytes > MaxWebSocketStateBytes {
 		return false
 	}
+	l.queue = append(l.queue, batch...)
+	l.items += len(batch)
+	l.bytes += batchBytes
+	l.signalLocked()
+	return true
+}
+
+// pruneLocked removes unclaimed visible-after items for revoked scopes. Caller
+// holds mu, which is also the writer's claim gate.
+func (l *webSocketStateLane) pruneLocked(revoked []Scope) {
+	if len(revoked) == 0 || len(l.queue) == 0 {
+		return
+	}
+	revokedSet := scopesToSet(revoked)
+	kept := l.queue[:0]
+	for _, frame := range l.queue {
+		if frame.item.Policy == StateDeliveryVisibleAfter {
+			if _, remove := revokedSet[frame.item.Scope]; remove {
+				l.items--
+				l.bytes -= frame.bytes
+				continue
+			}
+		}
+		kept = append(kept, frame)
+	}
+	clear(l.queue[len(kept):])
+	l.queue = kept
+}
+
+// claim removes the oldest queued frame while retaining its capacity until the
+// writer finishes or abandons the socket write.
+func (l *webSocketStateLane) claim() (webSocketStateFrame, bool) {
+	if l == nil {
+		return webSocketStateFrame{}, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed || len(l.queue) == 0 {
+		return webSocketStateFrame{}, false
+	}
+	frame := l.queue[0]
+	l.queue[0] = webSocketStateFrame{}
+	l.queue = l.queue[1:]
+	if len(l.queue) != 0 {
+		l.signalLocked()
+	}
+	return frame, true
 }
 
 // release returns one dequeued state frame's reserved capacity.
@@ -780,18 +853,44 @@ func (l *webSocketStateLane) release(frame webSocketStateFrame) {
 	l.mu.Unlock()
 }
 
-// releaseQueued clears reservations for frames abandoned by terminal shutdown.
-func (l *webSocketStateLane) releaseQueued() {
+// close clears reservations for frames abandoned by terminal shutdown and
+// rejects every enqueue racing the write pump's exit.
+func (l *webSocketStateLane) close() {
 	if l == nil {
 		return
 	}
-	for {
-		select {
-		case frame := <-l.queue:
-			l.release(frame)
-		default:
-			return
+	l.stop()
+	l.mu.Lock()
+	l.items = 0
+	l.bytes = 0
+	l.mu.Unlock()
+}
+
+// stop rejects later state delivery and discards every frame not yet claimed by
+// the writer. Claim and stop share mu, so a frame is unambiguously ordered
+// before terminal close or removed; socket I/O never occurs under this gate.
+func (l *webSocketStateLane) stop() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if !l.closed {
+		l.closed = true
+		for _, frame := range l.queue {
+			l.items--
+			l.bytes -= frame.bytes
 		}
+		clear(l.queue)
+		l.queue = nil
+	}
+	l.mu.Unlock()
+}
+
+// signalLocked wakes the writer once for any non-empty queue. Caller holds mu.
+func (l *webSocketStateLane) signalLocked() {
+	select {
+	case l.ready <- struct{}{}:
+	default:
 	}
 }
 
@@ -893,9 +992,9 @@ func (p *webSocketWritePump) EnqueueResponse(response *webSocketResponseSlot, fr
 	}
 }
 
-// Enqueue queues one already-serialized server frame without blocking the
-// caller. EventBus priority lanes replace this temporary lifecycle queue before
-// state delivery is enabled.
+// Enqueue queues one already-serialized connection-local control frame without
+// blocking the caller. Replay and live EventBus delivery uses ApplyStateBatch
+// so a whole handoff is admitted atomically.
 func (p *webSocketWritePump) Enqueue(frame []byte) bool {
 	if p == nil || len(frame) == 0 {
 		return false
@@ -905,7 +1004,22 @@ func (p *webSocketWritePump) Enqueue(frame []byte) bool {
 		return false
 	default:
 	}
-	return p.state.enqueue(frame, p.done)
+	return p.state.enqueue(frame)
+}
+
+// ApplyStateBatch atomically prunes revoked scope work and appends a replay/live
+// handoff in wire order. The EventBus uses this operation while holding the
+// connection delivery gate; lifecycle control frames continue to use Enqueue.
+func (p *webSocketWritePump) ApplyStateBatch(revoked []Scope, items []StateQueueItem) bool {
+	if p == nil {
+		return false
+	}
+	select {
+	case <-p.done:
+		return false
+	default:
+	}
+	return p.state.applyBatch(revoked, items)
 }
 
 // RequestPing queues one liveness ping without allowing periodic ticks to
@@ -941,6 +1055,9 @@ func (p *webSocketWritePump) RequestClose(statusCode int, reason string) {
 	if p == nil {
 		return
 	}
+	// Stop and claim share the state-lane gate. An item already claimed is
+	// ordered before this close; every unclaimed item is discarded here.
+	p.state.stop()
 	terminal := webSocketTerminal{status: statusCode, reason: reason}
 	select {
 	case <-p.done:
@@ -976,7 +1093,7 @@ func (p *webSocketWritePump) Done() <-chan struct{} {
 // so a lifecycle close cannot be starved by future state-event producers.
 func (p *webSocketWritePump) run() {
 	defer func() {
-		p.state.releaseQueued()
+		p.state.close()
 		p.responses.releaseQueued()
 		close(p.done)
 	}()
@@ -1005,8 +1122,12 @@ func (p *webSocketWritePump) run() {
 			if !p.writeControl(websocket.PongMessage, payload) {
 				return
 			}
-		case frame := <-p.state.queue:
-			if !p.writeFrame(frame.frame) {
+		case <-p.state.ready:
+			frame, ok := p.state.claim()
+			if !ok {
+				continue
+			}
+			if !p.writeFrame(frame.item.Frame) {
 				p.state.release(frame)
 				return
 			}

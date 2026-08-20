@@ -23,6 +23,16 @@ func postJSON(t *testing.T, app *server.App, path, body string) *httptest.Respon
 	return rec
 }
 
+func postJSONIdempotency(t *testing.T, app *server.App, path, key, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("Idempotency-Key", key)
+	rec := httptest.NewRecorder()
+	app.Echo().ServeHTTP(rec, req)
+	return rec
+}
+
 func postJSONToken(t *testing.T, app *server.App, path, token, body string) *httptest.ResponseRecorder {
 	return requestToken(t, app, http.MethodPost, path, token, body)
 }
@@ -79,7 +89,7 @@ func activateAdmin(t *testing.T, app *server.App) (code, token string) {
 	if err != nil || !ok {
 		t.Fatalf("EnsureActivationCode = (_, %v, %v)", ok, err)
 	}
-	rec := postJSON(t, app, "/api/v0/admin/activate",
+	rec := postJSONIdempotency(t, app, "/api/v0/admin/activate", "activate-owner-0001",
 		`{"code":"`+code+`","username":"boss","password":"secret123"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("activate status = %d, body = %s", rec.Code, rec.Body.String())

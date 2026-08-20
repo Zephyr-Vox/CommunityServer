@@ -243,10 +243,9 @@ func NewPostCommitSequencer(publication *StatePublication, idGen *snowflake.IDGe
 }
 
 // Submit admits command when both ordinary queue limits permit and waits for
-// the worker's ordered terminal result. The worker observes ctx before a
-// runtime publication and aborts a canceled candidate; once any command reaches
-// its commit point, waiting for its completion lets the caller finish response
-// and idempotency bookkeeping with the final command ID and checkpoint.
+// its ordered completion. A canceled context before a runtime publication
+// aborts that candidate; cancellation after a persistent commit or successful
+// runtime publication cannot roll back the command.
 func (s *PostCommitSequencer) Submit(ctx context.Context, command PostCommitCommand) (CommandCompletion, error) {
 	if ctx == nil || command.Execute == nil || command.QueueBytes <= 0 || command.QueueBytes > MaxSequencerQueueBytes {
 		return CommandCompletion{}, ErrInvalidSequencer
@@ -259,8 +258,12 @@ func (s *PostCommitSequencer) Submit(ctx context.Context, command PostCommitComm
 	if err := s.enqueue(pending); err != nil {
 		return CommandCompletion{}, err
 	}
-	reply := <-pending.completion
-	return reply.completion, reply.err
+	select {
+	case reply := <-pending.completion:
+		return reply.completion, reply.err
+	case <-ctx.Done():
+		return CommandCompletion{}, ctx.Err()
+	}
 }
 
 // Close stops ordinary admission, drains commands already accepted, and waits

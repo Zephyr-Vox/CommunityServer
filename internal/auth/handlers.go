@@ -3,12 +3,14 @@ package auth
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
+	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/store"
 )
 
@@ -147,6 +149,7 @@ func RegisterHandler(svc *RegisterService) echo.HandlerFunc {
 // Errors:
 //   - 1 invalid activation code: code wrong, used, or none pending
 //   - 2 owner already exists: an owner binding already exists
+//   - 9 idempotency mismatch: the retry key belongs to another activation request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1008 rate limited: too many activation attempts
@@ -155,25 +158,35 @@ func ActivateHandler(mgr *ActivationManager) echo.HandlerFunc {
 	const (
 		codeInvalidActivationCode = 1
 		codeOwnerAlreadyExists    = 2
+		codeIdempotencyMismatch   = 9
 	)
 	return func(c *echo.Context) error {
+		idempotencyKey := c.Request().Header.Get("Idempotency-Key")
+		if !realtime.IdempotencyKeyValid(idempotencyKey) {
+			return api.InvalidField("header.Idempotency-Key", "must be 16-64 characters using letters, digits, underscore, or hyphen")
+		}
 		var req activateRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
 
-		user, err := mgr.Activate(c.Request().Context(), req.Code, req.Username, req.Password, req.Nickname)
+		result, err := mgr.Activate(c.Request().Context(), idempotencyKey, req.Code, req.Username, req.Password, req.Nickname)
 		if err != nil {
 			switch {
 			case errors.Is(err, ErrInvalidActivationCode):
 				return api.NewError(codeInvalidActivationCode, http.StatusForbidden, "invalid activation code")
 			case errors.Is(err, ErrOwnerAlreadyExists):
 				return api.NewError(codeOwnerAlreadyExists, http.StatusForbidden, "owner already exists")
+			case errors.Is(err, realtime.ErrIdempotencyMismatch):
+				return api.NewError(codeIdempotencyMismatch, http.StatusConflict, "idempotency key reused with different request")
+			case errors.Is(err, ErrActivationIdempotencyKey):
+				return api.InvalidField("header.Idempotency-Key", "must be 16-64 characters using letters, digits, underscore, or hyphen")
 			default:
 				return err
 			}
 		}
-		return api.OK(c, http.StatusOK, userEnvelope{User: newUserResponse(user)})
+		c.Response().Header().Set("X-Zephyr-Command-ID", strconv.FormatInt(result.CommandID, 10))
+		return api.OK(c, http.StatusOK, userEnvelope{User: newUserResponse(result.User)})
 	}
 }
 

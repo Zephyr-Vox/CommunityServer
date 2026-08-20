@@ -41,12 +41,15 @@ func TestStatusHandlerRequiresActivation(t *testing.T) {
 
 func TestStatusHandlerNoActivationAfterOwner(t *testing.T) {
 	e := newEnv(t)
-	mgr := auth.NewActivationManager(e.stores)
+	mgr, err := auth.NewActivationManager(e.stores, e.secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 	code, _, err := mgr.EnsureCode(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mgr.Activate(t.Context(), code, "boss", "secret123", ""); err != nil {
+	if _, err := mgr.Activate(t.Context(), "activation-owner-0001", code, "boss", "secret123", ""); err != nil {
 		t.Fatal(err)
 	}
 
