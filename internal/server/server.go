@@ -70,6 +70,11 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 			return err
 		}
 	}
+	running, err := a.beginRun(ctx)
+	if err != nil {
+		return err
+	}
+	defer a.finishRun(running)
 
 	addr := net.JoinHostPort(a.cfg.Server.Host, strconv.Itoa(a.cfg.Server.HTTPPort))
 
@@ -152,7 +157,12 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 		ln.Close()
 		return fmt.Errorf("server: invalid tls_mode %q", mode)
 	}
-	return a.serve(ctx, ln, tlsInfo, timeouts)
+	// Snapshot/replay needs every persistent mutation to pass through the
+	// sequencer and a live EventBus, while UDP needs channel membership and relay
+	// authority. Those adapters are not assembled yet, so neither listener is
+	// public or bound. Starting either partial surface would let clients retain
+	// stale ACL/presence/voice state.
+	return a.serve(running, ln, tlsInfo, timeouts)
 }
 
 // validate rejects incomplete test-injected timeout policies before Run binds
@@ -171,10 +181,16 @@ func isWildcardHost(host string) bool {
 	return host == "0.0.0.0" || host == "::" || host == "[::]"
 }
 
-// serve publishes readiness, runs the HTTP server, and coordinates shutdown.
-// The serve goroutine owns ln until it returns; the buffered channel lets the
-// select receive an immediate listen failure or wait for context cancellation.
-func (a *App) serve(ctx context.Context, ln net.Listener, tlsInfo func(), timeouts HTTPTimeouts) error {
+// serve publishes readiness only after every core listener is bound, starts the
+// HTTP worker under supervisor, and owns graceful/fatal teardown. HTTP serving
+// itself never initiates shutdown; it only reports an unexpected failure to the
+// process supervisor.
+func (a *App) serve(running *appRun, ln net.Listener, tlsInfo func(), timeouts HTTPTimeouts) error {
+	if running == nil || running.supervisor == nil {
+		_ = ln.Close()
+		return errors.New("server: invalid process runtime")
+	}
+	supervisor := running.supervisor
 	log := a.logger.With("module", "server")
 	addr := ln.Addr().String()
 	log.Info("http listening on: " + addr)
@@ -186,27 +202,61 @@ func (a *App) serve(ctx context.Context, ln net.Listener, tlsInfo func(), timeou
 	// magenta on terminals; files and pipes render it plain.
 	log.Info("System initialization finished, LINK START!", "color", "magenta")
 	srv := newHTTPServer(addr, a.echo, a.logger, timeouts)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.Serve(ln)
-	}()
-
-	select {
-	case err := <-errCh:
+	a.setRunServer(running, srv)
+	supervisor.Go("http serve", func(context.Context) error {
+		err := srv.Serve(ln)
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
-	case <-ctx.Done():
-		log.Info("shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		err := shutdownHTTPServer(shutdownCtx, srv)
-		if err == nil {
-			log.Info("shutdown complete")
-		}
-		return err
+	})
+
+	<-supervisor.Context().Done()
+	if fatal := supervisor.FatalError(); fatal != nil {
+		return a.fatalShutdown(srv, supervisor, fatal)
 	}
+	return a.gracefulShutdown(srv, supervisor, log)
+}
+
+// gracefulShutdown applies the currently assembled subset of the fixed staged
+// order: stop new control admission, drain hijacked WS, stop UDP/purge, drain
+// HTTP, wait workers, then close DB. Future sequencer/EventBus/timer/relay
+// stages register at the marked boundaries without changing ownership.
+func (a *App) gracefulShutdown(srv *http.Server, supervisor *ProcessSupervisor, log *slog.Logger) error {
+	log.Info("shutting down")
+	supervisor.BeginShutdown()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	connectionsErr := a.ShutdownConnections(shutdownCtx)
+	voiceErr := a.stopVoice()
+	httpErr := shutdownHTTPServer(shutdownCtx, srv)
+	workersErr := supervisor.WaitWorkers(shutdownCtx)
+	realtimeErr := a.stopRealtime(shutdownCtx)
+	dbErr := a.closeDatabase()
+	err := errors.Join(connectionsErr, voiceErr, httpErr, workersErr, realtimeErr, dbErr)
+	if err == nil {
+		log.Info("shutdown complete")
+	}
+	return err
+}
+
+// fatalShutdown does not attempt to drain the failed worker. It rejects new
+// control admission, force-closes live sockets after best-effort terminal work,
+// stops UDP/HTTP, waits only within an independent short deadline, then closes
+// DB so restart reconstructs runtime state from persistent facts.
+func (a *App) fatalShutdown(srv *http.Server, supervisor *ProcessSupervisor, cause error) error {
+	supervisor.BeginShutdown()
+	a.connections.StopAdmission()
+	a.connections.DisconnectAll(4005, "server failure")
+	a.connections.ForceCloseAll()
+	voiceErr := a.stopVoice()
+	httpErr := srv.Close()
+	fatalCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	workersErr := supervisor.WaitWorkers(fatalCtx)
+	realtimeErr := a.stopRealtime(fatalCtx)
+	dbErr := a.closeDatabase()
+	return errors.Join(cause, voiceErr, httpErr, workersErr, realtimeErr, dbErr)
 }
 
 // newHTTPServer builds the ordinary HTTP server with the fixed deadline and

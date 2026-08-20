@@ -589,3 +589,74 @@ func TestRunBindFailureDoesNotClaimReady(t *testing.T) {
 		t.Fatalf("claimed readiness despite bind failure: %q", buf.String())
 	}
 }
+
+func TestRunDoesNotBindVoiceBeforeChannelAuthorityExists(t *testing.T) {
+	occupied, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	voicePort := occupied.LocalAddr().(*net.UDPAddr).Port
+
+	var buf bytes.Buffer
+	cfg := testConfig(t.TempDir(), freePort(t))
+	cfg.Server.VoicePort = voicePort
+	app, err := server.New(cfg, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- app.Run(ctx) }()
+	waitReady(t, http.DefaultClient, "http://127.0.0.1:"+strconv.Itoa(cfg.Server.HTTPPort))
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run with occupied UDP port = %v, want nil", err)
+	}
+	if !strings.Contains(buf.String(), "LINK START") {
+		t.Fatalf("server did not claim HTTP readiness: %q", buf.String())
+	}
+}
+
+// TestCloseStopsRunBeforeClosingDatabase verifies that Close drives the same
+// supervisor-owned shutdown as a canceled Run. A returned Close must therefore
+// imply the HTTP server has stopped and the Run goroutine has finished.
+func TestCloseStopsRunBeforeClosingDatabase(t *testing.T) {
+	cfg := testConfig(t.TempDir(), freePort(t))
+	app, err := server.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- app.Run(context.Background()) }()
+	addr := "http://" + net.JoinHostPort(cfg.Server.Host, strconv.Itoa(cfg.Server.HTTPPort))
+	waitReady(t, http.DefaultClient, addr)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- app.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not complete the active Run shutdown")
+	}
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run after Close = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close returned before Run finished")
+	}
+
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	response, err := client.Get(addr + "/api/v0/auth/status")
+	if err == nil {
+		response.Body.Close()
+		t.Fatal("HTTP server remained reachable after Close")
+	}
+}

@@ -128,3 +128,16 @@ func TestUnknownRouteIsEnvelope404(t *testing.T) {
 		t.Fatalf("code = %d, want 1004 (not found)", resp.Code)
 	}
 }
+
+// TestIncompleteRealtimeRoutesRemainUnmounted ensures handlers cannot expose
+// snapshots or WebSocket state before their publication/EventBus pipeline is
+// fully assembled.
+func TestIncompleteRealtimeRoutesRemainUnmounted(t *testing.T) {
+	app := newTestApp(t)
+	for _, path := range []string{"/api/v0/ws", "/api/v0/state/snapshot"} {
+		rec := get(t, app, path)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", path, rec.Code)
+		}
+	}
+}

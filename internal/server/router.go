@@ -46,7 +46,6 @@ func (a *App) routes(e *echo.Echo) error {
 	}
 
 	api := e.Group("/api/v0")
-
 	authGroup := api.Group("/auth")
 	authGroup.GET("/status", auth.StatusHandler(a.stores, auth.RegistrationMode(a.cfg.RegistrationMode)))
 	authGroup.POST("/register", auth.RegisterHandler(a.register), auth.IPRateLimit(a.cfg.LoginRateLimit))
