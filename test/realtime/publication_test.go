@@ -129,6 +129,47 @@ func TestStatePublicationCommitsVersionRingAndVisibilityTogether(t *testing.T) {
 	}
 }
 
+func TestStatePublicationRunsRuntimeCleanupAfterUnlock(t *testing.T) {
+	loader := &staticProjectionLoader{projection: &store.StateProjection{
+		Users: []db.User{{ID: 1, Username: "alice", Nickname: "Alice"}},
+	}}
+	state, err := realtime.NewStateStoreWithEpoch(context.Background(), loader, testEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := realtime.NewStatePublication(state, realtime.NewStateRing(), realtime.NewVisibilityResolver(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := state.BuildPersistentCandidate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runtimeCommitted bool
+	cleanupSawPublished := false
+	result, err := publication.Commit(realtime.PublicationRequest{
+		Candidate: candidate,
+		Events: []realtime.StateEventTemplate{{
+			EventType: "server.updated",
+			Scope:     realtime.Scope{Type: "server"},
+			Data:      []byte(`{}`),
+		}},
+		CommitRuntime: func() (func(), error) {
+			runtimeCommitted = true
+			if state.Current() != candidate.Base() {
+				t.Fatal("runtime commit observed state swap before ring publication")
+			}
+			return func() { cleanupSawPublished = state.Current() != candidate.Base() }, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !runtimeCommitted || !cleanupSawPublished || state.Current() != result.Version {
+		t.Fatalf("runtime publication = committed=%t cleanupSawPublished=%t current=%p result=%p", runtimeCommitted, cleanupSawPublished, state.Current(), result.Version)
+	}
+}
+
 func TestStateRingEnforcesByteRetentionAndSingleEventLimit(t *testing.T) {
 	probe, err := realtime.NewStateRingWithLimits(3, realtime.MaxStateRingBytes)
 	if err != nil {

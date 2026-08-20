@@ -90,3 +90,13 @@ func (s *Stores) WithTx(tx *sql.Tx) *Stores {
 		ActivationIdempotency: &ActivationIdempotencyStore{q: q, now: s.ActivationIdempotency.now, transactional: true},
 	}
 }
+
+// IDGenerator returns the process-wide snowflake generator shared by the
+// stores. Realtime's post-commit sequencer uses the same generator so command
+// IDs and persisted resource IDs remain in one server-local ID domain.
+func (s *Stores) IDGenerator() *snowflake.IDGenerator {
+	if s == nil || s.Users == nil {
+		return nil
+	}
+	return s.Users.idGen
+}
