@@ -147,6 +147,20 @@ type PreparedSession struct {
 	used    bool
 }
 
+// Info returns the unpublished session negotiation result. The returned master
+// key slice is copied so callers cannot mutate the one-time response material
+// retained by PreparedSession before activation.
+func (p *PreparedSession) Info() SessionInfo {
+	if p == nil {
+		return SessionInfo{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	info := p.info
+	info.MasterKey = append([]byte(nil), p.info.MasterKey...)
+	return info
+}
+
 // Session is one user's active voice session. Mutable state (ExpiresAt,
 // remote, rxReplay, rxBudget, sendSeq) is guarded by mu; the UDP server keeps
 // every critical section short and never performs encryption, packet
@@ -272,16 +286,23 @@ func (m *Manager) Prepare(userID int64, deviceID string, encrypted bool) (*Prepa
 	return &PreparedSession{owner: m, session: sess, info: SessionInfo{ID: id, Encrypted: encrypted, MasterKey: masterKey, ExpiresAt: expiresAt}}, nil
 }
 
-// ActivatePrepared publishes prepared when the user's current session matches
-// expectedOldID. A nil expectation permits an unconditional preemption.
-func (m *Manager) ActivatePrepared(prepared *PreparedSession, expectedOldID *[16]byte) (SessionInfo, error) {
+// ActivationCleanup performs the old-session best-effort UDP notification after
+// an application staging lock has been released. It is safe to call once; a nil
+// function represents a successful activation that replaced no live session.
+type ActivationCleanup func()
+
+// ActivatePreparedStaged publishes prepared when the user's current session
+// matches expectedOldID. A nil expectation permits unconditional preemption. It
+// returns cleanup work instead of executing UDP notification while a caller may
+// still hold an application coordinator/publication lock.
+func (m *Manager) ActivatePreparedStaged(prepared *PreparedSession, expectedOldID *[16]byte) (SessionInfo, ActivationCleanup, error) {
 	if prepared == nil || prepared.session == nil || prepared.owner != m {
-		return SessionInfo{}, ErrSessionPrecondition
+		return SessionInfo{}, nil, ErrSessionPrecondition
 	}
 	prepared.mu.Lock()
 	if prepared.used {
 		prepared.mu.Unlock()
-		return SessionInfo{}, ErrSessionPrecondition
+		return SessionInfo{}, nil, ErrSessionPrecondition
 	}
 	userID := prepared.session.UserID
 	nowMS := m.nowMillis()
@@ -290,7 +311,7 @@ func (m *Manager) ActivatePrepared(prepared *PreparedSession, expectedOldID *[16
 	if expectedOldID != nil && (!exists || currentID != *expectedOldID) {
 		m.mu.Unlock()
 		prepared.mu.Unlock()
-		return SessionInfo{}, ErrSessionPrecondition
+		return SessionInfo{}, nil, ErrSessionPrecondition
 	}
 	// Mark used before publishing indexes. Every successful activation has one
 	// linearization point, so a repeated call cannot deactivate and reinsert the
@@ -317,13 +338,30 @@ func (m *Manager) ActivatePrepared(prepared *PreparedSession, expectedOldID *[16
 	revokeHandler = m.onRevoke
 	m.mu.Unlock()
 	prepared.mu.Unlock()
-	// Explicit replacement must drain an already-reserved Send even when the
-	// session expired while that syscall was blocked. Expiry only suppresses the
-	// best-effort notification; it cannot release the write-order barrier.
-	runRevocation(revocationWork{session: removedSession, reason: RevocationReplaced, handler: revokeHandler, notify: replaced})
 
 	info := prepared.info
 	info.ReplacedPrevious = replaced
+	info.MasterKey = append([]byte(nil), info.MasterKey...)
+	cleanup := ActivationCleanup(func() {
+		// Explicit replacement must drain an already-reserved Send even when the
+		// session expired while that syscall was blocked. Expiry only suppresses
+		// notification; it cannot release the write-order barrier.
+		runRevocation(revocationWork{session: removedSession, reason: RevocationReplaced, handler: revokeHandler, notify: replaced})
+	})
+	return info, cleanup, nil
+}
+
+// ActivatePrepared publishes prepared and immediately performs its old-session
+// cleanup. Application code that holds a coordinator or StatePublication lock
+// must use ActivatePreparedStaged and run the returned cleanup after unlocking.
+func (m *Manager) ActivatePrepared(prepared *PreparedSession, expectedOldID *[16]byte) (SessionInfo, error) {
+	info, cleanup, err := m.ActivatePreparedStaged(prepared, expectedOldID)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	if cleanup != nil {
+		cleanup()
+	}
 	return info, nil
 }
 
