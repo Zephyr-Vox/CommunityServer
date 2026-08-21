@@ -1,45 +1,177 @@
 package server_test
 
 import (
-	"context"
-	"net"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// TestRunLeavesIncompleteRealtimeSurfacesUnavailable proves that ordinary HTTP
-// startup does not bind the configured UDP port or publish snapshot/WS routes
-// until channel authority, relay, sequencer and EventBus are connected.
-func TestRunLeavesIncompleteRealtimeSurfacesUnavailable(t *testing.T) {
-	occupied, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+// TestRealtimeHTTPAndWebSocketHandoff exercises metadata, a replace snapshot,
+// connection.ready, replay-to-live handoff and a sequenced presence.set event.
+func TestRealtimeHTTPAndWebSocketHandoff(t *testing.T) {
+	app := newTestApp(t)
+	_, token := activateAdmin(t, app)
+	server := httptest.NewServer(app.Echo())
+	defer server.Close()
+
+	metadataResp, err := http.Get(server.URL + "/api/v0/metadata")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer occupied.Close()
+	defer metadataResp.Body.Close()
+	var metadata struct {
+		Code int `json:"code"`
+		Data struct {
+			ProtocolVersion int `json:"protocol_version"`
+			VoiceEndpoint   struct {
+				Host string `json:"host"`
+				Port int    `json:"port"`
+			} `json:"voice_endpoint"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(metadataResp.Body).Decode(&metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadataResp.StatusCode != http.StatusOK || metadata.Code != 0 || metadata.Data.ProtocolVersion != 1 || metadata.Data.VoiceEndpoint.Host == "" || metadata.Data.VoiceEndpoint.Port == 0 {
+		t.Fatalf("metadata = status:%d body:%+v", metadataResp.StatusCode, metadata)
+	}
 
-	cfg := testConfig(t.TempDir(), freePort(t))
-	cfg.Server.VoicePort = occupied.LocalAddr().(*net.UDPAddr).Port
-	addr, cancel, done := startRun(t, cfg)
-	defer func() {
-		cancel()
-		if err := <-done; err != nil {
-			t.Errorf("Run after cancel = %v", err)
+	snapshotRequest, err := http.NewRequest(http.MethodGet, server.URL+"/api/v0/state/snapshot", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotRequest.Header.Set("Authorization", "Bearer "+token)
+	snapshotResp, err := http.DefaultClient.Do(snapshotRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshotResp.Body.Close()
+	var snapshot struct {
+		Code int `json:"code"`
+		Data struct {
+			Cursor string `json:"cursor"`
+			State  struct {
+				Self struct {
+					User struct {
+						Username string `json:"username"`
+					} `json:"user"`
+					Presence struct {
+						Status string `json:"status"`
+					} `json:"presence"`
+					ServerPermissions []string `json:"server_permissions"`
+				} `json:"self"`
+			} `json:"state"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(snapshotResp.Body).Decode(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotResp.StatusCode != http.StatusOK || snapshot.Code != 0 || snapshot.Data.Cursor == "" || snapshot.Data.State.Self.User.Username != "boss" || snapshot.Data.State.Self.Presence.Status != "offline" || len(snapshot.Data.State.Self.ServerPermissions) != 1 || snapshot.Data.State.Self.ServerPermissions[0] != "*" {
+		t.Fatalf("snapshot = status:%d body:%+v", snapshotResp.StatusCode, snapshot)
+	}
+	if cacheControl := snapshotResp.Header.Get("Cache-Control"); cacheControl != "private, no-store" {
+		t.Fatalf("snapshot Cache-Control = %q", cacheControl)
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v0/ws"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Authorization": []string{"Bearer " + token}})
+	if err != nil {
+		if response != nil {
+			response.Body.Close()
 		}
-	}()
-	waitReady(t, http.DefaultClient, "http://"+addr)
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var ready struct {
+		Type string `json:"type"`
+		Data struct {
+			ControlConnectionID string `json:"control_connection_id"`
+		} `json:"data"`
+	}
+	if err := conn.ReadJSON(&ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready.Type != "connection.ready" || len(ready.Data.ControlConnectionID) != 32 {
+		t.Fatalf("ready = %+v", ready)
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "sync.hello", "data": map[string]any{"cursor": snapshot.Data.Cursor}}); err != nil {
+		t.Fatal(err)
+	}
 
-	for _, path := range []string{"/api/v0/state/snapshot", "/api/v0/ws"} {
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+addr+path, nil)
-		if err != nil {
+	seenReplay := false
+	seenComplete := false
+	for !seenComplete {
+		var frame struct {
+			Type string `json:"type"`
+			Data struct {
+				Events []struct {
+					EventType string `json:"event_type"`
+				} `json:"events"`
+				Cursor string `json:"cursor"`
+			} `json:"data"`
+		}
+		if err := conn.ReadJSON(&frame); err != nil {
 			t.Fatal(err)
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
+		switch frame.Type {
+		case "sync.replay":
+			seenReplay = true
+			if len(frame.Data.Events) != 1 || frame.Data.Events[0].EventType != "presence.updated" {
+				t.Fatalf("replay = %+v", frame)
+			}
+		case "sync.complete":
+			if frame.Data.Cursor == "" {
+				t.Fatal("sync.complete has empty cursor")
+			}
+			seenComplete = true
+		default:
+			t.Fatalf("unexpected sync frame = %+v", frame)
+		}
+	}
+	if !seenReplay {
+		t.Fatal("sync replay was not sent")
+	}
+
+	if err := conn.WriteJSON(map[string]any{"type": "presence.set", "request_id": "presence-set-0001", "data": map[string]any{"status": "dnd"}}); err != nil {
+		t.Fatal(err)
+	}
+	seenPresence := false
+	seenAck := false
+	for !seenPresence || !seenAck {
+		var frame struct {
+			Type      string `json:"type"`
+			RequestID string `json:"request_id"`
+			EventType string `json:"event_type"`
+			Data      struct {
+				CommandType string `json:"command_type"`
+				CommandID   string `json:"command_id"`
+				User        struct {
+					Presence struct {
+						Status string `json:"status"`
+					} `json:"presence"`
+				} `json:"user"`
+			} `json:"data"`
+		}
+		if err := conn.ReadJSON(&frame); err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("%s status = %d, want 404", path, resp.StatusCode)
+		if frame.Type == "state.event" && frame.EventType == "presence.updated" {
+			if frame.Data.User.Presence.Status != "dnd" {
+				t.Fatalf("presence event = %+v", frame)
+			}
+			seenPresence = true
+		}
+		if frame.Type == "command.ok" && frame.RequestID == "presence-set-0001" {
+			if frame.Data.CommandType != "presence.set" || frame.Data.CommandID == "" {
+				t.Fatalf("presence acknowledgement = %+v", frame)
+			}
+			seenAck = true
 		}
 	}
 }

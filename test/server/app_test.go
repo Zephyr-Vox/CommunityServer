@@ -129,15 +129,17 @@ func TestUnknownRouteIsEnvelope404(t *testing.T) {
 	}
 }
 
-// TestIncompleteRealtimeRoutesRemainUnmounted ensures handlers cannot expose
-// snapshots or WebSocket state before their publication/EventBus pipeline is
-// fully assembled.
-func TestIncompleteRealtimeRoutesRemainUnmounted(t *testing.T) {
+// TestRealtimeRoutesRequireTheirDocumentedAuthentication confirms that metadata
+// is public while snapshot and WebSocket upgrade require an access token.
+func TestRealtimeRoutesRequireTheirDocumentedAuthentication(t *testing.T) {
 	app := newTestApp(t)
+	if rec := get(t, app, "/api/v0/metadata"); rec.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, body = %s", rec.Code, rec.Body.String())
+	}
 	for _, path := range []string{"/api/v0/ws", "/api/v0/state/snapshot"} {
 		rec := get(t, app, path)
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("%s status = %d, want 404", path, rec.Code)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s status = %d, want 401", path, rec.Code)
 		}
 	}
 }

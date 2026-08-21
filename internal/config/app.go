@@ -51,6 +51,7 @@ const (
 // (the transport — KCP, WebRTC, ... — is an implementation detail).
 type ServerConfig struct {
 	Host              string   // listen host, e.g. "0.0.0.0"
+	AdvertisedHost    string   // client-reachable voice endpoint host, never a wildcard listener
 	HTTPPort          int      // HTTP/REST listener port
 	VoicePort         int      // future voice channel listener port
 	DBPath            string   // SQLite database file path
@@ -108,6 +109,7 @@ type appConfig struct {
 	JWTSecret string `mapstructure:"jwt_secret"`
 	Server    struct {
 		Host              string   `mapstructure:"host"`
+		AdvertisedHost    string   `mapstructure:"advertised_host"`
 		HTTPPort          int      `mapstructure:"http_port"`
 		VoicePort         int      `mapstructure:"voice_port"`
 		DBPath            string   `mapstructure:"db_path"`
@@ -274,10 +276,23 @@ func validateVoice(cfg appConfig) (VoiceConfig, error) {
 // the TLS defaults are applied in exactly one place.
 func validateServerTLS(cfg appConfig) (ServerConfig, error) {
 	s := ServerConfig{
-		Host:      cfg.Server.Host,
-		HTTPPort:  cfg.Server.HTTPPort,
-		VoicePort: cfg.Server.VoicePort,
-		DBPath:    cfg.Server.DBPath,
+		Host:           cfg.Server.Host,
+		AdvertisedHost: strings.TrimSpace(cfg.Server.AdvertisedHost),
+		HTTPPort:       cfg.Server.HTTPPort,
+		VoicePort:      cfg.Server.VoicePort,
+		DBPath:         cfg.Server.DBPath,
+	}
+	if s.AdvertisedHost == "" {
+		// Older hand-written configurations predate advertised_host. Preserve a
+		// non-wildcard endpoint for their metadata response; operators serving
+		// remote clients must explicitly replace this local-safe default.
+		s.AdvertisedHost = "localhost"
+		if s.Host != "0.0.0.0" && s.Host != "::" && s.Host != "[::]" {
+			s.AdvertisedHost = s.Host
+		}
+	}
+	if s.AdvertisedHost == "0.0.0.0" || s.AdvertisedHost == "::" || s.AdvertisedHost == "[::]" || (net.ParseIP(s.AdvertisedHost) == nil && !validDNSName(s.AdvertisedHost)) {
+		return ServerConfig{}, errors.New("config: server.advertised_host must be a client-reachable DNS name or IP address")
 	}
 	mode := strings.ToLower(strings.TrimSpace(cfg.Server.TLSMode))
 	if mode == "" {

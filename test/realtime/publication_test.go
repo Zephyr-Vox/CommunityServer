@@ -94,13 +94,16 @@ func TestStatePublicationCommitsVersionRingAndVisibilityTogether(t *testing.T) {
 		t.Fatal(got.err)
 	}
 	snapshot := <-captured
-	if snapshot.Version != got.result.Version || snapshot.HighWater != 1 || snapshot.Version.Checkpoint() != (realtime.Checkpoint{StreamEpoch: testEpoch, GEID: 1}) || len(snapshot.Events) != 1 {
+	if snapshot.Version != got.result.Version || snapshot.HighWater != 5 || snapshot.Version.Checkpoint() != (realtime.Checkpoint{StreamEpoch: testEpoch, GEID: 5}) || len(snapshot.Events) != 2 {
 		t.Fatalf("publication snapshot = %+v", snapshot)
 	}
 	if got.result.Version.VisibilityEpoch(1) != 1 || len(got.result.VisibilityChanges[1].Granted) != 1 || got.result.VisibilityChanges[1].Granted[0] != (realtime.Scope{Type: "group", ID: 10}) {
 		t.Fatalf("visibility result = %+v epoch=%d", got.result.VisibilityChanges, got.result.Version.VisibilityEpoch(1))
 	}
-	if events, replayable := ring.EventsAfter(0); !replayable || len(events) != 1 || events[0].GEID != 1 || events[0].ServerTime != 123 {
+	if len(got.result.Events) != 5 || got.result.Events[0].EventType != "group.updated" || got.result.Events[1].EventType != "visibility.grant.begin" || got.result.Events[2].EventType != "visibility.fragment" || got.result.Events[3].EventType != "visibility.granted" || got.result.Events[4].EventType != "visibility.transition.complete" || got.result.Events[4].CursorVisibilityEpoch != 1 {
+		t.Fatalf("visibility transition events = %+v", got.result.Events)
+	}
+	if events, replayable := ring.EventsAfter(3); !replayable || len(events) != 2 || events[0].GEID != 4 || events[1].GEID != 5 || events[0].ServerTime != 123 {
 		t.Fatalf("replay events = %+v replayable=%t", events, replayable)
 	}
 
@@ -124,7 +127,7 @@ func TestStatePublicationCommitsVersionRingAndVisibilityTogether(t *testing.T) {
 	if _, replayable := ring.EventsAfter(0); replayable {
 		t.Fatal("evicted GEID range was incorrectly replayable")
 	}
-	if events, replayable := ring.EventsAfter(1); !replayable || len(events) != 2 || events[0].GEID != 2 || events[1].GEID != 3 {
+	if events, replayable := ring.EventsAfter(5); !replayable || len(events) != 2 || events[0].GEID != 6 || events[1].GEID != 7 {
 		t.Fatalf("retained range = %+v replayable=%t", events, replayable)
 	}
 }

@@ -32,10 +32,18 @@ var (
 // SHA-256 digest is kept in memory. A pending code never expires until the
 // process restarts, at which point a fresh code replaces it.
 type ActivationManager struct {
-	mu       sync.Mutex
-	stores   *store.Stores
-	codeHash string
-	durable  *realtime.DurableActivationIdempotency
+	mu        sync.Mutex
+	stores    *store.Stores
+	codeHash  string
+	durable   *realtime.DurableActivationIdempotency
+	publisher StateChangePublisher
+}
+
+// SetStateChangePublisher installs the post-commit realtime projection bridge
+// used after the first owner is committed. Replayed activation results do not
+// invoke it because they carry no new state transition.
+func (m *ActivationManager) SetStateChangePublisher(publisher StateChangePublisher) {
+	m.publisher = publisher
 }
 
 // NewActivationManager returns an ActivationManager bound to stores. identityKey
@@ -212,6 +220,11 @@ func (m *ActivationManager) activate(ctx context.Context, idempotencyKey, code, 
 		return ActivationResult{}, err
 	}
 	m.codeHash = ""
+	if m.publisher != nil {
+		if err := m.publisher(ctx, StateChange{EventType: "user.created", UserID: user.ID}); err != nil {
+			return ActivationResult{}, err
+		}
+	}
 	return ActivationResult{User: user, CommandID: commandID}, nil
 }
 

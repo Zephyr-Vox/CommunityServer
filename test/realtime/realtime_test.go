@@ -224,12 +224,11 @@ func TestVisibilityEpochRemainsMonotonicAcrossRevokeAndRegrant(t *testing.T) {
 	grant, err := publication.Commit(realtime.PublicationRequest{
 		Candidate:         grantCandidate,
 		VisibilityUserIDs: []int64{1},
-		Events:            []realtime.StateEventTemplate{{EventType: "visibility.granted", Scope: realtime.Scope{Type: "group", ID: 200}, Data: []byte(`{}`)}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if grant.Version.VisibilityEpoch(1) != 1 || len(grant.VisibilityChanges[1].Granted) != 1 || len(grant.VisibilityChanges[1].Revoked) != 0 || grant.Checkpoint.GEID != 1 {
+	if grant.Version.VisibilityEpoch(1) != 1 || len(grant.VisibilityChanges[1].Granted) != 1 || len(grant.VisibilityChanges[1].Revoked) != 0 || grant.Checkpoint.GEID != 4 || len(grant.Events) != 4 || grant.Events[0].EventType != "visibility.grant.begin" || grant.Events[3].EventType != "visibility.transition.complete" || grant.Events[0].CursorVisibilityEpoch != 0 || grant.Events[3].CursorVisibilityEpoch != 1 {
 		t.Fatalf("grant publication = %+v", grant)
 	}
 	grantVersion := grant.Version
@@ -242,12 +241,11 @@ func TestVisibilityEpochRemainsMonotonicAcrossRevokeAndRegrant(t *testing.T) {
 	revoke, err := publication.Commit(realtime.PublicationRequest{
 		Candidate:         revokeCandidate,
 		VisibilityUserIDs: []int64{1},
-		Events:            []realtime.StateEventTemplate{{EventType: "visibility.revoked", Scope: realtime.Scope{Type: "group", ID: 200}, Data: []byte(`{}`)}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if revoke.Version.VisibilityEpoch(1) != 2 || len(revoke.VisibilityChanges[1].Granted) != 0 || len(revoke.VisibilityChanges[1].Revoked) != 1 || revoke.Checkpoint.GEID != 2 {
+	if revoke.Version.VisibilityEpoch(1) != 2 || len(revoke.VisibilityChanges[1].Granted) != 0 || len(revoke.VisibilityChanges[1].Revoked) != 1 || revoke.Checkpoint.GEID != 7 || len(revoke.Events) != 3 || revoke.Events[0].EventType != "visibility.tombstone" || revoke.Events[1].EventType != "visibility.revoked" || revoke.Events[2].EventType != "visibility.transition.complete" || revoke.Events[0].CursorVisibilityEpoch != 1 || revoke.Events[2].CursorVisibilityEpoch != 2 {
 		t.Fatalf("revoke publication = %+v", revoke)
 	}
 
@@ -259,12 +257,11 @@ func TestVisibilityEpochRemainsMonotonicAcrossRevokeAndRegrant(t *testing.T) {
 	regrant, err := publication.Commit(realtime.PublicationRequest{
 		Candidate:         regrantCandidate,
 		VisibilityUserIDs: []int64{1},
-		Events:            []realtime.StateEventTemplate{{EventType: "visibility.granted", Scope: realtime.Scope{Type: "group", ID: 200}, Data: []byte(`{}`)}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if regrant.Version.VisibilityEpoch(1) != 3 || len(regrant.VisibilityChanges[1].Granted) != 1 || len(regrant.VisibilityChanges[1].Revoked) != 0 || regrant.Checkpoint.GEID != 3 {
+	if regrant.Version.VisibilityEpoch(1) != 3 || len(regrant.VisibilityChanges[1].Granted) != 1 || len(regrant.VisibilityChanges[1].Revoked) != 0 || regrant.Checkpoint.GEID != 11 || len(regrant.Events) != 4 || regrant.Events[0].CursorVisibilityEpoch != 2 || regrant.Events[3].CursorVisibilityEpoch != 3 {
 		t.Fatalf("regrant publication = %+v", regrant)
 	}
 	if grantVersion.VisibilityEpoch(1) != 1 || state.Current() != regrant.Version || state.Current().Number() != 3 {

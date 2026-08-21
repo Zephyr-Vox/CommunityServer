@@ -157,11 +157,10 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 		ln.Close()
 		return fmt.Errorf("server: invalid tls_mode %q", mode)
 	}
-	// Snapshot/replay needs every persistent mutation to pass through the
-	// sequencer and a live EventBus, while UDP needs channel membership and relay
-	// authority. Those adapters are not assembled yet, so neither listener is
-	// public or bound. Starting either partial surface would let clients retain
-	// stale ACL/presence/voice state.
+	// Realtime StateStore, EventBus and HTTP/WS adapters are assembled before
+	// this listener is published. UDP voice binding remains deferred until the
+	// channel authority/relay adapter owns its membership lifecycle, so metadata
+	// can describe the validated endpoint without opening a partial media plane.
 	return a.serve(running, ln, tlsInfo, timeouts)
 }
 

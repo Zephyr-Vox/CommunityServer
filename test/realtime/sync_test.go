@@ -397,6 +397,95 @@ func TestEventBusPassesVisibilityRevokeToQueuePrune(t *testing.T) {
 	}
 }
 
+// TestVisibilityTransitionUsesOldAndNewEpochCursors proves that a revoke sends
+// sanitized direct transitions after pruning queued private data. Scope events
+// retain the old epoch while the single transition.complete cursor commits the
+// new epoch, so an interrupted client must snapshot instead of persisting a
+// partial transition.
+func TestVisibilityTransitionUsesOldAndNewEpochCursors(t *testing.T) {
+	loader := &staticProjectionLoader{projection: &store.StateProjection{
+		Users:  []db.User{{ID: 1, Username: "alice", Nickname: "Alice"}},
+		Groups: []db.ChannelGroup{{ID: 10, Name: "Private", Visibility: "private", Version: 1}},
+		GroupAccess: []db.GroupAccess{{
+			ID:            20,
+			GroupID:       10,
+			PrincipalType: "user",
+			UserID:        sql.NullInt64{Int64: 1, Valid: true},
+		}},
+	}}
+	state, err := realtime.NewStateStoreWithEpoch(context.Background(), loader, testEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility := realtime.NewVisibilityResolver()
+	publication, err := realtime.NewStatePublication(state, realtime.NewStateRing(), visibility, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := realtime.NewCursorSignerWithKey(testEpoch, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventBus, err := realtime.NewEventBus(signer, visibility)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(eventBus.Close)
+	strategy, err := realtime.NewFullSnapshotSyncStrategy(publication, signer, visibility, eventBus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := strategy.CaptureSnapshot(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := newSyncConnectionRecorder(1, 1)
+	if _, err := strategy.OnHello(connection, snapshot.Cursor); err != nil {
+		t.Fatal(err)
+	}
+
+	loader.projection = &store.StateProjection{
+		Users:  []db.User{{ID: 1, Username: "alice", Nickname: "Alice"}},
+		Groups: []db.ChannelGroup{{ID: 10, Name: "Private", Visibility: "private", Version: 1}},
+	}
+	publishSyncEventData(t, state, publication, "acl.updated", realtime.Scope{Type: "server"}, []byte(`{}`), []int64{1})
+	batches := connection.Batches()
+	if len(batches) != 2 || len(batches[1]) != 4 {
+		t.Fatalf("transition batches = %v", frameTypes(batches))
+	}
+	var events []struct {
+		EventType string `json:"event_type"`
+		Cursor    string `json:"cursor"`
+	}
+	for _, frame := range batches[1] {
+		var event struct {
+			EventType string `json:"event_type"`
+			Cursor    string `json:"cursor"`
+		}
+		if err := json.Unmarshal(frame, &event); err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, event)
+	}
+	wantTypes := []string{"acl.updated", "visibility.tombstone", "visibility.revoked", "visibility.transition.complete"}
+	for index, want := range wantTypes {
+		if events[index].EventType != want {
+			t.Fatalf("transition event %d = %q, want %q", index, events[index].EventType, want)
+		}
+		cursor, err := signer.Parse(1, events[index].Cursor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantEpoch := uint64(0)
+		if want == "visibility.transition.complete" {
+			wantEpoch = 1
+		}
+		if cursor.VisibilityEpoch != wantEpoch {
+			t.Fatalf("%s cursor epoch = %d, want %d", want, cursor.VisibilityEpoch, wantEpoch)
+		}
+	}
+}
+
 type syncConnectionRecorder struct {
 	ref realtime.ControlConnectionRef
 

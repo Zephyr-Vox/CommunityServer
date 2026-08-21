@@ -7,10 +7,11 @@ import (
 
 // TestRouteTable pins the complete mounted route table. This guards the
 // path-grouping refactor against accidentally dropping or renaming a route,
-// including empty-path routes such as PATCH /api/v0/me and GET /api/v0/presence.
+// including the public metadata endpoint and authenticated synchronization
+// endpoints alongside empty-path routes such as PATCH /api/v0/me.
 func TestRouteTable(t *testing.T) {
 	app := newTestApp(t)
-	got := make([]string, 0, 36)
+	got := make([]string, 0, 37)
 	for _, r := range app.Echo().Router().Routes() {
 		got = append(got, r.Method+" "+r.Path)
 	}
@@ -25,12 +26,14 @@ func TestRouteTable(t *testing.T) {
 		"GET /api/v0/admin/invites",
 		"GET /api/v0/auth/me",
 		"GET /api/v0/auth/status",
-		"GET /api/v0/presence",
+		"GET /api/v0/metadata",
 		"GET /api/v0/rbac/bindings",
 		"GET /api/v0/rbac/config",
 		"GET /api/v0/rbac/roles",
+		"GET /api/v0/state/snapshot",
 		"GET /api/v0/users",
 		"GET /api/v0/users/:id",
+		"GET /api/v0/ws",
 		"GET /avatar/:file",
 		"PATCH /api/v0/me",
 		"PATCH /api/v0/rbac/roles/:key",
@@ -44,7 +47,6 @@ func TestRouteTable(t *testing.T) {
 		"POST /api/v0/me/avatar",
 		"POST /api/v0/me/password",
 		"POST /api/v0/owner/transfer",
-		"POST /api/v0/presence/heartbeat",
 		"POST /api/v0/rbac/bindings",
 		"POST /api/v0/rbac/config/reset",
 		"POST /api/v0/rbac/roles",

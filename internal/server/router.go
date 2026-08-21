@@ -9,10 +9,10 @@ import (
 
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/image"
-	"zephyr.vox/server/ce/internal/presence"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbaccontrol "zephyr.vox/server/ce/internal/rbac/control"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
+	"zephyr.vox/server/ce/internal/realtime"
 )
 
 // routes mounts every endpoint on e. Groups mirror URL prefixes only; each
@@ -38,6 +38,7 @@ func (a *App) routes(e *echo.Echo) error {
 	authnMW := rbacecho.AuthN(auth.NewPrincipalResolver(a.principals))
 	authz := rbac.NewAuthorizer(a.stores.Roles)
 	rbacSvc := rbaccontrol.NewService(a.stores, a.principals)
+	rbacSvc.SetStateChangePublisher(a.publishRBACChange)
 
 	// authed wraps the standard authentication chain; extra middleware (e.g.
 	// permission checks) runs after it.
@@ -46,6 +47,9 @@ func (a *App) routes(e *echo.Echo) error {
 	}
 
 	api := e.Group("/api/v0")
+	api.GET("/metadata", realtime.MetadataHandler(a.metadata))
+	api.GET("/state/snapshot", realtime.SnapshotHandler(a.currentStateSync), authed()...)
+	api.GET("/ws", realtime.WebSocketHandler(a.connectionAuthenticator(), a.connections, a.upgradeLimiter(), a.currentStateSync, a.connectionStatePublisher()))
 	authGroup := api.Group("/auth")
 	authGroup.GET("/status", auth.StatusHandler(a.stores, auth.RegistrationMode(a.cfg.RegistrationMode)))
 	authGroup.POST("/register", auth.RegisterHandler(a.register), auth.IPRateLimit(a.cfg.LoginRateLimit))
@@ -59,10 +63,6 @@ func (a *App) routes(e *echo.Echo) error {
 	me.POST("/avatar", image.UploadAvatarHandler(a.avatar), authed()...)
 	me.DELETE("/avatar", image.DeleteAvatarHandler(a.avatar), authed()...)
 	me.POST("/password", auth.MePasswordHandler(a.authSvc), authed()...)
-
-	presenceGroup := api.Group("/presence")
-	presenceGroup.POST("/heartbeat", presence.HeartbeatHandler(a.presence), authed()...)
-	presenceGroup.GET("", presence.QueryHandler(a.presence), authed()...)
 
 	users := api.Group("/users")
 	users.GET("", auth.ListUsersHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserRead))...)

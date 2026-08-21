@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
 
 	"github.com/labstack/echo/v5"
 
+	versioninfo "zephyr.vox/server/ce"
 	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
@@ -78,7 +80,8 @@ type SnapshotUser struct {
 
 // SnapshotPresence is the v1 server-global presence representation.
 type SnapshotPresence struct {
-	Status string `json:"status"`
+	Status   string            `json:"status"`
+	Activity *PresenceActivity `json:"activity,omitempty"`
 }
 
 // SnapshotUserPresence is another user's privacy-projected identity/presence.
@@ -351,7 +354,7 @@ func (s *FullSnapshotSyncStrategy) replayFrames(userID int64, version *StateVers
 		if err != nil {
 			return nil, err
 		}
-		encoded, err := event.EncodedWithCursor(cursor)
+		encoded, err := encodeEventForRecipient(event, userID, version, cursor)
 		if err != nil {
 			return nil, err
 		}
@@ -462,10 +465,10 @@ func SnapshotHandler(strategy func() StateSyncStrategy) echo.HandlerFunc {
 func snapshotStateFor(userID int64, version *StateVersion, visibility *VisibilityResolver) SnapshotState {
 	selfUser, _ := version.User(userID)
 	state := SnapshotState{
-		Server: SnapshotServer{},
+		Server: SnapshotServer{Name: "ZephyrVox", Version: versioninfo.Version},
 		Self: SnapshotSelf{
 			User:           snapshotUser(selfUser),
-			Presence:       SnapshotPresence{Status: "offline"},
+			Presence:       snapshotPresenceFor(userID, userID, version),
 			VoiceAuthority: json.RawMessage("null"),
 		},
 		VoiceMemberships: []SnapshotVoiceMembership{},
@@ -475,8 +478,10 @@ func snapshotStateFor(userID int64, version *StateVersion, visibility *Visibilit
 			state.Self.ServerRoleKeys = append(state.Self.ServerRoleKeys, binding.RoleKey)
 		}
 	}
+	sort.Strings(state.Self.ServerRoleKeys)
+	state.Self.ServerPermissions = snapshotServerPermissions(state.Self.ServerRoleKeys, version)
 	for _, user := range version.Users() {
-		state.Users = append(state.Users, SnapshotUserPresence{UserID: strconv.FormatInt(user.ID, 10), Nickname: user.Nickname, Avatar: user.Avatar, Presence: SnapshotPresence{Status: "offline"}})
+		state.Users = append(state.Users, snapshotUserPresenceFor(userID, user.ID, version))
 	}
 	for _, role := range version.Roles() {
 		state.Roles = append(state.Roles, SnapshotRole{Key: role.Key, DisplayName: role.DisplayName, Rank: strconv.FormatInt(role.Rank, 10), Builtin: role.Builtin})
@@ -498,6 +503,95 @@ func snapshotStateFor(userID int64, version *StateVersion, visibility *Visibilit
 		state.Channels = append(state.Channels, SnapshotChannel{ID: strconv.FormatInt(channel.ID, 10), GroupID: groupID, Name: channel.Name, Mode: channel.Mode, Temporary: channel.Temporary, Visibility: channel.Visibility, Capacity: strconv.FormatInt(channel.Capacity, 10), Position: strconv.FormatInt(channel.Position, 10), Pinned: channel.Pinned, Version: strconv.FormatInt(channel.Version, 10)})
 	}
 	return state
+}
+
+// SnapshotUserPresenceFor exposes the canonical privacy projection used by
+// snapshot serialization, visibility fragments and user/presence event
+// materialization. recipientID receives private activity only for itself.
+func SnapshotUserPresenceFor(recipientID, subjectID int64, version *StateVersion) SnapshotUserPresence {
+	return snapshotUserPresenceFor(recipientID, subjectID, version)
+}
+
+// SnapshotSelfFor returns the complete recipient-owned snapshot subdocument.
+// It is used by targeted self.updated events after permission or profile
+// mutations, so those events use exactly the snapshot representation.
+func SnapshotSelfFor(userID int64, version *StateVersion) SnapshotSelf {
+	return snapshotStateFor(userID, version, NewVisibilityResolver()).Self
+}
+
+// snapshotUserPresenceFor projects subject's presence for recipient. Invisible
+// and private activity remain visible only to the subject itself.
+func snapshotUserPresenceFor(recipientID, subjectID int64, version *StateVersion) SnapshotUserPresence {
+	user, _ := version.User(subjectID)
+	return SnapshotUserPresence{
+		UserID:   strconv.FormatInt(user.ID, 10),
+		Nickname: user.Nickname,
+		Avatar:   user.Avatar,
+		Presence: snapshotPresenceFor(recipientID, subjectID, version),
+	}
+}
+
+// snapshotPresenceFor converts one runtime presence value to its privacy-safe
+// wire projection for recipientID.
+func snapshotPresenceFor(recipientID, subjectID int64, version *StateVersion) SnapshotPresence {
+	presence := version.Presence(subjectID)
+	if recipientID != subjectID && presence.Status == "invisible" {
+		return SnapshotPresence{Status: "offline"}
+	}
+	projected := SnapshotPresence{Status: presence.Status}
+	if presence.Activity != nil && (recipientID == subjectID || presence.Activity.Privacy == "public") {
+		activity := *presence.Activity
+		projected.Activity = &activity
+	}
+	return projected
+}
+
+// snapshotServerPermissions resolves stable effective server permissions from
+// the immutable root config rather than querying mutable SQLite during snapshot
+// serialization. Owner's mandatory wildcard is represented directly.
+func snapshotServerPermissions(roleKeys []string, version *StateVersion) []string {
+	for _, roleKey := range roleKeys {
+		if roleKey == "owner" {
+			return []string{"*"}
+		}
+	}
+	config, ok := version.Config(Scope{Type: "server"})
+	if !ok {
+		return []string{}
+	}
+	var grants map[string][]string
+	if json.Unmarshal([]byte(config.Config), &grants) != nil {
+		return []string{}
+	}
+	seen := make(map[string]struct{})
+	permissions := make([]string, 0)
+	for _, roleKey := range roleKeys {
+		for _, permission := range grants[roleKey] {
+			if _, exists := seen[permission]; exists {
+				continue
+			}
+			seen[permission] = struct{}{}
+			permissions = append(permissions, permission)
+		}
+	}
+	sort.Strings(permissions)
+	return permissions
+}
+
+// encodeEventForRecipient applies v1's recipient-specific user/presence
+// projection before serializing an otherwise immutable ring event.
+func encodeEventForRecipient(event StateEvent, recipientID int64, version *StateVersion, cursor string) ([]byte, error) {
+	data := event.Data
+	if event.SubjectUserID > 0 && (event.EventType == "user.created" || event.EventType == "user.updated" || event.EventType == "presence.updated") {
+		projected, err := json.Marshal(struct {
+			User SnapshotUserPresence `json:"user"`
+		}{User: SnapshotUserPresenceFor(recipientID, event.SubjectUserID, version)})
+		if err != nil {
+			return nil, err
+		}
+		data = projected
+	}
+	return event.EncodedWithDataAndCursor(data, cursor)
 }
 
 // snapshotUser converts the store projection's credential-free user DTO.
@@ -529,6 +623,9 @@ func eventsAfterCapture(events []StateEvent, highWater, geid uint64) ([]StateEve
 
 // eventVisibleTo applies the same immutable resolver used by snapshots.
 func eventVisibleTo(userID int64, event StateEvent, version *StateVersion, visibility *VisibilityResolver) bool {
+	if event.DeliveryPolicy == StateDeliveryDirectTransition {
+		return event.RecipientUserID == userID
+	}
 	switch event.Scope.Type {
 	case "server":
 		_, ok := version.User(userID)

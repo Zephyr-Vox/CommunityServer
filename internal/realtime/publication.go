@@ -2,7 +2,11 @@ package realtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -71,6 +75,11 @@ type PublicationRequest struct {
 	Candidate         *StateCandidate
 	Events            []StateEventTemplate
 	VisibilityUserIDs []int64
+	// CommitRuntime applies a staged coordinator transition while the
+	// publication lock excludes half-published state. It must not perform socket
+	// I/O, UDP sends, or wait for another goroutine. Any returned cleanup runs
+	// after the publication and delivery locks have been released.
+	CommitRuntime func() (cleanup func(), err error)
 }
 
 // PublicationResult describes the immutable state and replayable events made
@@ -88,8 +97,9 @@ type PublicationResult struct {
 // is still rollbackable, then publish only after that transaction commits.
 // Exactly one of Publish, PublishRuntime, or Abort releases the reservation.
 type PublicationReservation struct {
-	publication *StatePublication
-	result      PublicationResult
+	publication   *StatePublication
+	result        PublicationResult
+	runtimeCommit func() (cleanup func(), err error)
 
 	mu        sync.Mutex
 	completed bool
@@ -111,11 +121,29 @@ type StatePublication struct {
 	state      *StateStore
 	ring       *StateRing
 	visibility *VisibilityResolver
+	eventBus   *EventBus
 	now        func() int64
 
 	mu          sync.RWMutex
 	hook        PublicationHook
 	captureHook atomic.Pointer[publicationCaptureHookValue]
+}
+
+// BindEventBus attaches the process-local live delivery registry to p. It must
+// be called before connections may begin synchronization. A publication may
+// only ever use one EventBus because its ring, cursor signer and live handoff
+// share one stream epoch.
+func (p *StatePublication) BindEventBus(eventBus *EventBus) error {
+	if p == nil || eventBus == nil || eventBus.visibility != p.visibility {
+		return ErrInvalidPublication
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.eventBus != nil && p.eventBus != eventBus {
+		return ErrInvalidPublication
+	}
+	p.eventBus = eventBus
+	return nil
 }
 
 // NewStatePublication creates the state commit boundary over state and ring.
@@ -176,7 +204,7 @@ func (p *StatePublication) Reserve(request PublicationRequest) (*PublicationRese
 		p.mu.Unlock()
 		return nil, err
 	}
-	return &PublicationReservation{publication: p, result: result}, nil
+	return &PublicationReservation{publication: p, result: result, runtimeCommit: request.CommitRuntime}, nil
 }
 
 // Result returns an independent copy of the final, still-unpublished result.
@@ -221,26 +249,48 @@ func (r *PublicationReservation) PublishRuntime(ctx context.Context) (Publicatio
 // publish completes one reservation. A non-nil runtimeCtx is checked after the
 // before-append test hook and immediately before any externally observable
 // mutation; persistent publications pass nil because their DB commit is final.
-func (r *PublicationReservation) publish(runtimeCtx context.Context) (PublicationResult, error) {
+func (r *PublicationReservation) publish(runtimeCtx context.Context) (result PublicationResult, err error) {
 	if !r.claimCompletion() {
 		return PublicationResult{}, ErrInvalidPublication
 	}
-	defer r.publication.mu.Unlock()
 
 	p := r.publication
+	var slow []StateSyncConnection
+	var cleanup func()
+	defer func() {
+		p.mu.Unlock()
+		for _, connection := range slow {
+			connection.DisconnectSlowConsumer()
+		}
+		if err == nil && cleanup != nil {
+			cleanup()
+		}
+	}()
 	p.callHook(PublicationBeforeRingAppend)
 	if runtimeCtx != nil {
-		if err := runtimeCtx.Err(); err != nil {
+		if err = runtimeCtx.Err(); err != nil {
 			return PublicationResult{}, err
 		}
 	}
-	if err := p.ring.Append(r.result.Events); err != nil {
+	if r.runtimeCommit != nil {
+		cleanup, err = r.runtimeCommit()
+		if err != nil {
+			return PublicationResult{}, err
+		}
+	}
+	if err = p.ring.Append(r.result.Events); err != nil {
 		return PublicationResult{}, err
 	}
 	p.callHook(PublicationAfterRingAppend)
 	p.callHook(PublicationBeforeStateSwap)
 	p.state.current.Store(r.result.Version)
 	p.callHook(PublicationAfterStateSwap)
+	if p.eventBus != nil {
+		slow, err = p.eventBus.fanout(r.result.Version, r.result.Events, r.result.VisibilityChanges)
+		if err != nil {
+			return PublicationResult{}, err
+		}
+	}
 	return clonePublicationResult(r.result), nil
 }
 
@@ -290,16 +340,23 @@ func (p *StatePublication) reserveLocked(request PublicationRequest) (Publicatio
 	if err != nil {
 		return PublicationResult{}, err
 	}
-	events, err := p.materializeEvents(request.Events, before.checkpoint.GEID)
+	// Transition serialization needs both the old version and the candidate's
+	// final epoch. Updating the unpublished candidate here cannot leak because
+	// the publication lock still excludes every snapshot and subscriber.
+	for userID, epoch := range epochs {
+		after.runtime.visibilityEpochs[userID] = epoch
+	}
+	templates, err := appendVisibilityTransitions(request.Events, before, after, changes)
+	if err != nil {
+		return PublicationResult{}, err
+	}
+	events, err := p.materializeEvents(templates, before.checkpoint.GEID)
 	if err != nil {
 		return PublicationResult{}, err
 	}
 	// Nothing outside this lock can observe after until the ring has accepted all
 	// event refs. The candidate itself is unpublished, so updating its runtime
 	// epochs and checkpoint here cannot leak a half-committed view.
-	for userID, epoch := range epochs {
-		after.runtime.visibilityEpochs[userID] = epoch
-	}
 	if len(events) != 0 {
 		after.checkpoint.GEID = events[len(events)-1].GEID
 	}
@@ -312,6 +369,229 @@ func (p *StatePublication) reserveLocked(request PublicationRequest) (Publicatio
 		Events:            cloneStateEvents(events),
 		VisibilityChanges: cloneVisibilityChanges(changes),
 	}, nil
+}
+
+const maxVisibilityFragmentBytes = 128 << 10
+
+// appendVisibilityTransitions adds recipient-targeted revoke/grant control
+// events after caller-supplied mutation events. All transition scope events use
+// the old epoch; exactly one complete event per affected user uses the new
+// epoch, making persistence of that cursor proof that every fragment arrived.
+func appendVisibilityTransitions(templates []StateEventTemplate, before, after *StateVersion, changes map[int64]VisibilityChange) ([]StateEventTemplate, error) {
+	combined := append([]StateEventTemplate(nil), templates...)
+	causationID := int64(0)
+	for _, template := range templates {
+		if template.CausationID != 0 {
+			causationID = template.CausationID
+			break
+		}
+	}
+	userIDs := sortedIntKeys(changes)
+	for _, userID := range userIDs {
+		change := changes[userID]
+		oldEpoch := before.VisibilityEpoch(userID)
+		newEpoch := after.VisibilityEpoch(userID)
+		for _, scope := range change.Revoked {
+			data, err := marshalVisibilityScope(scope)
+			if err != nil {
+				return nil, err
+			}
+			combined = append(combined,
+				directTransitionTemplate("visibility.tombstone", scope, userID, oldEpoch, causationID, data),
+				directTransitionTemplate("visibility.revoked", scope, userID, oldEpoch, causationID, data),
+			)
+		}
+		for _, scope := range change.Granted {
+			data, err := marshalVisibilityScope(scope)
+			if err != nil {
+				return nil, err
+			}
+			combined = append(combined, directTransitionTemplate("visibility.grant.begin", scope, userID, oldEpoch, causationID, data))
+			fragments, err := visibilityFragmentPayloads(userID, scope, after)
+			if err != nil {
+				return nil, err
+			}
+			fragmentID := fmt.Sprintf("%d-%d-%s", userID, after.Number(), scope.Key())
+			for index, fragment := range fragments {
+				data, err := json.Marshal(struct {
+					FragmentID string          `json:"fragment_id"`
+					Scope      eventScope      `json:"scope"`
+					PartIndex  int             `json:"part_index"`
+					PartCount  int             `json:"part_count"`
+					Data       json.RawMessage `json:"data"`
+				}{
+					FragmentID: fragmentID,
+					Scope:      stateEventScope(scope),
+					PartIndex:  index,
+					PartCount:  len(fragments),
+					Data:       fragment,
+				})
+				if err != nil || len(data) > maxVisibilityFragmentBytes {
+					return nil, ErrStateEventTooLarge
+				}
+				combined = append(combined, directTransitionTemplate("visibility.fragment", scope, userID, oldEpoch, causationID, data))
+			}
+			combined = append(combined, directTransitionTemplate("visibility.granted", scope, userID, oldEpoch, causationID, mustMarshalVisibilityScope(scope)))
+		}
+		digest := visibilityChangeDigest(change)
+		data, err := json.Marshal(struct {
+			ChangedScopeIDsDigest string `json:"changed_scope_ids_digest"`
+		}{ChangedScopeIDsDigest: digest})
+		if err != nil {
+			return nil, err
+		}
+		combined = append(combined, directTransitionTemplate("visibility.transition.complete", Scope{Type: "server"}, userID, newEpoch, causationID, data))
+	}
+	return combined, nil
+}
+
+// directTransitionTemplate creates one ring event delivered only to userID.
+func directTransitionTemplate(eventType string, scope Scope, userID int64, epoch uint64, causationID int64, data json.RawMessage) StateEventTemplate {
+	return StateEventTemplate{
+		EventType:                eventType,
+		Scope:                    scope,
+		CausationID:              causationID,
+		Data:                     data,
+		DeliveryPolicy:           StateDeliveryDirectTransition,
+		RecipientUserID:          userID,
+		CursorVisibilityEpoch:    epoch,
+		HasCursorVisibilityEpoch: true,
+	}
+}
+
+// marshalVisibilityScope encodes one sanitized scope reference for transition
+// control events without exposing names, ACLs, or membership data.
+func marshalVisibilityScope(scope Scope) (json.RawMessage, error) {
+	data, err := json.Marshal(struct {
+		Scope eventScope `json:"scope"`
+	}{Scope: stateEventScope(scope)})
+	return data, err
+}
+
+// mustMarshalVisibilityScope is used only after a matching marshal succeeded
+// for the same validated scope in appendVisibilityTransitions.
+func mustMarshalVisibilityScope(scope Scope) json.RawMessage {
+	data, _ := marshalVisibilityScope(scope)
+	return data
+}
+
+// visibilityChangeDigest produces the fixed SHA-256 digest of all scopes
+// changed for one user by one mutation.
+func visibilityChangeDigest(change VisibilityChange) string {
+	lines := make([]string, 0, len(change.Granted)+len(change.Revoked))
+	for _, scope := range change.Granted {
+		lines = append(lines, scope.Key()+"\n")
+	}
+	for _, scope := range change.Revoked {
+		lines = append(lines, scope.Key()+"\n")
+	}
+	sort.Strings(lines)
+	hash := sha256.Sum256([]byte(joinStrings(lines)))
+	return hex.EncodeToString(hash[:])
+}
+
+// joinStrings avoids allocating a formatting buffer for the deterministic
+// visibility digest input.
+func joinStrings(values []string) string {
+	length := 0
+	for _, value := range values {
+		length += len(value)
+	}
+	buffer := make([]byte, 0, length)
+	for _, value := range values {
+		buffer = append(buffer, value...)
+	}
+	return string(buffer)
+}
+
+// visibilityFragmentPayloads returns replace-style scope subsets split so each
+// embedded data field remains within the 128 KiB fragment hard limit.
+func visibilityFragmentPayloads(userID int64, scope Scope, version *StateVersion) ([]json.RawMessage, error) {
+	state := snapshotStateFor(userID, version, NewVisibilityResolver())
+	switch scope.Type {
+	case "group":
+		var group SnapshotGroup
+		found := false
+		for _, candidate := range state.Groups {
+			if candidate.ID == fmt.Sprint(scope.ID) {
+				group, found = candidate, true
+				break
+			}
+		}
+		if !found {
+			return nil, ErrInvalidPublication
+		}
+		childIDs := make([]string, 0)
+		for _, channel := range state.Channels {
+			if channel.GroupID != nil && *channel.GroupID == group.ID {
+				childIDs = append(childIDs, channel.ID)
+			}
+		}
+		return splitGroupFragment(group, childIDs)
+	case "channel":
+		for _, channel := range state.Channels {
+			if channel.ID != fmt.Sprint(scope.ID) {
+				continue
+			}
+			data, err := json.Marshal(struct {
+				Channel SnapshotChannel           `json:"channel"`
+				Members []SnapshotVoiceMembership `json:"members"`
+			}{Channel: channel, Members: []SnapshotVoiceMembership{}})
+			if err != nil || len(data) > maxVisibilityFragmentBytes {
+				return nil, ErrStateEventTooLarge
+			}
+			return []json.RawMessage{data}, nil
+		}
+	}
+	return nil, ErrInvalidPublication
+}
+
+// splitGroupFragment creates one or more independently valid group fragments.
+func splitGroupFragment(group SnapshotGroup, childIDs []string) ([]json.RawMessage, error) {
+	encode := func(ids []string) (json.RawMessage, error) {
+		return json.Marshal(struct {
+			Group           SnapshotGroup `json:"group"`
+			VisibleChildIDs []string      `json:"visible_child_ids"`
+		}{Group: group, VisibleChildIDs: ids})
+	}
+	if len(childIDs) == 0 {
+		data, err := encode([]string{})
+		if err != nil || len(data) > maxVisibilityFragmentBytes {
+			return nil, ErrStateEventTooLarge
+		}
+		return []json.RawMessage{data}, nil
+	}
+	parts := make([]json.RawMessage, 0, 1)
+	start := 0
+	for start < len(childIDs) {
+		end := start + 1
+		for end <= len(childIDs) {
+			data, err := encode(childIDs[start:end])
+			if err != nil {
+				return nil, err
+			}
+			if len(data) > maxVisibilityFragmentBytes {
+				if end == start+1 {
+					return nil, ErrStateEventTooLarge
+				}
+				end--
+				data, err = encode(childIDs[start:end])
+				if err != nil {
+					return nil, err
+				}
+				parts = append(parts, data)
+				start = end
+				break
+			}
+			if end == len(childIDs) {
+				parts = append(parts, data)
+				start = end
+				break
+			}
+			end++
+		}
+	}
+	return parts, nil
 }
 
 // Capture returns one version/ring pair while excluding a concurrent commit.

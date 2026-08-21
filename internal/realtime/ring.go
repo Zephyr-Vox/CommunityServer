@@ -43,22 +43,32 @@ var (
 // StatePublication creates one replayable event. Data must be a valid JSON
 // value; it intentionally excludes the per-recipient cursor.
 type StateEventTemplate struct {
-	EventType   string
-	Scope       Scope
-	CausationID int64
-	Data        json.RawMessage
+	EventType                string
+	Scope                    Scope
+	CausationID              int64
+	Data                     json.RawMessage
+	DeliveryPolicy           StateDeliveryPolicy
+	RecipientUserID          int64
+	SubjectUserID            int64
+	CursorVisibilityEpoch    uint64
+	HasCursorVisibilityEpoch bool
 }
 
 // StateEvent is one immutable replayable event retained in the process-local
 // state ring. Accessors return copies so callers cannot alter retained data.
 type StateEvent struct {
-	GEID        uint64
-	EventType   string
-	Scope       Scope
-	CausationID int64
-	ServerTime  int64
-	Data        json.RawMessage
-	encoded     []byte
+	GEID                     uint64
+	EventType                string
+	Scope                    Scope
+	CausationID              int64
+	ServerTime               int64
+	Data                     json.RawMessage
+	DeliveryPolicy           StateDeliveryPolicy
+	RecipientUserID          int64
+	SubjectUserID            int64
+	CursorVisibilityEpoch    uint64
+	HasCursorVisibilityEpoch bool
+	encoded                  []byte
 }
 
 // Encoded returns the canonical recipient-independent JSON event body. The
@@ -74,7 +84,17 @@ func (e StateEvent) EncodedWithCursor(cursor string) ([]byte, error) {
 	if !validStateEventCursor(cursor) {
 		return nil, ErrInvalidStateEvent
 	}
-	encoded, err := json.Marshal(stateEventEnvelopeFromEvent(e, cursor))
+	return e.EncodedWithDataAndCursor(e.Data, cursor)
+}
+
+// EncodedWithDataAndCursor serializes e for one recipient using a
+// privacy-projected data value. Ring entries retain canonical source DTOs while
+// EventBus and replay use this method for user/presence projection.
+func (e StateEvent) EncodedWithDataAndCursor(data json.RawMessage, cursor string) ([]byte, error) {
+	if !validStateEventCursor(cursor) || !json.Valid(data) {
+		return nil, ErrInvalidStateEvent
+	}
+	encoded, err := json.Marshal(stateEventEnvelopeFromEventWithData(e, data, cursor))
 	if err != nil {
 		return nil, fmt.Errorf("realtime: encode state event: %w", err)
 	}
@@ -251,12 +271,17 @@ func (r *StateRing) validateAppendLocked(events []StateEvent) ([]StateEvent, err
 // validated event template.
 func stateEventFromTemplate(template StateEventTemplate, geid uint64, serverTime int64) (StateEvent, error) {
 	return normalizeStateEvent(StateEvent{
-		GEID:        geid,
-		EventType:   template.EventType,
-		Scope:       template.Scope,
-		CausationID: template.CausationID,
-		ServerTime:  serverTime,
-		Data:        append(json.RawMessage(nil), template.Data...),
+		GEID:                     geid,
+		EventType:                template.EventType,
+		Scope:                    template.Scope,
+		CausationID:              template.CausationID,
+		ServerTime:               serverTime,
+		Data:                     append(json.RawMessage(nil), template.Data...),
+		DeliveryPolicy:           template.DeliveryPolicy,
+		RecipientUserID:          template.RecipientUserID,
+		SubjectUserID:            template.SubjectUserID,
+		CursorVisibilityEpoch:    template.CursorVisibilityEpoch,
+		HasCursorVisibilityEpoch: template.HasCursorVisibilityEpoch,
 	})
 }
 
@@ -265,6 +290,15 @@ func stateEventFromTemplate(template StateEventTemplate, geid uint64, serverTime
 // not be able to bypass the size and structural validation rules.
 func normalizeStateEvent(event StateEvent) (StateEvent, error) {
 	if event.GEID == 0 || event.EventType == "" || !event.Scope.Valid() || event.CausationID < 0 {
+		return StateEvent{}, ErrInvalidStateEvent
+	}
+	if event.DeliveryPolicy != 0 && event.DeliveryPolicy != StateDeliveryVisibleAfter && event.DeliveryPolicy != StateDeliveryDirectTransition {
+		return StateEvent{}, ErrInvalidStateEvent
+	}
+	if event.DeliveryPolicy == StateDeliveryDirectTransition && event.RecipientUserID <= 0 {
+		return StateEvent{}, ErrInvalidStateEvent
+	}
+	if event.SubjectUserID < 0 {
 		return StateEvent{}, ErrInvalidStateEvent
 	}
 	if event.Data == nil {
@@ -298,6 +332,12 @@ type stateEventEnvelope struct {
 
 // stateEventEnvelopeFromEvent creates the canonical event envelope for event.
 func stateEventEnvelopeFromEvent(event StateEvent, cursor string) stateEventEnvelope {
+	return stateEventEnvelopeFromEventWithData(event, event.Data, cursor)
+}
+
+// stateEventEnvelopeFromEventWithData creates one wire event with the supplied
+// recipient-specific data projection.
+func stateEventEnvelopeFromEventWithData(event StateEvent, data json.RawMessage, cursor string) stateEventEnvelope {
 	return stateEventEnvelope{
 		Type:        "state.event",
 		GEID:        strconv.FormatUint(event.GEID, 10),
@@ -307,7 +347,7 @@ func stateEventEnvelopeFromEvent(event StateEvent, cursor string) stateEventEnve
 		EventType:   event.EventType,
 		CausationID: commandIDText(event.CausationID),
 		ServerTime:  event.ServerTime,
-		Data:        event.Data,
+		Data:        data,
 	}
 }
 

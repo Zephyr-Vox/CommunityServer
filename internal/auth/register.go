@@ -30,8 +30,16 @@ const (
 // RegisterService creates accounts and redeems invites atomically: user,
 // role binding and invite consumption either all commit or all roll back.
 type RegisterService struct {
-	stores *store.Stores
-	mode   RegistrationMode
+	stores    *store.Stores
+	mode      RegistrationMode
+	publisher StateChangePublisher
+}
+
+// SetStateChangePublisher installs the post-commit realtime projection bridge.
+// Assembly calls it before routes accept requests; nil preserves standalone
+// auth-service behavior for focused tests.
+func (s *RegisterService) SetStateChangePublisher(publisher StateChangePublisher) {
+	s.publisher = publisher
 }
 
 // NewRegisterService returns a RegisterService.
@@ -113,6 +121,11 @@ func (s *RegisterService) Register(ctx context.Context, username, password, nick
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	if s.publisher != nil {
+		if err := s.publisher(ctx, StateChange{EventType: "user.created", UserID: user.ID}); err != nil {
+			return nil, err
+		}
 	}
 	return user, nil
 }

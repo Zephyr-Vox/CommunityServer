@@ -50,11 +50,31 @@ type PrincipalMutations interface {
 type Service struct {
 	stores     *store.Stores
 	principals PrincipalMutations
+	publisher  StateChangePublisher
 }
+
+// StateChange identifies a committed RBAC mutation requiring an immutable
+// realtime projection refresh. UserIDs receive targeted self.updated events
+// when their effective roles or permissions may have changed.
+type StateChange struct {
+	EventType string
+	RoleKey   string
+	UserIDs   []int64
+}
+
+// StateChangePublisher synchronizes one committed RBAC fact into the
+// application-owned StateStore. Server assembly provides it; focused RBAC tests
+// may leave it unset.
+type StateChangePublisher func(context.Context, StateChange) error
 
 // NewService returns a Service backed by stores and principal cache barriers.
 func NewService(stores *store.Stores, principals PrincipalMutations) *Service {
 	return &Service{stores: stores, principals: principals}
+}
+
+// SetStateChangePublisher installs the post-commit realtime projection bridge.
+func (s *Service) SetStateChangePublisher(publisher StateChangePublisher) {
+	s.publisher = publisher
 }
 
 // BindingInput identifies the target user, role and one exact binding scope.
@@ -104,6 +124,9 @@ func (s *Service) CreateRole(ctx context.Context, actorID int64, key, displayNam
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if err := s.publish(ctx, StateChange{EventType: "rbac.role.created", RoleKey: role.Key}); err != nil {
 		return nil, err
 	}
 	return role, nil
@@ -160,6 +183,9 @@ func (s *Service) UpdateRole(ctx context.Context, actorID int64, key string, dis
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	if err := s.publish(ctx, StateChange{EventType: "rbac.role.updated", RoleKey: updated.Key}); err != nil {
+		return nil, err
+	}
 	return updated, nil
 }
 
@@ -193,7 +219,10 @@ func (s *Service) DeleteRole(ctx context.Context, actorID int64, key string) err
 	if err := txStores.Roles.Delete(ctx, key); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.publish(ctx, StateChange{EventType: "rbac.role.deleted", RoleKey: key})
 }
 
 // ListBindings returns bindings the actor may manage. Non-owners do not see
@@ -279,6 +308,9 @@ func (s *Service) CreateBinding(ctx context.Context, actorID int64, input Bindin
 		return nil, false, err
 	}
 	s.principals.Invalidate(input.UserID)
+	if err := s.publish(ctx, StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{input.UserID}}); err != nil {
+		return nil, false, err
+	}
 	return binding, true, nil
 }
 
@@ -335,7 +367,7 @@ func (s *Service) DeleteBinding(ctx context.Context, actorID, bindingID int64) e
 		return err
 	}
 	s.principals.Invalidate(binding.UserID)
-	return nil
+	return s.publish(ctx, StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{binding.UserID}})
 }
 
 // TransferOwner transfers the unique owner role after the principal mutation
@@ -348,7 +380,7 @@ func (s *Service) TransferOwner(ctx context.Context, currentUserID, targetUserID
 	}
 	s.principals.Invalidate(currentUserID)
 	s.principals.Invalidate(targetUserID)
-	return nil
+	return s.publish(ctx, StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{currentUserID, targetUserID}})
 }
 
 // GetConfig returns the requested scope's local snapshot and effective source.
@@ -401,6 +433,9 @@ func (s *Service) UpdateConfig(ctx context.Context, actorID int64, input ConfigI
 		return nil, err
 	}
 	s.invalidatePrincipals(userIDs)
+	if err := s.publish(ctx, StateChange{EventType: "rbac.config.updated", UserIDs: userIDs}); err != nil {
+		return nil, err
+	}
 	return config, nil
 }
 
@@ -445,6 +480,9 @@ func (s *Service) ResetConfig(ctx context.Context, actorID int64, scope store.Co
 		return nil, err
 	}
 	s.invalidatePrincipals(userIDs)
+	if err := s.publish(ctx, StateChange{EventType: "rbac.config.updated", UserIDs: userIDs}); err != nil {
+		return nil, err
+	}
 	return config, nil
 }
 
@@ -586,6 +624,14 @@ func (s *Service) invalidatePrincipals(userIDs []int64) {
 	for _, userID := range userIDs {
 		s.principals.Invalidate(userID)
 	}
+}
+
+// publish forwards one committed RBAC fact to the optional realtime bridge.
+func (s *Service) publish(ctx context.Context, change StateChange) error {
+	if s.publisher == nil {
+		return nil
+	}
+	return s.publisher(ctx, change)
 }
 
 // checkBindingAuthority validates actor, target and granted-role ordering

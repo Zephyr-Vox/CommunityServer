@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/labstack/echo/v5"
@@ -20,6 +21,7 @@ import (
 	"zephyr.vox/server/ce/internal/image"
 	"zephyr.vox/server/ce/internal/oss"
 	"zephyr.vox/server/ce/internal/presence"
+	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/store"
 	"zephyr.vox/server/ce/internal/validation"
@@ -28,20 +30,43 @@ import (
 // App is the fully assembled HTTP application: database, stores, services,
 // middleware and every route.
 type App struct {
-	cfg        *config.App
-	conn       *sql.DB
-	stores     *store.Stores
-	principals *auth.PrincipalCache
-	authSvc    *auth.AuthService
-	register   *auth.RegisterService
-	users      *auth.UserService
-	invites    *auth.InviteService
-	activate   *auth.ActivationManager
-	presence   *presence.Presence
-	objects    *oss.LocalObjectStorage
-	avatar     *image.AvatarService
-	echo       *echo.Echo
-	logger     *slog.Logger
+	cfg            *config.App
+	conn           *sql.DB
+	stores         *store.Stores
+	principals     *auth.PrincipalCache
+	authSvc        *auth.AuthService
+	register       *auth.RegisterService
+	users          *auth.UserService
+	invites        *auth.InviteService
+	activate       *auth.ActivationManager
+	presence       *presence.Presence
+	objects        *oss.LocalObjectStorage
+	avatar         *image.AvatarService
+	connections    *realtime.ConnectionCoordinator
+	voice          *voiceRuntime
+	connectionAuth *auth.ConnectionAuthenticator
+	upgrades       *realtime.UpgradeLimiter
+	metadata       realtime.Metadata
+
+	runtimeMu       sync.RWMutex
+	state           *realtime.StateStore
+	publication     *realtime.StatePublication
+	eventBus        *realtime.EventBus
+	sequencer       *realtime.PostCommitSequencer
+	syncStrategy    realtime.StateSyncStrategy
+	connectionState *realtime.ConnectionStatePublisher
+
+	lifecycleMu sync.Mutex
+	running     *appRun
+	closing     bool
+	dbCloseOnce sync.Once
+	dbCloseErr  error
+
+	fatalMu       sync.RWMutex
+	realtimeFatal func(error)
+
+	echo   *echo.Echo
+	logger *slog.Logger
 }
 
 // New assembles the application from validated configuration: it opens the
@@ -87,6 +112,16 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	}
 	avatarSvc := image.NewAvatarService(stores.Users, objects, idGen, cfg.Avatar)
 	users := auth.NewUserService(stores, principals, pres, avatarSvc)
+	connections := realtime.NewConnectionCoordinator()
+	voice, err := newVoiceRuntime(cfg.Voice, connections, now)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("server: voice runtime: %w", err)
+	}
+	authSvc.SetConnectionRevoker(connections)
+	users.SetConnectionRevoker(connections)
+	connectionAuth := auth.NewConnectionAuthenticator(secret, principals, stores.Sessions, now)
+	upgrades := realtime.NewUpgradeLimiter(time.Now)
 	invites := auth.NewInviteService(stores, principals, now)
 	activate, err := auth.NewActivationManager(stores, secret)
 	if err != nil {
@@ -102,23 +137,47 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	e.Validator = validation.New()
 	e.HTTPErrorHandler = api.NewErrorHandler(logger)
 
-	app := &App{
-		cfg:        cfg,
-		conn:       conn,
-		stores:     stores,
-		principals: principals,
-		authSvc:    authSvc,
-		register:   register,
-		users:      users,
-		invites:    invites,
-		activate:   activate,
-		presence:   pres,
-		objects:    objects,
-		avatar:     avatarSvc,
-		echo:       e,
-		logger:     logger,
+	metadata, err := realtime.NewMetadata(metadataHost(cfg.Server), cfg.Server.VoicePort)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("server: realtime metadata: %w", err)
 	}
+	app := &App{
+		cfg:            cfg,
+		conn:           conn,
+		stores:         stores,
+		principals:     principals,
+		authSvc:        authSvc,
+		register:       register,
+		users:          users,
+		invites:        invites,
+		activate:       activate,
+		presence:       pres,
+		objects:        objects,
+		avatar:         avatarSvc,
+		connections:    connections,
+		voice:          voice,
+		connectionAuth: connectionAuth,
+		upgrades:       upgrades,
+		metadata:       metadata,
+		echo:           e,
+		logger:         logger,
+	}
+	app.realtimeFatal = func(fatal error) {
+		logger.Error("realtime sequencer failed before server run", "module", "realtime", "err", fatal)
+	}
+	if err := app.startRealtime(context.Background()); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	register.SetStateChangePublisher(app.publishAccountChange)
+	activate.SetStateChangePublisher(app.publishAccountChange)
+	users.SetStateChangePublisher(app.publishAccountChange)
+	avatarSvc.SetStatePublisher(func(ctx context.Context, userID int64) error {
+		return app.publishAccountChange(ctx, auth.StateChange{EventType: "user.updated", UserID: userID})
+	})
 	if err := app.routes(e); err != nil {
+		_ = app.stopRealtime(context.Background())
 		conn.Close()
 		return nil, fmt.Errorf("server: mount routes: %w", err)
 	}
@@ -132,9 +191,24 @@ func (a *App) Echo() *echo.Echo {
 	return a.echo
 }
 
-// Close releases the database connection.
+// Close prevents a later Run, stops active WebSocket admission and the
+// realtime worker, and finally releases the SQLite connection. It is safe to
+// call concurrently and is idempotent.
 func (a *App) Close() error {
-	return a.conn.Close()
+	if a == nil {
+		return nil
+	}
+	a.lifecycleMu.Lock()
+	a.closing = true
+	running := a.running
+	a.lifecycleMu.Unlock()
+	if running != nil {
+		running.supervisor.BeginShutdown()
+		<-running.done
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	return errors.Join(a.ShutdownConnections(ctx), a.stopRealtime(ctx), a.closeDatabase())
 }
 
 // EnsureActivationCode makes sure a first-owner activation code exists. ok

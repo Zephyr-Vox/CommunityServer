@@ -80,6 +80,16 @@ func (s *Stores) NextID() (int64, error) {
 	return s.Users.idGen.Next()
 }
 
+// IDGenerator returns the process-local snowflake generator shared by every
+// store. Realtime sequencers use it for causation IDs so resource and command
+// identifiers remain in one server-wide ID space.
+func (s *Stores) IDGenerator() *snowflake.IDGenerator {
+	if s == nil || s.Users == nil {
+		return nil
+	}
+	return s.Users.idGen
+}
+
 // WithTx returns stores bound to tx. The returned stores share idGen and clock
 // but not the root conn.
 func (s *Stores) WithTx(tx *sql.Tx) *Stores {

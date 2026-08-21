@@ -8,14 +8,13 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v5"
-
-	"zephyr.vox/server/ce/internal/auth"
 )
 
 const (
@@ -69,16 +68,33 @@ const (
 	syncPhaseLive
 )
 
+// WebSocketIdentity is the authenticated identity retained by one WebSocket
+// control connection. The HTTP/auth adapter converts its own claims into this
+// small realtime-owned shape so the sync package never imports auth.
+type WebSocketIdentity struct {
+	UserID          int64
+	LoginSessionID  int64
+	AccessExpiresAt int64
+}
+
+// WebSocketAuthenticator verifies an access token and runs its callback while
+// the corresponding principal mutation barrier is held. The application auth
+// adapter owns token parsing and account/session validation; realtime only
+// needs the authenticated identity needed by ConnectionCoordinator.
+type WebSocketAuthenticator interface {
+	Authenticate(context.Context, string, func(WebSocketIdentity) error) (WebSocketIdentity, error)
+	UpdateLease(context.Context, string, int64, int64, func(WebSocketIdentity) error) (WebSocketIdentity, error)
+}
+
 // WebSocketHandler is the GET /api/v0/ws adapter. It reserves
 // global/user/source admission before upgrading, authenticates and reserves
 // opening state inside the principal read barrier, then maintains auth lease,
 // sync-hello and liveness deadlines until the coordinator owns a terminal close
-// transition. Server routes must not mount it until a StateSyncStrategy and its
-// HTTP snapshot endpoint are assembled; the current server deliberately keeps
-// this adapter unpublished.
-func WebSocketHandler(authenticator *auth.ConnectionAuthenticator, coordinator *ConnectionCoordinator, upgrades *UpgradeLimiter, syncStrategy func() StateSyncStrategy) echo.HandlerFunc {
+// transition. lifecycle publishes first-active presence before ready and
+// provides the sequenced presence.set implementation.
+func WebSocketHandler(authenticator WebSocketAuthenticator, coordinator *ConnectionCoordinator, upgrades *UpgradeLimiter, syncStrategy func() StateSyncStrategy, lifecycle ControlConnectionPublisher) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		if authenticator == nil || coordinator == nil || upgrades == nil || syncStrategy == nil {
+		if authenticator == nil || coordinator == nil || upgrades == nil || syncStrategy == nil || lifecycle == nil {
 			return errors.New("realtime: WebSocket handler is not initialized")
 		}
 		strategy := syncStrategy()
@@ -101,7 +117,7 @@ func WebSocketHandler(authenticator *auth.ConnectionAuthenticator, coordinator *
 		}
 
 		var reservation *ConnectionReservation
-		identity, err := authenticator.Authenticate(c.Request().Context(), accessToken, func(identity auth.ConnectionAuth) error {
+		identity, err := authenticator.Authenticate(c.Request().Context(), accessToken, func(identity WebSocketIdentity) error {
 			var reserveErr error
 			reservation, reserveErr = coordinator.ReserveConnectFrom(identity.UserID, identity.LoginSessionID, sourceIP)
 			return reserveErr
@@ -119,7 +135,7 @@ func WebSocketHandler(authenticator *auth.ConnectionAuthenticator, coordinator *
 			return nil
 		}
 		pump := newWebSocketWritePump(conn)
-		ref, lease, err := reservation.Activate(pump, identity.AccessExpiresAt)
+		ref, lease, err := lifecycle.Activate(c.Request().Context(), reservation, pump, identity.AccessExpiresAt)
 		if err != nil {
 			pump.RequestClose(websocketCloseRevoked, "connection revoked")
 			<-pump.Done()
@@ -277,7 +293,7 @@ func WebSocketHandler(authenticator *auth.ConnectionAuthenticator, coordinator *
 				malformedCommands = 0
 				commandCtx, cancel := context.WithTimeout(context.Background(), websocketCommandTimeout)
 				var renewed AuthLease
-				updated, err := authenticator.UpdateLease(commandCtx, accessToken, ref.UserID, ref.LoginSessionID, func(identity auth.ConnectionAuth) error {
+				updated, err := authenticator.UpdateLease(commandCtx, accessToken, ref.UserID, ref.LoginSessionID, func(identity WebSocketIdentity) error {
 					var renewErr error
 					renewed, renewErr = coordinator.RenewAuthLease(ref, identity.AccessExpiresAt, time.Now().UnixMilli())
 					return renewErr
@@ -325,7 +341,40 @@ func WebSocketHandler(authenticator *auth.ConnectionAuthenticator, coordinator *
 					}
 					continue
 				}
-				if !enqueueCommandError(pump, response, envelope.RequestID, envelope.Type, 1, "presence unavailable", true) {
+				status, activity, ok := presenceSetData(envelope.Data)
+				if !ok {
+					malformedCommands++
+					if !enqueueCommandError(pump, response, envelope.RequestID, envelope.Type, 1001, "malformed request", false) {
+						coordinator.BeginDisconnect(ref, websocketCloseSlow, "writer unavailable")
+						return nil
+					}
+					continue
+				}
+				commandCtx, cancel := context.WithTimeout(context.Background(), websocketCommandTimeout)
+				result, err := lifecycle.SetPresence(commandCtx, ref, status, activity)
+				cancel()
+				if err != nil {
+					switch {
+					case errors.Is(err, ErrPresenceRateLimited):
+						if !enqueueCommandError(pump, response, envelope.RequestID, envelope.Type, 1008, "rate limited", true) {
+							coordinator.BeginDisconnect(ref, websocketCloseSlow, "writer unavailable")
+							return nil
+						}
+					case errors.Is(err, ErrInvalidPresence):
+						if !enqueueCommandError(pump, response, envelope.RequestID, envelope.Type, 1, "invalid presence", false) {
+							coordinator.BeginDisconnect(ref, websocketCloseSlow, "writer unavailable")
+							return nil
+						}
+					case errors.Is(err, ErrConnectionNotActive):
+						coordinator.BeginDisconnect(ref, websocketCloseExpired, "connection inactive")
+						return nil
+					default:
+						coordinator.BeginDisconnect(ref, websocketCloseProtocol, "presence publication failed")
+						return nil
+					}
+					continue
+				}
+				if !pump.EnqueueResponse(response, webSocketPresenceUpdatedFrame(envelope.RequestID, result.CommandID)) {
 					coordinator.BeginDisconnect(ref, websocketCloseSlow, "writer unavailable")
 					return nil
 				}
@@ -548,6 +597,20 @@ func authUpdateToken(data json.RawMessage) (string, bool) {
 	return update.AccessToken, true
 }
 
+// presenceSetData validates and copies presence.set's structured payload. The
+// lifecycle publisher performs semantic status/activity validation so callers
+// receive a correlated command.error rather than an unparseable-frame close.
+func presenceSetData(data json.RawMessage) (string, *PresenceActivity, bool) {
+	var set struct {
+		Status   *string           `json:"status"`
+		Activity *PresenceActivity `json:"activity"`
+	}
+	if len(data) == 0 || json.Unmarshal(data, &set) != nil || set.Status == nil {
+		return "", nil, false
+	}
+	return *set.Status, clonePresenceActivity(set.Activity), true
+}
+
 // webSocketReadyFrame serializes the first server frame emitted after a
 // connection becomes active.
 func webSocketReadyFrame(ref ControlConnectionRef, accessExpiresAt int64) []byte {
@@ -598,6 +661,28 @@ func webSocketAuthUpdatedFrame(requestID string, expiresAt int64) []byte {
 			CommandType string `json:"command_type"`
 			ExpiresAt   int64  `json:"expires_at"`
 		}{CommandType: "auth.update", ExpiresAt: expiresAt},
+	})
+	return encoded
+}
+
+// webSocketPresenceUpdatedFrame serializes the result-bearing acknowledgement
+// for a sequenced presence.set command. command_id is stable for the command's
+// replayable presence.updated event and lets clients de-duplicate optimistic UI.
+func webSocketPresenceUpdatedFrame(requestID string, commandID int64) []byte {
+	encoded, _ := json.Marshal(struct {
+		Type      string `json:"type"`
+		RequestID string `json:"request_id"`
+		Data      struct {
+			CommandType string `json:"command_type"`
+			CommandID   string `json:"command_id"`
+		} `json:"data"`
+	}{
+		Type:      "command.ok",
+		RequestID: requestID,
+		Data: struct {
+			CommandType string `json:"command_type"`
+			CommandID   string `json:"command_id"`
+		}{CommandType: "presence.set", CommandID: strconv.FormatInt(commandID, 10)},
 	})
 	return encoded
 }
@@ -656,9 +741,6 @@ func bearerAccessToken(header string) (string, bool) {
 // before the connection is upgraded. Access-token failures remain intentionally
 // indistinguishable while capacity and shutdown return retryable HTTP errors.
 func webSocketAuthenticationError(err error) error {
-	if errors.Is(err, auth.ErrUserBanned) {
-		return echo.ErrForbidden
-	}
 	if errors.Is(err, ErrConnectionAdmissionClosed) {
 		return echo.NewHTTPError(http.StatusServiceUnavailable, "server shutting down")
 	}

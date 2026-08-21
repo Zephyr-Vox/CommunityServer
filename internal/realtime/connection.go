@@ -182,16 +182,21 @@ type ConnectionCoordinator struct {
 	indexMu sync.Mutex
 	users   map[int64]*connectionUser
 
-	admissionMu sync.Mutex
-	accepting   bool
-	admitted    int
-	sources     map[netip.Addr]int
-	wg          sync.WaitGroup
-	voiceStop   atomic.Pointer[voiceStopValue]
+	admissionMu   sync.Mutex
+	accepting     bool
+	admitted      int
+	sources       map[netip.Addr]int
+	wg            sync.WaitGroup
+	voiceStop     atomic.Pointer[voiceStopValue]
+	closeObserver atomic.Pointer[connectionCloseObserver]
 }
 
 type voiceStopValue struct {
 	stop VoiceSessionDeactivator
+}
+
+type connectionCloseObserver struct {
+	observe func(ControlConnectionRef)
 }
 
 type connectionUser struct {
@@ -246,6 +251,21 @@ func (c *ConnectionCoordinator) SetVoiceSessionDeactivator(stop VoiceSessionDeac
 		return
 	}
 	c.voiceStop.Store(&voiceStopValue{stop: stop})
+}
+
+// SetCloseObserver installs the runtime state callback invoked after a control
+// connection is atomically marked closing and its terminal socket request has
+// been queued. The callback runs without coordinator locks and must not perform
+// socket I/O. Supplying nil stops later lifecycle publication during shutdown.
+func (c *ConnectionCoordinator) SetCloseObserver(observer func(ControlConnectionRef)) {
+	if c == nil {
+		return
+	}
+	if observer == nil {
+		c.closeObserver.Store(nil)
+		return
+	}
+	c.closeObserver.Store(&connectionCloseObserver{observe: observer})
 }
 
 // ReserveConnect creates an opening connection reservation without source-IP
@@ -593,6 +613,9 @@ func (c *ConnectionCoordinator) ExpireAuthLease(ref ControlConnectionRef, expect
 	plan, ok := c.beginDisconnectLocked(user, ref, 4001, "token expired")
 	user.mu.Unlock()
 	c.runClosePlan(plan)
+	if ok {
+		c.notifyClosed(ref)
+	}
 	return ok
 }
 
@@ -609,6 +632,9 @@ func (c *ConnectionCoordinator) BeginDisconnect(ref ControlConnectionRef, status
 	plan, ok := c.beginDisconnectLocked(user, ref, statusCode, reason)
 	user.mu.Unlock()
 	c.runClosePlan(plan)
+	if ok {
+		c.notifyClosed(ref)
+	}
 	return ok
 }
 
@@ -653,16 +679,21 @@ func (c *ConnectionCoordinator) DisconnectAll(statusCode int, reason string) {
 	users := c.acquireAllUsers()
 	for _, user := range users {
 		plans := make([]connectionClosePlan, 0)
+		refs := make([]ControlConnectionRef, 0)
 		user.mu.Lock()
 		for _, record := range user.connections {
 			plan, ok := c.beginDisconnectLocked(user, record.ref, statusCode, reason)
 			if ok {
 				plans = append(plans, plan)
+				refs = append(refs, record.ref)
 			}
 		}
 		user.mu.Unlock()
 		for _, plan := range plans {
 			c.runClosePlan(plan)
+		}
+		for _, ref := range refs {
+			c.notifyClosed(ref)
 		}
 		c.releaseUser(user.userID, user)
 	}
@@ -694,6 +725,27 @@ func (c *ConnectionCoordinator) ActiveCount() int {
 	c.admissionMu.Lock()
 	defer c.admissionMu.Unlock()
 	return c.admitted
+}
+
+// UserActiveCount returns the number of active, non-closing control
+// connections for userID. Opening reservations do not make presence online;
+// callers use this after BeginDisconnect to decide whether an offline runtime
+// publication is still required.
+func (c *ConnectionCoordinator) UserActiveCount(userID int64) int {
+	if c == nil || userID <= 0 {
+		return 0
+	}
+	user := c.acquireUser(userID)
+	defer c.releaseUser(userID, user)
+	user.mu.Lock()
+	defer user.mu.Unlock()
+	count := 0
+	for _, record := range user.connections {
+		if record.state == ConnectionActive {
+			count++
+		}
+	}
+	return count
 }
 
 // SourceCount returns sourceIP's opening and active admission count. It is
@@ -741,6 +793,18 @@ func (c *ConnectionCoordinator) runClosePlan(plan connectionClosePlan) {
 	}
 }
 
+// notifyClosed invokes the current runtime observer after a successful
+// once-only lifecycle transition. Loading its immutable wrapper keeps observer
+// replacement lock-free for shutdown.
+func (c *ConnectionCoordinator) notifyClosed(ref ControlConnectionRef) {
+	if c == nil {
+		return
+	}
+	if observer := c.closeObserver.Load(); observer != nil && observer.observe != nil {
+		observer.observe(ref)
+	}
+}
+
 // disconnectMatching applies the same conditional transition to one user's
 // matching records, then submits all terminal close requests without holding
 // the coordinator's user lock.
@@ -748,18 +812,23 @@ func (c *ConnectionCoordinator) disconnectMatching(userID int64, reason string, 
 	user := c.acquireUser(userID)
 	defer c.releaseUser(userID, user)
 	plans := make([]connectionClosePlan, 0)
+	refs := make([]ControlConnectionRef, 0)
 	user.mu.Lock()
 	for _, record := range user.connections {
 		if match(record.ref) {
 			plan, ok := c.beginDisconnectLocked(user, record.ref, 4002, reason)
 			if ok {
 				plans = append(plans, plan)
+				refs = append(refs, record.ref)
 			}
 		}
 	}
 	user.mu.Unlock()
 	for _, plan := range plans {
 		c.runClosePlan(plan)
+	}
+	for _, ref := range refs {
+		c.notifyClosed(ref)
 	}
 }
 

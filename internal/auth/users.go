@@ -52,6 +52,14 @@ type UserService struct {
 	presence      PresenceRevoker
 	avatarCleaner AvatarCleaner
 	connections   ConnectionRevoker
+	publisher     StateChangePublisher
+}
+
+// SetStateChangePublisher installs the post-commit realtime projection bridge
+// used by public account mutations. It is configured once during server
+// assembly, before handlers can call this service.
+func (s *UserService) SetStateChangePublisher(publisher StateChangePublisher) {
+	s.publisher = publisher
 }
 
 // SetConnectionRevoker installs the lifecycle owner notified after kick, ban,
@@ -118,7 +126,14 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 		// would overwrite a nickname committed concurrently by another request.
 		return user, nil
 	}
-	return s.users.UpdateNickname(ctx, userID, nickname)
+	updated, err := s.users.UpdateNickname(ctx, userID, nickname)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.publish(ctx, "user.updated", userID); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 // UpdateManagedProfile changes a user's nickname after verifying that actorID
@@ -126,6 +141,9 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 // returns the target row without writing. Self-service callers use
 // UpdateProfile instead and require no management permission.
 func (s *UserService) UpdateManagedProfile(ctx context.Context, actorID, userID int64, nickname string) (*db.User, error) {
+	if nickname == "" {
+		return s.users.GetUserByID(ctx, userID)
+	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
 	var user *db.User
@@ -135,14 +153,15 @@ func (s *UserService) UpdateManagedProfile(ctx context.Context, actorID, userID 
 		}
 		var err error
 		user, err = tx.Users.GetUserByID(ctx, userID)
-		if err != nil || nickname == "" {
-			// An omitted patch field is not a write. Returning the row read under
-			// this mutation barrier avoids overwriting a concurrent nickname change.
+		if err != nil {
 			return err
 		}
 		user, err = tx.Users.UpdateNickname(ctx, userID, nickname)
 		return err
 	}); err != nil {
+		return nil, err
+	}
+	if err := s.publish(ctx, "user.updated", userID); err != nil {
 		return nil, err
 	}
 	return user, nil
@@ -214,6 +233,9 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 	s.disconnectUser(userID, "kicked")
 	s.principals.Invalidate(userID)
 	s.presence.Remove(userID)
+	if err := s.publish(ctx, "user.updated", userID); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -247,6 +269,9 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 	s.disconnectUser(userID, "banned")
 	s.principals.Invalidate(userID)
 	s.presence.Remove(userID)
+	if err := s.publish(ctx, "user.updated", userID); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -267,6 +292,9 @@ func (s *UserService) Unban(ctx context.Context, actorID, userID int64) error {
 		return err
 	}
 	s.principals.Invalidate(userID)
+	if err := s.publish(ctx, "user.updated", userID); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -314,10 +342,22 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	s.disconnectUser(userID, "account_deleted")
 	s.principals.Invalidate(userID)
 	s.presence.Remove(userID)
+	if err := s.publish(ctx, "user.deleted", userID); err != nil {
+		return err
+	}
 	if s.avatarCleaner != nil && avatarName != "" {
 		_ = s.avatarCleaner.DeleteAvatar(ctx, avatarName) // best-effort after commit
 	}
 	return nil
+}
+
+// publish forwards a committed account change to the optional application
+// realtime bridge. Nil preserves the service's standalone use in unit tests.
+func (s *UserService) publish(ctx context.Context, eventType string, userID int64) error {
+	if s.publisher == nil {
+		return nil
+	}
+	return s.publisher(ctx, StateChange{EventType: eventType, UserID: userID})
 }
 
 // parsePagination reads limit/offset query parameters with defaults of 50 and

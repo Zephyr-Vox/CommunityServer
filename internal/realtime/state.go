@@ -152,6 +152,22 @@ type Mute struct {
 	Version   int64
 }
 
+// PresenceActivity is an optional user-selected activity. Private activities
+// are only materialized for the subject's own snapshot and state events.
+type PresenceActivity struct {
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Privacy string `json:"privacy"`
+}
+
+// Presence is the server-global runtime presence state retained in each
+// immutable StateVersion. It is never persisted and starts offline after a
+// process restart until a control connection becomes active.
+type Presence struct {
+	Status   string
+	Activity *PresenceActivity
+}
+
 type persistentState struct {
 	users         map[int64]User
 	roles         map[string]Role
@@ -167,6 +183,7 @@ type persistentState struct {
 type runtimeState struct {
 	visibilityEpochs map[int64]uint64
 	moderationEpoch  uint64
+	presences        map[int64]Presence
 }
 
 // StateVersion is an immutable server-state projection. Its accessors return
@@ -211,21 +228,15 @@ func (v *StateVersion) Role(key string) (Role, bool) {
 	return role, ok
 }
 
-// Roles returns role definitions in their canonical display order.
+// Roles returns role definitions in ascending immutable key order. Snapshot
+// arrays use keys as their stable identity, so display-name and rank edits must
+// not reorder otherwise unchanged role data for clients.
 func (v *StateVersion) Roles() []Role {
 	roles := make([]Role, 0, len(v.persistent.roles))
 	for _, role := range v.persistent.roles {
 		roles = append(roles, role)
 	}
-	sort.Slice(roles, func(i, j int) bool {
-		if roles[i].Rank != roles[j].Rank {
-			return roles[i].Rank > roles[j].Rank
-		}
-		if roles[i].DisplayName != roles[j].DisplayName {
-			return roles[i].DisplayName < roles[j].DisplayName
-		}
-		return roles[i].Key < roles[j].Key
-	})
+	sort.Slice(roles, func(i, j int) bool { return roles[i].Key < roles[j].Key })
 	return roles
 }
 
@@ -317,6 +328,19 @@ func (v *StateVersion) ModerationEpoch() uint64 {
 	return v.runtime.moderationEpoch
 }
 
+// Presence returns userID's runtime presence. Users without an explicit
+// runtime entry are offline, which is also the post-restart default.
+func (v *StateVersion) Presence(userID int64) Presence {
+	if v == nil {
+		return Presence{Status: "offline"}
+	}
+	presence, ok := v.runtime.presences[userID]
+	if !ok {
+		return Presence{Status: "offline"}
+	}
+	return clonePresence(presence)
+}
+
 // ProjectionLoader loads the complete persisted state from one database view.
 // *store.Stores implements it through LoadStateProjection.
 type ProjectionLoader interface {
@@ -364,9 +388,30 @@ func NewStateStoreWithEpoch(ctx context.Context, loader ProjectionLoader, stream
 		persistent: persistent,
 		runtime: runtimeState{
 			visibilityEpochs: make(map[int64]uint64),
+			presences:        make(map[int64]Presence),
 		},
 	})
 	return state, nil
+}
+
+// BuildRuntimeCandidate creates an unpublished successor that keeps the
+// current persistent projection and clones only runtime state. Runtime commands
+// such as control-connection presence transitions use it instead of reading the
+// database, while StatePublication still assigns the next version/checkpoint.
+func (s *StateStore) BuildRuntimeCandidate() (*StateCandidate, error) {
+	if s == nil || s.Current() == nil {
+		return nil, ErrInvalidProjection
+	}
+	base := s.Current()
+	return &StateCandidate{
+		base: base,
+		version: &StateVersion{
+			number:     base.number + 1,
+			checkpoint: base.checkpoint,
+			persistent: base.persistent,
+			runtime:    base.runtime.clone(),
+		},
+	}, nil
 }
 
 // Current returns the current immutable state version without taking a global
@@ -425,6 +470,20 @@ func (c *StateCandidate) Base() *StateVersion {
 // Version returns the unpublished immutable candidate version.
 func (c *StateCandidate) Version() *StateVersion {
 	return c.version
+}
+
+// SetPresence updates one candidate's runtime presence. userID must exist in
+// the candidate projection and presence must use a protocol-supported status
+// and activity privacy shape.
+func (c *StateCandidate) SetPresence(userID int64, presence Presence) error {
+	if c == nil || c.version == nil {
+		return ErrInvalidProjection
+	}
+	if _, exists := c.version.persistent.users[userID]; !exists || !validPresence(presence) {
+		return ErrInvalidProjection
+	}
+	c.version.runtime.presences[userID] = clonePresence(presence)
+	return nil
 }
 
 // NewStreamEpoch returns a cryptographically random 128-bit stream epoch in
@@ -691,9 +750,37 @@ func (r runtimeState) clone() runtimeState {
 	cloned := runtimeState{
 		visibilityEpochs: make(map[int64]uint64, len(r.visibilityEpochs)),
 		moderationEpoch:  r.moderationEpoch,
+		presences:        make(map[int64]Presence, len(r.presences)),
 	}
 	for userID, epoch := range r.visibilityEpochs {
 		cloned.visibilityEpochs[userID] = epoch
+	}
+	for userID, presence := range r.presences {
+		cloned.presences[userID] = clonePresence(presence)
+	}
+	return cloned
+}
+
+// validPresence enforces the v1 status and activity privacy vocabulary before
+// data can become part of an immutable synchronized state version.
+func validPresence(presence Presence) bool {
+	switch presence.Status {
+	case "online", "dnd", "afk", "offline", "invisible":
+	default:
+		return false
+	}
+	if presence.Activity == nil {
+		return true
+	}
+	return presence.Activity.Type != "" && presence.Activity.Name != "" && (presence.Activity.Privacy == "public" || presence.Activity.Privacy == "private")
+}
+
+// clonePresence gives immutable state versions independent activity storage.
+func clonePresence(presence Presence) Presence {
+	cloned := presence
+	if presence.Activity != nil {
+		activity := *presence.Activity
+		cloned.Activity = &activity
 	}
 	return cloned
 }

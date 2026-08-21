@@ -10,6 +10,7 @@ registration_mode = "invite"
 
 [server]
 host = "0.0.0.0"   # 监听地址；join URL 会用它，公网部署请填实际可达域名/IP
+advertised_host = "localhost" # metadata 中返回给客户端的语音端点主机名/IP，不能是 0.0.0.0 或 ::
 http_port = 8745
 voice_port = 8746
 db_path = "./data/zephyr.db"

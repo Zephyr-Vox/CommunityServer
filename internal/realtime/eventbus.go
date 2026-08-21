@@ -255,12 +255,12 @@ func (b *EventBus) fanout(version *StateVersion, events []StateEvent, visibility
 		if !subscription.active {
 			continue
 		}
-		items, oversized, err := b.liveItems(subscription.ref, version, events)
+		visibilityChange := visibilityChanges[subscription.ref.UserID]
+		items, oversized, err := b.liveItems(subscription.ref, version, events, visibilityChange)
 		if err != nil {
 			unlockSubscriptions(subscriptions)
 			return nil, err
 		}
-		visibilityChange := visibilityChanges[subscription.ref.UserID]
 		revoked := visibilityChange.Revoked
 		if visibilityChange.Changed() {
 			subscription.visibilityEpoch = version.VisibilityEpoch(subscription.ref.UserID)
@@ -307,7 +307,7 @@ func (b *EventBus) fanout(version *StateVersion, events []StateEvent, visibility
 // events against the same immutable visibility resolver used by snapshots and
 // replay. oversized reports connection backpressure without allocating beyond
 // the fixed state queue budget.
-func (b *EventBus) liveItems(ref ControlConnectionRef, version *StateVersion, events []StateEvent) ([]StateQueueItem, bool, error) {
+func (b *EventBus) liveItems(ref ControlConnectionRef, version *StateVersion, events []StateEvent, visibilityChange VisibilityChange) ([]StateQueueItem, bool, error) {
 	items := make([]StateQueueItem, 0, min(len(events), MaxWebSocketStateItems))
 	bytes := 0
 	checkpoint := version.Checkpoint()
@@ -316,22 +316,34 @@ func (b *EventBus) liveItems(ref ControlConnectionRef, version *StateVersion, ev
 			continue
 		}
 		cursorEpoch := version.VisibilityEpoch(ref.UserID)
+		if event.HasCursorVisibilityEpoch {
+			cursorEpoch = event.CursorVisibilityEpoch
+		} else if visibilityChange.Changed() && cursorEpoch > 0 {
+			// The current publication changed this user's visible scope set. Its
+			// ordinary events remain on the old epoch until direct transition.complete
+			// proves every revoke/grant fragment has been applied.
+			cursorEpoch--
+		}
 		cursor, err := b.signer.Issue(ref.UserID, Checkpoint{StreamEpoch: checkpoint.StreamEpoch, GEID: event.GEID}, cursorEpoch)
 		if err != nil {
 			return nil, false, err
 		}
-		frame, err := event.EncodedWithCursor(cursor)
+		frame, err := encodeEventForRecipient(event, ref.UserID, version, cursor)
 		if err != nil {
 			return nil, false, err
 		}
 		if len(items)+1 > MaxWebSocketStateItems || bytes+len(frame) > MaxWebSocketStateBytes {
 			return nil, true, nil
 		}
+		policy := StateDeliveryVisibleAfter
+		if event.DeliveryPolicy == StateDeliveryDirectTransition {
+			policy = StateDeliveryDirectTransition
+		}
 		items = append(items, StateQueueItem{
 			Frame:                 frame,
 			Scope:                 event.Scope,
 			GEID:                  event.GEID,
-			Policy:                StateDeliveryVisibleAfter,
+			Policy:                policy,
 			RecipientUserID:       ref.UserID,
 			ConnectionGeneration:  ref.Generation,
 			CursorVisibilityEpoch: cursorEpoch,
