@@ -14,11 +14,41 @@ import (
 
 func writeApp(t *testing.T, content string) string {
 	t.Helper()
+	if strings.Contains(content, "[server]") && !strings.Contains(content, "advertised_host") {
+		content = strings.Replace(content, "[server]\n", "[server]\nadvertised_host = \"localhost\"\n", 1)
+	}
 	path := filepath.Join(t.TempDir(), "zephyr.toml")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestLoadAppRejectsMissingAdvertisedHost(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zephyr.toml")
+	content := `
+jwt_secret = "0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[auth]
+access_token_ttl = "15m"
+refresh_token_ttl = "720h"
+login_rate_limit = 10
+
+[server]
+host = "0.0.0.0"
+http_port = 8080
+voice_port = 8081
+db_path = "./data/zephyr.db"
+
+[storage]
+base_dir = "./data/objects"
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.LoadApp(path); err == nil || !strings.Contains(err.Error(), "advertised_host") {
+		t.Fatalf("missing advertised_host error = %v", err)
+	}
 }
 
 func TestLoadAppGeneratesDefault(t *testing.T) {
@@ -228,6 +258,7 @@ login_rate_limit = 5
 
 [server]
 host = "0.0.0.0"
+advertised_host = "localhost"
 http_port = 9000
 voice_port = 9091
 db_path = "/tmp/zephyr.db"

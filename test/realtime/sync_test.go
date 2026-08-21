@@ -486,6 +486,88 @@ func TestVisibilityTransitionUsesOldAndNewEpochCursors(t *testing.T) {
 	}
 }
 
+// TestReplayMaterializesUserDataAtEventVersion keeps a user.updated payload
+// valid when a later retained event deletes that user. Replay must not rebuild
+// the older event from the hello-time projection, which would otherwise invent
+// a zero-valued user ID after deletion.
+func TestReplayMaterializesUserDataAtEventVersion(t *testing.T) {
+	loader := &staticProjectionLoader{projection: &store.StateProjection{Users: []db.User{
+		{ID: 1, Username: "alice", Nickname: "Alice"},
+		{ID: 2, Username: "bob", Nickname: "Before delete"},
+	}}}
+	state, err := realtime.NewStateStoreWithEpoch(context.Background(), loader, testEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility := realtime.NewVisibilityResolver()
+	publication, err := realtime.NewStatePublication(state, realtime.NewStateRing(), visibility, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := realtime.NewCursorSignerWithKey(testEpoch, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventBus, err := realtime.NewEventBus(signer, visibility)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(eventBus.Close)
+	strategy, err := realtime.NewFullSnapshotSyncStrategy(publication, signer, visibility, eventBus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := strategy.CaptureSnapshot(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := state.BuildPersistentCandidate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publication.Commit(realtime.PublicationRequest{Candidate: candidate, Events: []realtime.StateEventTemplate{{
+		EventType: "user.updated", Scope: realtime.Scope{Type: "server"}, Data: []byte(`{"user_id":"2"}`), SubjectUserID: 2,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	loader.projection = &store.StateProjection{Users: []db.User{{ID: 1, Username: "alice", Nickname: "Alice"}}}
+	candidate, err = state.BuildPersistentCandidate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publication.Commit(realtime.PublicationRequest{Candidate: candidate, Events: []realtime.StateEventTemplate{{
+		EventType: "user.deleted", Scope: realtime.Scope{Type: "server"}, Data: []byte(`{"user_id":"2"}`),
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	connection := newSyncConnectionRecorder(1, 1)
+	if hello, err := strategy.OnHello(connection, snapshot.Cursor); err != nil || hello.RequiredReason != "" {
+		t.Fatalf("hello = %+v err=%v", hello, err)
+	}
+	batches := connection.Batches()
+	if len(batches) != 1 || len(batches[0]) != 2 {
+		t.Fatalf("replay batches = %v", frameTypes(batches))
+	}
+	var replay struct {
+		Data struct {
+			Events []struct {
+				EventType string `json:"event_type"`
+				Data      struct {
+					User struct {
+						UserID string `json:"user_id"`
+					} `json:"user"`
+				} `json:"data"`
+			} `json:"events"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(batches[0][0], &replay); err != nil {
+		t.Fatal(err)
+	}
+	if len(replay.Data.Events) != 2 || replay.Data.Events[0].EventType != "user.updated" || replay.Data.Events[0].Data.User.UserID != "2" || replay.Data.Events[1].EventType != "user.deleted" {
+		t.Fatalf("replay events = %+v", replay.Data.Events)
+	}
+}
+
 type syncConnectionRecorder struct {
 	ref realtime.ControlConnectionRef
 

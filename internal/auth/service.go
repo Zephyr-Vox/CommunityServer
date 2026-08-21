@@ -48,6 +48,8 @@ type AuthService struct {
 	refreshTTL  time.Duration
 	now         func() int64 // Unix milliseconds, injectable for tests
 	connections ConnectionRevoker
+	publisher   StateChangePublisher
+	gate        MutationGate
 }
 
 // SetConnectionRevoker installs the lifecycle owner notified by session and
@@ -56,6 +58,15 @@ type AuthService struct {
 func (s *AuthService) SetConnectionRevoker(revoker ConnectionRevoker) {
 	s.connections = revoker
 }
+
+// SetStateChangePublisher installs the persistent realtime projection bridge
+// for auth-version-changing password mutations.
+func (s *AuthService) SetStateChangePublisher(publisher StateChangePublisher) {
+	s.publisher = publisher
+}
+
+// SetStateMutationGate installs the process-wide persistent mutation gate.
+func (s *AuthService) SetStateMutationGate(gate MutationGate) { s.gate = gate }
 
 // NewAuthService returns an AuthService. The now function supplies Unix
 // milliseconds and is injectable for deterministic tests.
@@ -200,6 +211,11 @@ func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 func (s *AuthService) ChangePassword(ctx context.Context, userID int64, newPasswordHash string) error {
 	unlock := s.principals.LockMutation(userID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if err := tx.Users.SetPasswordHash(ctx, userID, newPasswordHash); err != nil {
 			return err
@@ -210,6 +226,9 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID int64, newPassw
 	}
 	s.disconnectUser(userID, "password_changed")
 	s.principals.Invalidate(userID)
+	if s.publisher != nil {
+		return s.publisher(ctx, StateChange{EventType: "user.updated", UserID: userID})
+	}
 	return nil
 }
 
@@ -224,6 +243,11 @@ func (s *AuthService) ResetPassword(ctx context.Context, actorID, userID int64, 
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserUpdate); err != nil {
 			return err
@@ -244,6 +268,9 @@ func (s *AuthService) ResetPassword(ctx context.Context, actorID, userID int64, 
 	}
 	s.disconnectUser(userID, "password_reset")
 	s.principals.Invalidate(userID)
+	if s.publisher != nil {
+		return s.publisher(ctx, StateChange{EventType: "user.updated", UserID: userID})
+	}
 	return nil
 }
 

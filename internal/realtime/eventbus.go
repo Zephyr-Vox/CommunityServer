@@ -38,6 +38,10 @@ const (
 	// StateDeliveryDirectTransition identifies sanitized visibility transition
 	// events addressed directly to one user rather than resolved by scope ACL.
 	StateDeliveryDirectTransition
+	// StateDeliveryUserTargeted identifies a non-transition event addressed to
+	// exactly one user. It uses ordinary cursor semantics and is never pruned as
+	// a visibility replacement control item.
+	StateDeliveryUserTargeted
 )
 
 // StateQueueItem is one immutable connection-local delivery unit. Scope and
@@ -315,15 +319,7 @@ func (b *EventBus) liveItems(ref ControlConnectionRef, version *StateVersion, ev
 		if !eventVisibleTo(ref.UserID, event, version, b.visibility) {
 			continue
 		}
-		cursorEpoch := version.VisibilityEpoch(ref.UserID)
-		if event.HasCursorVisibilityEpoch {
-			cursorEpoch = event.CursorVisibilityEpoch
-		} else if visibilityChange.Changed() && cursorEpoch > 0 {
-			// The current publication changed this user's visible scope set. Its
-			// ordinary events remain on the old epoch until direct transition.complete
-			// proves every revoke/grant fragment has been applied.
-			cursorEpoch--
-		}
+		cursorEpoch := cursorEpochForEvent(event, ref.UserID, version)
 		cursor, err := b.signer.Issue(ref.UserID, Checkpoint{StreamEpoch: checkpoint.StreamEpoch, GEID: event.GEID}, cursorEpoch)
 		if err != nil {
 			return nil, false, err
@@ -338,6 +334,8 @@ func (b *EventBus) liveItems(ref ControlConnectionRef, version *StateVersion, ev
 		policy := StateDeliveryVisibleAfter
 		if event.DeliveryPolicy == StateDeliveryDirectTransition {
 			policy = StateDeliveryDirectTransition
+		} else if event.DeliveryPolicy == StateDeliveryUserTargeted {
+			policy = StateDeliveryUserTargeted
 		}
 		items = append(items, StateQueueItem{
 			Frame:                 frame,
@@ -351,6 +349,34 @@ func (b *EventBus) liveItems(ref ControlConnectionRef, version *StateVersion, ev
 		bytes += len(frame)
 	}
 	return items, false, nil
+}
+
+// cursorEpochForEvent returns the persisted proof epoch for one recipient. A
+// direct visibility transition carries its explicit old/new epoch. Ordinary
+// events produced by that same visibility-changing publication retain the
+// recipient's old epoch, so an interrupted replay cannot skip transition parts.
+func cursorEpochForEvent(event StateEvent, userID int64, version *StateVersion) uint64 {
+	if event.HasCursorVisibilityEpoch {
+		return event.CursorVisibilityEpoch
+	}
+	index := sort.Search(len(event.cursorVisibilityEpochs), func(index int) bool {
+		return event.cursorVisibilityEpochs[index].userID >= userID
+	})
+	if index < len(event.cursorVisibilityEpochs) && event.cursorVisibilityEpochs[index].userID == userID {
+		return event.cursorVisibilityEpochs[index].epoch
+	}
+	return version.VisibilityEpoch(userID)
+}
+
+// isVisibilityTransitionEvent reports whether eventType is permitted on the
+// visibility-only direct-transition delivery policy.
+func isVisibilityTransitionEvent(eventType string) bool {
+	switch eventType {
+	case "visibility.tombstone", "visibility.revoked", "visibility.grant.begin", "visibility.fragment", "visibility.granted", "visibility.transition.complete":
+		return true
+	default:
+		return false
+	}
 }
 
 // appendPending prunes revoked private scopes and retains live items published

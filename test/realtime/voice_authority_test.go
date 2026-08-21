@@ -127,10 +127,34 @@ func TestVoiceAuthorityStageRejectsOldConnectionGeneration(t *testing.T) {
 	}
 }
 
+// TestVoiceAuthorityStageRejectsPreparedSessionForAnotherUser prevents one
+// manager-owned prepared session from becoming authority for a different user.
+func TestVoiceAuthorityStageRejectsPreparedSessionForAnotherUser(t *testing.T) {
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(7, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := reservation.Activate(&closeRecorder{}, time.Now().Add(time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := protocol.NewManager(time.Now)
+	prepared, err := manager.Prepare(8, "other-user", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.StageVoiceReplacement(owner, nil, 101, prepared, time.Now().UnixMilli()); !errors.Is(err, realtime.ErrVoiceAuthorityPrecondition) {
+		t.Fatalf("cross-user prepared session = %v, want ErrVoiceAuthorityPrecondition", err)
+	}
+}
+
 func TestVoiceOwnerConnectionCloseStopsOnlyCurrentAuthority(t *testing.T) {
 	coordinator := realtime.NewConnectionCoordinator()
 	recorder := &voiceStopRecorder{}
-	coordinator.SetVoiceSessionDeactivator(recorder.Stop)
+	coordinator.SetVoiceAuthorityDeactivator(func(authority realtime.VoiceAuthority, reason string) {
+		recorder.Stop(authority.UserID, authority.VoiceSessionID, reason)
+	})
 	reservation, err := coordinator.ReserveConnect(7, 11)
 	if err != nil {
 		t.Fatal(err)

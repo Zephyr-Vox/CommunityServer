@@ -15,7 +15,77 @@ import (
 	"zephyr.vox/server/ce/internal/protocol"
 	rbaccontrol "zephyr.vox/server/ce/internal/rbac/control"
 	"zephyr.vox/server/ce/internal/realtime"
+
+	"github.com/labstack/echo/v5"
 )
+
+// requestAdmission owns ordinary HTTP mutation admission independently from
+// listener lifetime. Stop linearizes with begin, after which Wait can safely
+// observe every mutation that may still commit database or realtime state.
+type requestAdmission struct {
+	mu        sync.Mutex
+	accepting bool
+	wg        sync.WaitGroup
+}
+
+func newRequestAdmission() *requestAdmission {
+	return &requestAdmission{accepting: true}
+}
+
+func (a *requestAdmission) begin() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.accepting {
+		return false
+	}
+	a.wg.Add(1)
+	return true
+}
+
+func (a *requestAdmission) done() { a.wg.Done() }
+
+func (a *requestAdmission) stop() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.accepting = false
+	a.mu.Unlock()
+}
+
+func (a *requestAdmission) wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// commandAdmissionMiddleware tracks only mutation methods. Read-only metadata,
+// snapshots and resource GETs remain available while graceful drain begins.
+func (a *App) commandAdmissionMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c *echo.Context) error {
+			switch c.Request().Method {
+			case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+				if !a.commands.begin() {
+					return echo.NewHTTPError(http.StatusServiceUnavailable, "server shutting down")
+				}
+				defer a.commands.done()
+			}
+			return next(c)
+		}
+	}
+}
 
 // appRun owns exactly one active Run invocation. It retains the supervisor and
 // HTTP server together so App.Close can request shutdown without racing an
@@ -55,6 +125,25 @@ func (a *App) beginRun(parent context.Context) (*appRun, error) {
 	running := &appRun{supervisor: NewProcessSupervisor(parent), done: make(chan struct{})}
 	a.running = running
 	a.setRealtimeFatal(running.supervisor.Fatal)
+	a.runtimeMu.RLock()
+	sequencer := a.sequencer
+	a.runtimeMu.RUnlock()
+	if sequencer != nil {
+		running.supervisor.Go("realtime sequencer", func(ctx context.Context) error {
+			<-sequencer.Done()
+			if ctx.Err() != nil {
+				return nil
+			}
+			if err := sequencer.Failure(); err != nil {
+				return err
+			}
+			return errors.New("server: realtime sequencer stopped unexpectedly")
+		})
+		// The idle/command-completion heartbeat goes silent while the single
+		// writer is stuck inside one command or publication phase, which is the
+		// spec's stall signal for root cancellation.
+		running.supervisor.WatchProgress("sequencer", sequencer.Progress(), sequencerWatchdogTimeout)
+	}
 	return running, nil
 }
 
@@ -92,15 +181,22 @@ func (a *App) ShutdownConnections(ctx context.Context) error {
 	if a == nil || a.connections == nil || ctx == nil {
 		return errors.New("server: invalid connection shutdown")
 	}
+	a.commands.stop()
+	commandsErr := a.commands.wait(ctx)
+	if a.voice != nil {
+		a.voice.beginStopping()
+	}
 	a.connections.StopAdmission()
+	a.connections.SetCloseObserver(nil)
+	a.connections.SetVoiceAuthorityObserver(nil)
 	a.connections.DisconnectAll(4005, "server shutdown")
 	if err := a.connections.Wait(ctx); err == nil {
-		return nil
+		return commandsErr
 	} else {
 		a.connections.ForceCloseAll()
 		forceCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		return errors.Join(err, a.connections.Wait(forceCtx))
+		return errors.Join(commandsErr, err, a.connections.Wait(forceCtx))
 	}
 }
 
@@ -150,6 +246,14 @@ func (a *App) startRealtime(ctx context.Context) error {
 		eventBus.Close()
 		return fmt.Errorf("server: create connection state publisher: %w", err)
 	}
+	connectionState.SetConnectionLeaseValidator(func(ctx context.Context, ref realtime.ControlConnectionRef) (func(), error) {
+		release, err := a.connectionAuth.AcquireCurrent(ctx, ref.UserID, ref.LoginSessionID)
+		if errors.Is(err, auth.ErrUserBanned) || errors.Is(err, auth.ErrLoginSessionInvalid) || errors.Is(err, auth.ErrTokenRevoked) {
+			return nil, fmt.Errorf("%w: %v", realtime.ErrConnectionUnauthorized, err)
+		}
+		return release, err
+	})
+	connectionState.SetRuntimeMutationAdmission(a.mutationGate)
 	a.state = state
 	a.publication = publication
 	a.eventBus = eventBus
@@ -165,26 +269,41 @@ func (a *App) stopRealtime(ctx context.Context) error {
 	if a == nil || ctx == nil {
 		return nil
 	}
+	a.stopMu.Lock()
+	defer a.stopMu.Unlock()
 	a.runtimeMu.Lock()
 	sequencer := a.sequencer
 	eventBus := a.eventBus
-	a.state = nil
-	a.publication = nil
-	a.eventBus = nil
-	a.sequencer = nil
+	connectionState := a.connectionState
 	a.syncStrategy = nil
-	a.connectionState = nil
 	a.runtimeMu.Unlock()
 	if a.connections != nil {
 		a.connections.SetCloseObserver(nil)
+		a.connections.SetVoiceAuthorityObserver(nil)
+	}
+	if connectionState != nil {
+		if err := connectionState.Close(ctx); err != nil {
+			return err
+		}
+	}
+	if sequencer != nil {
+		if err := sequencer.Close(ctx); err != nil {
+			return err
+		}
 	}
 	if eventBus != nil {
 		eventBus.Close()
 	}
-	if sequencer == nil {
-		return nil
+	a.runtimeMu.Lock()
+	if a.sequencer == sequencer {
+		a.state = nil
+		a.publication = nil
+		a.eventBus = nil
+		a.sequencer = nil
+		a.connectionState = nil
 	}
-	return sequencer.Close(ctx)
+	a.runtimeMu.Unlock()
+	return nil
 }
 
 // currentStateSync returns the strategy published for the current process
@@ -222,10 +341,12 @@ func (a *App) publishAccountChange(ctx context.Context, change auth.StateChange)
 	if !ok {
 		return errors.New("server: realtime unavailable")
 	}
-	_, err := sequencer.Submit(ctx, realtime.PostCommitCommand{
+	completionCtx := context.WithoutCancel(ctx)
+	_, err := sequencer.Submit(completionCtx, realtime.PostCommitCommand{
 		QueueBytes: 1,
-		Execute: func(ctx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
-			candidate, err := state.BuildPersistentCandidate(ctx)
+		CommandID:  change.CommandID,
+		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+			candidate, err := state.BuildPersistentCandidate(commandCtx)
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
@@ -273,8 +394,8 @@ func accountStateEvents(change auth.StateChange, version *realtime.StateVersion)
 		return nil, errors.New("server: account missing from realtime projection")
 	}
 	userData, err := json.Marshal(struct {
-		User realtime.SnapshotUserPresence `json:"user"`
-	}{User: realtime.SnapshotUserPresenceFor(change.UserID, change.UserID, version)})
+		UserID string `json:"user_id"`
+	}{UserID: strconv.FormatInt(change.UserID, 10)})
 	if err != nil {
 		return nil, err
 	}
@@ -292,13 +413,11 @@ func accountStateEvents(change auth.StateChange, version *realtime.StateVersion)
 			return nil, err
 		}
 		events = append(events, realtime.StateEventTemplate{
-			EventType:                "self.updated",
-			Scope:                    realtime.Scope{Type: "server"},
-			Data:                     selfData,
-			DeliveryPolicy:           realtime.StateDeliveryDirectTransition,
-			RecipientUserID:          change.UserID,
-			CursorVisibilityEpoch:    version.VisibilityEpoch(change.UserID),
-			HasCursorVisibilityEpoch: true,
+			EventType:       "self.updated",
+			Scope:           realtime.Scope{Type: "server"},
+			Data:            selfData,
+			DeliveryPolicy:  realtime.StateDeliveryUserTargeted,
+			RecipientUserID: change.UserID,
 		})
 	}
 	return events, nil
@@ -312,10 +431,11 @@ func (a *App) publishRBACChange(ctx context.Context, change rbaccontrol.StateCha
 	if !ok {
 		return errors.New("server: realtime unavailable")
 	}
-	_, err := sequencer.Submit(ctx, realtime.PostCommitCommand{
+	completionCtx := context.WithoutCancel(ctx)
+	_, err := sequencer.Submit(completionCtx, realtime.PostCommitCommand{
 		QueueBytes: 1,
-		Execute: func(ctx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
-			candidate, err := state.BuildPersistentCandidate(ctx)
+		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+			candidate, err := state.BuildPersistentCandidate(commandCtx)
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
@@ -359,7 +479,7 @@ func rbacStateEvents(change rbaccontrol.StateChange, version *realtime.StateVers
 		data, err := json.Marshal(realtime.SnapshotRole{
 			Key:         role.Key,
 			DisplayName: role.DisplayName,
-			Rank:        strconv.FormatInt(role.Rank, 10),
+			Rank:        role.Rank,
 			Builtin:     role.Builtin,
 		})
 		if err != nil {
@@ -401,13 +521,11 @@ func rbacStateEvents(change rbaccontrol.StateChange, version *realtime.StateVers
 			return nil, err
 		}
 		events = append(events, realtime.StateEventTemplate{
-			EventType:                "self.updated",
-			Scope:                    realtime.Scope{Type: "server"},
-			Data:                     data,
-			DeliveryPolicy:           realtime.StateDeliveryDirectTransition,
-			RecipientUserID:          userID,
-			CursorVisibilityEpoch:    version.VisibilityEpoch(userID),
-			HasCursorVisibilityEpoch: true,
+			EventType:       "self.updated",
+			Scope:           realtime.Scope{Type: "server"},
+			Data:            data,
+			DeliveryPolicy:  realtime.StateDeliveryUserTargeted,
+			RecipientUserID: userID,
 		})
 	}
 	return events, nil
@@ -488,16 +606,65 @@ func (a *App) closeDatabase() error {
 // voiceRuntime owns transport-only voice dependencies assembled at the
 // application boundary. Channel authority remains outside protocol.Manager.
 type voiceRuntime struct {
-	manager  *protocol.Manager
-	registry *protocol.ChannelTypeRegistry
-	server   *protocol.UDPServer
+	manager     *protocol.Manager
+	registry    *protocol.ChannelTypeRegistry
+	server      *protocol.UDPServer
+	revocations chan protocol.RevocationCleanup
+	expiries    chan voiceExpiry
+	connections *realtime.ConnectionCoordinator
+	fatal       func(error)
 
 	closeMu   sync.Mutex
 	started   bool
 	closed    bool
+	stopped   bool
 	closeOnce sync.Once
 	closeErr  error
 	stopPurge func()
+}
+
+type voiceExpiry struct {
+	userID    int64
+	sessionID [16]byte
+}
+
+// beginStopping marks the voice runtime as intentionally shutting down. After
+// this point a full cleanup reserve degrades to a silent drop because
+// best-effort UDP notifications are never required for teardown convergence.
+func (v *voiceRuntime) beginStopping() {
+	if v == nil {
+		return
+	}
+	v.closeMu.Lock()
+	v.stopped = true
+	v.closeMu.Unlock()
+}
+
+// stopping reports whether intentional teardown has begun.
+func (v *voiceRuntime) stopping() bool {
+	if v == nil {
+		return false
+	}
+	v.closeMu.Lock()
+	defer v.closeMu.Unlock()
+	return v.stopped
+}
+
+// fail reports a voice lifecycle failure to the process supervisor when the
+// runtime has been started. Before Run, construction failures are returned by
+// the caller directly and no asynchronous worker exists yet. An intentional
+// shutdown swallows late reserve pressure instead of faking a fatal cause.
+func (v *voiceRuntime) fail(err error) {
+	if v == nil || err == nil {
+		return
+	}
+	v.closeMu.Lock()
+	fatal := v.fatal
+	stopping := v.stopped
+	v.closeMu.Unlock()
+	if fatal != nil && !stopping {
+		fatal(err)
+	}
 }
 
 // newVoiceRuntime builds the protocol dependencies without binding UDP. Run
@@ -527,14 +694,11 @@ func newVoiceRuntime(cfg config.VoiceConfig, connections *realtime.ConnectionCoo
 	if err != nil {
 		return nil, err
 	}
-	connections.SetVoiceSessionDeactivator(func(userID int64, sessionID [16]byte, _ string) {
-		_ = manager.Delete(sessionID, userID)
-	})
 	registry := protocol.NewChannelTypeRegistry()
-	if err := registry.Register(1, protocol.Capabilities{Name: "mic"}); err != nil {
+	if err := registry.Register(1, protocol.Capabilities{Name: "mic", MuteKind: "voice"}); err != nil {
 		return nil, err
 	}
-	if err := registry.Register(2, protocol.Capabilities{Name: "desktop_audio"}); err != nil {
+	if err := registry.Register(2, protocol.Capabilities{Name: "desktop_audio", MuteKind: "desktop_audio"}); err != nil {
 		return nil, err
 	}
 	ingress := protocol.IngressLimits{
@@ -550,7 +714,37 @@ func newVoiceRuntime(cfg config.VoiceConfig, connections *realtime.ConnectionCoo
 		return nil, err
 	}
 	manager.SetRevocationHandler(server.HandleRevocation)
-	return &voiceRuntime{manager: manager, registry: registry, server: server}, nil
+	runtime := &voiceRuntime{
+		manager:     manager,
+		registry:    registry,
+		server:      server,
+		revocations: make(chan protocol.RevocationCleanup, realtime.MaxControlTeardownQueueItems),
+		expiries:    make(chan voiceExpiry, realtime.MaxControlTeardownQueueItems),
+		connections: connections,
+	}
+	connections.SetVoiceAuthorityDeactivator(func(authority realtime.VoiceAuthority, _ string) {
+		cleanup, err := manager.RevokeStaged(authority.VoiceSessionID, authority.UserID)
+		if err != nil && !errors.Is(err, protocol.ErrSessionNotFound) {
+			runtime.fail(fmt.Errorf("voice revoke: %w", err))
+			return
+		}
+		if cleanup == nil {
+			return
+		}
+		select {
+		case runtime.revocations <- cleanup:
+		default:
+			runtime.fail(errors.New("voice revoke cleanup reserve exhausted"))
+		}
+	})
+	manager.SetExpiryHandler(func(userID int64, sessionID [16]byte) {
+		select {
+		case runtime.expiries <- voiceExpiry{userID: userID, sessionID: sessionID}:
+		default:
+			runtime.fail(errors.New("voice expiry cleanup reserve exhausted"))
+		}
+	})
+	return runtime, nil
 }
 
 // authWebSocketAuthenticator adapts auth.ConnectionAuthenticator to the small

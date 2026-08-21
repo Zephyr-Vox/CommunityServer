@@ -20,6 +20,7 @@ import (
 // rather than the default. Authed routes attach jwtMW + authnMW via authed,
 // and permission-protected routes add the matching Require middleware.
 func (a *App) routes(e *echo.Echo) error {
+	e.Use(a.commandAdmissionMiddleware())
 	// Global access log: runs for matched routes and for unknown paths, so
 	// 404s are visible too.
 	e.Use(a.requestLogging())
@@ -38,6 +39,7 @@ func (a *App) routes(e *echo.Echo) error {
 	authnMW := rbacecho.AuthN(auth.NewPrincipalResolver(a.principals))
 	authz := rbac.NewAuthorizer(a.stores.Roles)
 	rbacSvc := rbaccontrol.NewService(a.stores, a.principals)
+	rbacSvc.SetStateMutationGate(a.mutationGate)
 	rbacSvc.SetStateChangePublisher(a.publishRBACChange)
 
 	// authed wraps the standard authentication chain; extra middleware (e.g.

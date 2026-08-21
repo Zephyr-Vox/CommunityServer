@@ -65,14 +65,17 @@ func TestConnectionCoordinatorLifecycle(t *testing.T) {
 	if state, ok := coordinator.State(ref); !ok || state != realtime.ConnectionClosing {
 		t.Fatalf("closing state = (%v, %v), want closing", state, ok)
 	}
-	if coordinator.ActiveCount() != 0 {
-		t.Fatalf("closing admission count = %d, want 0", coordinator.ActiveCount())
+	if coordinator.ActiveCount() != 1 {
+		t.Fatalf("closing admission count = %d, want 1 until writer exit", coordinator.ActiveCount())
 	}
 	requests := transport.Requests()
 	if len(requests) != 1 || requests[0] != (closeRequest{status: 4000, reason: "protocol error"}) {
 		t.Fatalf("close requests = %+v, want one protocol close", requests)
 	}
 	coordinator.FinishDisconnect(ref)
+	if coordinator.ActiveCount() != 0 {
+		t.Fatalf("finished admission count = %d, want 0", coordinator.ActiveCount())
+	}
 	if _, ok := coordinator.State(ref); ok {
 		t.Fatal("finished connection must be removed")
 	}

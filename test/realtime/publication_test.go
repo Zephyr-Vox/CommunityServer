@@ -401,9 +401,12 @@ func TestPostCommitSequencerFinishesRuntimePublicationAfterCommitPointCancellati
 			close(published)
 		}
 	})
-	_, err = sequencer.Submit(ctx, sequencedCommand(state, "runtime.committed", nil, nil))
-	if err != nil && !errors.Is(err, context.Canceled) {
+	completion, err := sequencer.Submit(ctx, sequencedCommand(state, "runtime.committed", nil, nil))
+	if err != nil {
 		t.Fatalf("runtime result after commit-point cancellation = %v", err)
+	}
+	if completion.CommandID == 0 || completion.Publication.Checkpoint.GEID != 1 {
+		t.Fatalf("runtime completion after commit-point cancellation = %+v", completion)
 	}
 	select {
 	case <-published:

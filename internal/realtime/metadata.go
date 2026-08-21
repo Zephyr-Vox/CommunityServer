@@ -3,13 +3,16 @@ package realtime
 import (
 	"errors"
 	"net"
+	"sort"
 	"strings"
 
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/api"
+	"zephyr.vox/server/ce/internal/protocol"
 )
 
+// ErrInvalidMetadata reports invalid advertised endpoint or capability input.
 var ErrInvalidMetadata = errors.New("realtime: invalid metadata")
 
 // Metadata is the public process-level protocol discovery document returned by
@@ -51,13 +54,35 @@ type VoiceStreamType struct {
 // validated here as a final boundary because callers must not derive it from an
 // untrusted request header.
 func NewMetadata(advertisedHost string, voicePort int) (Metadata, error) {
+	registry := protocol.NewChannelTypeRegistry()
+	if err := registry.Register(1, protocol.Capabilities{Name: "mic", MuteKind: "voice"}); err != nil {
+		return Metadata{}, err
+	}
+	if err := registry.Register(2, protocol.Capabilities{Name: "desktop_audio", MuteKind: "desktop_audio"}); err != nil {
+		return Metadata{}, err
+	}
+	return NewMetadataFromRegistry(advertisedHost, voicePort, registry)
+}
+
+// NewMetadataFromRegistry creates discovery data from the exact immutable
+// stream registry used by UDP packet validation and relay mute enforcement.
+func NewMetadataFromRegistry(advertisedHost string, voicePort int, registry *protocol.ChannelTypeRegistry) (Metadata, error) {
 	host := strings.TrimSpace(advertisedHost)
-	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" || voicePort < 1 || voicePort > 65535 {
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" || voicePort < 1 || voicePort > 65535 || registry == nil {
 		return Metadata{}, ErrInvalidMetadata
 	}
 	if net.ParseIP(host) == nil && !validMetadataDNSName(host) {
 		return Metadata{}, ErrInvalidMetadata
 	}
+	streams := registry.Snapshot()
+	streamTypes := make([]VoiceStreamType, 0, len(streams))
+	for id, capabilities := range streams {
+		if capabilities.Name == "" || capabilities.MuteKind == "" {
+			return Metadata{}, ErrInvalidMetadata
+		}
+		streamTypes = append(streamTypes, VoiceStreamType{ID: int(id), Name: capabilities.Name, MuteKind: capabilities.MuteKind})
+	}
+	sort.Slice(streamTypes, func(i, j int) bool { return streamTypes[i].ID < streamTypes[j].ID })
 	return Metadata{
 		ProtocolVersion: 1,
 		VoiceEndpoint:   VoiceEndpoint{Host: host, Port: voicePort},
@@ -67,11 +92,11 @@ func NewMetadata(advertisedHost string, voicePort int) (Metadata, error) {
 			Channels:  2,
 			PTime:     []int{10, 20, 40, 60},
 		}},
-		VoiceStreamTypes: []VoiceStreamType{
-			{ID: 1, Name: "mic", MuteKind: "voice"},
-			{ID: 2, Name: "desktop_audio", MuteKind: "desktop_audio"},
-		},
-		Features: []string{"voice", "temporary_channels"},
+		VoiceStreamTypes: streamTypes,
+		// Channel join/leave and relay advertise their feature names when that
+		// application surface is mounted. A live UDP transport alone is not a
+		// client-usable voice feature.
+		Features: []string{},
 	}, nil
 }
 

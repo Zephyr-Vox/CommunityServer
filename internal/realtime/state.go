@@ -184,6 +184,7 @@ type runtimeState struct {
 	visibilityEpochs map[int64]uint64
 	moderationEpoch  uint64
 	presences        map[int64]Presence
+	voiceAuthorities map[int64]VoiceAuthority
 }
 
 // StateVersion is an immutable server-state projection. Its accessors return
@@ -341,6 +342,30 @@ func (v *StateVersion) Presence(userID int64) Presence {
 	return clonePresence(presence)
 }
 
+// VoiceAuthority returns userID's immutable voice authority tuple when that
+// user has an active runtime binding in this state version.
+func (v *StateVersion) VoiceAuthority(userID int64) (VoiceAuthority, bool) {
+	if v == nil {
+		return VoiceAuthority{}, false
+	}
+	authority, ok := v.runtime.voiceAuthorities[userID]
+	return authority, ok
+}
+
+// VoiceAuthorities returns all active runtime authorities ordered by user ID.
+// Snapshot and fragment serialization derive membership solely from this map.
+func (v *StateVersion) VoiceAuthorities() []VoiceAuthority {
+	if v == nil {
+		return nil
+	}
+	ids := sortedIntKeys(v.runtime.voiceAuthorities)
+	authorities := make([]VoiceAuthority, 0, len(ids))
+	for _, userID := range ids {
+		authorities = append(authorities, v.runtime.voiceAuthorities[userID])
+	}
+	return authorities
+}
+
 // ProjectionLoader loads the complete persisted state from one database view.
 // *store.Stores implements it through LoadStateProjection.
 type ProjectionLoader interface {
@@ -389,6 +414,7 @@ func NewStateStoreWithEpoch(ctx context.Context, loader ProjectionLoader, stream
 		runtime: runtimeState{
 			visibilityEpochs: make(map[int64]uint64),
 			presences:        make(map[int64]Presence),
+			voiceAuthorities: make(map[int64]VoiceAuthority),
 		},
 	})
 	return state, nil
@@ -484,6 +510,58 @@ func (c *StateCandidate) SetPresence(userID int64, presence Presence) error {
 	}
 	c.version.runtime.presences[userID] = clonePresence(presence)
 	return nil
+}
+
+// SetVoiceAuthority conditionally stores authority as the candidate's runtime
+// truth. A nil authority clears userID's binding. Non-nil values must be a
+// complete tuple for an existing user and channel, so snapshots cannot expose
+// a half-applied voice membership.
+func (c *StateCandidate) SetVoiceAuthority(userID int64, authority *VoiceAuthority) error {
+	if c == nil || c.version == nil || userID <= 0 {
+		return ErrInvalidProjection
+	}
+	if authority == nil {
+		delete(c.version.runtime.voiceAuthorities, userID)
+		return nil
+	}
+	if authority.UserID != userID || !authority.Valid() {
+		return ErrInvalidProjection
+	}
+	if _, exists := c.version.persistent.users[userID]; !exists {
+		return ErrInvalidProjection
+	}
+	if _, exists := c.version.persistent.channels[authority.ChannelID]; !exists {
+		return ErrInvalidProjection
+	}
+	c.version.runtime.voiceAuthorities[userID] = *authority
+	return nil
+}
+
+// TransitionVoiceAuthority conditionally applies one exact coordinator tuple
+// transition. A stale callback whose previous generation no longer matches the
+// runtime version returns false without altering a newer voice binding.
+func (c *StateCandidate) TransitionVoiceAuthority(previous, current *VoiceAuthority) (bool, error) {
+	var userID int64
+	if current != nil {
+		userID = current.UserID
+	} else if previous != nil {
+		userID = previous.UserID
+	}
+	if userID <= 0 || (previous != nil && !previous.Valid()) || (current != nil && !current.Valid()) {
+		return false, ErrInvalidProjection
+	}
+	existing, exists := c.version.runtime.voiceAuthorities[userID]
+	if previous == nil {
+		if exists {
+			return false, nil
+		}
+	} else if !exists || existing != *previous {
+		return false, nil
+	}
+	if err := c.SetVoiceAuthority(userID, current); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // NewStreamEpoch returns a cryptographically random 128-bit stream epoch in
@@ -751,12 +829,16 @@ func (r runtimeState) clone() runtimeState {
 		visibilityEpochs: make(map[int64]uint64, len(r.visibilityEpochs)),
 		moderationEpoch:  r.moderationEpoch,
 		presences:        make(map[int64]Presence, len(r.presences)),
+		voiceAuthorities: make(map[int64]VoiceAuthority, len(r.voiceAuthorities)),
 	}
 	for userID, epoch := range r.visibilityEpochs {
 		cloned.visibilityEpochs[userID] = epoch
 	}
 	for userID, presence := range r.presences {
 		cloned.presences[userID] = clonePresence(presence)
+	}
+	for userID, authority := range r.voiceAuthorities {
+		cloned.voiceAuthorities[userID] = authority
 	}
 	return cloned
 }

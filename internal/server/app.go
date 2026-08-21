@@ -49,12 +49,15 @@ type App struct {
 	metadata       realtime.Metadata
 
 	runtimeMu       sync.RWMutex
+	stopMu          sync.Mutex
 	state           *realtime.StateStore
 	publication     *realtime.StatePublication
 	eventBus        *realtime.EventBus
 	sequencer       *realtime.PostCommitSequencer
 	syncStrategy    realtime.StateSyncStrategy
 	connectionState *realtime.ConnectionStatePublisher
+	mutationGate    *realtime.MutationGate
+	commands        *requestAdmission
 
 	lifecycleMu sync.Mutex
 	running     *appRun
@@ -137,7 +140,7 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	e.Validator = validation.New()
 	e.HTTPErrorHandler = api.NewErrorHandler(logger)
 
-	metadata, err := realtime.NewMetadata(metadataHost(cfg.Server), cfg.Server.VoicePort)
+	metadata, err := realtime.NewMetadataFromRegistry(metadataHost(cfg.Server), cfg.Server.VoicePort, voice.registry)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("server: realtime metadata: %w", err)
@@ -160,6 +163,8 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		connectionAuth: connectionAuth,
 		upgrades:       upgrades,
 		metadata:       metadata,
+		mutationGate:   realtime.NewMutationGate(),
+		commands:       newRequestAdmission(),
 		echo:           e,
 		logger:         logger,
 	}
@@ -170,9 +175,15 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		conn.Close()
 		return nil, err
 	}
+	register.SetStateMutationGate(app.mutationGate)
+	activate.SetStateMutationGate(app.mutationGate)
+	users.SetStateMutationGate(app.mutationGate)
+	authSvc.SetStateMutationGate(app.mutationGate)
+	avatarSvc.SetStateMutationGate(app.mutationGate)
 	register.SetStateChangePublisher(app.publishAccountChange)
 	activate.SetStateChangePublisher(app.publishAccountChange)
 	users.SetStateChangePublisher(app.publishAccountChange)
+	authSvc.SetStateChangePublisher(app.publishAccountChange)
 	avatarSvc.SetStatePublisher(func(ctx context.Context, userID int64) error {
 		return app.publishAccountChange(ctx, auth.StateChange{EventType: "user.updated", UserID: userID})
 	})
@@ -208,7 +219,12 @@ func (a *App) Close() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	return errors.Join(a.ShutdownConnections(ctx), a.stopRealtime(ctx), a.closeDatabase())
+	connectionsErr := a.ShutdownConnections(ctx)
+	realtimeErr := a.stopRealtime(ctx)
+	if connectionsErr != nil || realtimeErr != nil {
+		return errors.Join(connectionsErr, realtimeErr)
+	}
+	return a.closeDatabase()
 }
 
 // EnsureActivationCode makes sure a first-owner activation code exists. ok

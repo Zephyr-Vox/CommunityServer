@@ -20,6 +20,10 @@ import (
 // the context is cancelled.
 const shutdownTimeout = 10 * time.Second
 
+// sequencerWatchdogTimeout bounds one sequencer command or publication phase.
+// A silent progress channel for longer than this is a stalled single writer.
+const sequencerWatchdogTimeout = 30 * time.Second
+
 const (
 	defaultReadHeaderTimeout = 10 * time.Second
 	defaultReadTimeout       = 60 * time.Second
@@ -157,10 +161,13 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 		ln.Close()
 		return fmt.Errorf("server: invalid tls_mode %q", mode)
 	}
-	// Realtime StateStore, EventBus and HTTP/WS adapters are assembled before
-	// this listener is published. UDP voice binding remains deferred until the
-	// channel authority/relay adapter owns its membership lifecycle, so metadata
-	// can describe the validated endpoint without opening a partial media plane.
+	if err := a.voice.Start(running.supervisor.Context(), a.cfg.Server.Host, a.cfg.Server.VoicePort, running.supervisor); err != nil {
+		ln.Close()
+		return err
+	}
+	// Realtime StateStore, EventBus, HTTP/WS and UDP adapters are all assembled
+	// before either listener claims readiness. A voice bind failure above leaves
+	// the HTTP socket closed, so metadata never advertises a dead UDP endpoint.
 	return a.serve(running, ln, tlsInfo, timeouts)
 }
 
@@ -223,15 +230,18 @@ func (a *App) serve(running *appRun, ln net.Listener, tlsInfo func(), timeouts H
 // stages register at the marked boundaries without changing ownership.
 func (a *App) gracefulShutdown(srv *http.Server, supervisor *ProcessSupervisor, log *slog.Logger) error {
 	log.Info("shutting down")
-	supervisor.BeginShutdown()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	connectionsErr := a.ShutdownConnections(shutdownCtx)
 	voiceErr := a.stopVoice()
 	httpErr := shutdownHTTPServer(shutdownCtx, srv)
-	workersErr := supervisor.WaitWorkers(shutdownCtx)
+	supervisor.BeginShutdown()
 	realtimeErr := a.stopRealtime(shutdownCtx)
-	dbErr := a.closeDatabase()
+	workersErr := supervisor.WaitWorkers(shutdownCtx)
+	var dbErr error
+	if connectionsErr == nil && voiceErr == nil && httpErr == nil && realtimeErr == nil && workersErr == nil {
+		dbErr = a.closeDatabase()
+	}
 	err := errors.Join(connectionsErr, voiceErr, httpErr, workersErr, realtimeErr, dbErr)
 	if err == nil {
 		log.Info("shutdown complete")
@@ -244,18 +254,28 @@ func (a *App) gracefulShutdown(srv *http.Server, supervisor *ProcessSupervisor, 
 // stops UDP/HTTP, waits only within an independent short deadline, then closes
 // DB so restart reconstructs runtime state from persistent facts.
 func (a *App) fatalShutdown(srv *http.Server, supervisor *ProcessSupervisor, cause error) error {
-	supervisor.BeginShutdown()
+	a.commands.stop()
+	if a.voice != nil {
+		a.voice.beginStopping()
+	}
 	a.connections.StopAdmission()
+	a.connections.SetCloseObserver(nil)
+	a.connections.SetVoiceAuthorityObserver(nil)
 	a.connections.DisconnectAll(4005, "server failure")
 	a.connections.ForceCloseAll()
 	voiceErr := a.stopVoice()
 	httpErr := srv.Close()
+	supervisor.BeginShutdown()
 	fatalCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	workersErr := supervisor.WaitWorkers(fatalCtx)
 	realtimeErr := a.stopRealtime(fatalCtx)
-	dbErr := a.closeDatabase()
-	return errors.Join(cause, voiceErr, httpErr, workersErr, realtimeErr, dbErr)
+	workersErr := supervisor.WaitWorkers(fatalCtx)
+	connectionsErr := a.connections.Wait(fatalCtx)
+	var dbErr error
+	if connectionsErr == nil && realtimeErr == nil && workersErr == nil {
+		dbErr = a.closeDatabase()
+	}
+	return errors.Join(cause, voiceErr, httpErr, connectionsErr, workersErr, realtimeErr, dbErr)
 }
 
 // newHTTPServer builds the ordinary HTTP server with the fixed deadline and

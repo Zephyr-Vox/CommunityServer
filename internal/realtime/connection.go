@@ -132,10 +132,25 @@ type ConnectionTransport interface {
 	ForceClose()
 }
 
-// VoiceSessionDeactivator immediately makes a UDP session reject future media.
-// It is invoked after the coordinator user lock is released on WS owner close;
-// membership/event cleanup remains the caller's sequenced responsibility.
-type VoiceSessionDeactivator func(userID int64, sessionID [16]byte, reason string)
+// AuthRevocationTransport optionally delivers an authenticated terminal notice
+// before its 4002 close. The coordinator uses it for login/session/account
+// revocation while retaining compatibility with non-WebSocket test transports.
+type AuthRevocationTransport interface {
+	ConnectionTransport
+	RequestAuthRevoked(reason string, statusCode int)
+}
+
+// VoiceAuthorityDeactivator receives the complete immutable authority tuple
+// when its owning control connection closes. It performs the synchronous
+// exact-session inactive/index removal; sendMu draining and best-effort UDP
+// notification are returned as deferred work so control-plane teardown never
+// waits for network I/O.
+type VoiceAuthorityDeactivator func(authority VoiceAuthority, reason string)
+
+// VoiceAuthorityObserver receives a completed coordinator authority transition
+// without coordinator locks. Implementations project the exact tuple into the
+// immutable runtime StateStore and must treat stale transitions as no-ops.
+type VoiceAuthorityObserver func(previous, current *VoiceAuthority, reason string)
 
 // ConnectionReservation represents one opening control connection. It is safe
 // to discard on an unsuccessful HTTP upgrade; Activate and Abort are both
@@ -182,17 +197,22 @@ type ConnectionCoordinator struct {
 	indexMu sync.Mutex
 	users   map[int64]*connectionUser
 
-	admissionMu   sync.Mutex
-	accepting     bool
-	admitted      int
-	sources       map[netip.Addr]int
-	wg            sync.WaitGroup
-	voiceStop     atomic.Pointer[voiceStopValue]
-	closeObserver atomic.Pointer[connectionCloseObserver]
+	admissionMu        sync.Mutex
+	accepting          bool
+	admitted           int
+	sources            map[netip.Addr]int
+	wg                 sync.WaitGroup
+	voiceAuthorityStop atomic.Pointer[voiceAuthorityStopValue]
+	voiceObserver      atomic.Pointer[voiceAuthorityObserverValue]
+	closeObserver      atomic.Pointer[connectionCloseObserver]
 }
 
-type voiceStopValue struct {
-	stop VoiceSessionDeactivator
+type voiceAuthorityStopValue struct {
+	stop VoiceAuthorityDeactivator
+}
+
+type voiceAuthorityObserverValue struct {
+	observe VoiceAuthorityObserver
 }
 
 type connectionCloseObserver struct {
@@ -221,12 +241,14 @@ type connectionRecord struct {
 }
 
 type connectionClosePlan struct {
-	transport ConnectionTransport
-	status    int
-	reason    string
-	voiceStop VoiceSessionDeactivator
-	voiceID   [16]byte
-	voiceUser int64
+	transport          ConnectionTransport
+	status             int
+	reason             string
+	voiceAuthority     *VoiceAuthority
+	voiceAuthorityStop VoiceAuthorityDeactivator
+	voiceObserver      VoiceAuthorityObserver
+	voiceReason        string
+	authRevoked        bool
 }
 
 // NewConnectionCoordinator returns an empty connection lifecycle owner with
@@ -239,18 +261,30 @@ func NewConnectionCoordinator() *ConnectionCoordinator {
 	}
 }
 
-// SetVoiceSessionDeactivator installs the transport-side immediate voice stop
-// callback. It must be configured before connections are admitted; the callback
-// is never invoked while a coordinator lock is held.
-func (c *ConnectionCoordinator) SetVoiceSessionDeactivator(stop VoiceSessionDeactivator) {
+// SetVoiceAuthorityDeactivator installs the exact-tuple teardown callback used
+// by the application voice adapter. It must be configured before admission.
+func (c *ConnectionCoordinator) SetVoiceAuthorityDeactivator(stop VoiceAuthorityDeactivator) {
 	if c == nil {
 		return
 	}
 	if stop == nil {
-		c.voiceStop.Store(nil)
+		c.voiceAuthorityStop.Store(nil)
 		return
 	}
-	c.voiceStop.Store(&voiceStopValue{stop: stop})
+	c.voiceAuthorityStop.Store(&voiceAuthorityStopValue{stop: stop})
+}
+
+// SetVoiceAuthorityObserver installs the immutable-state projection callback.
+// It is invoked after a coordinator transition has released its user lock.
+func (c *ConnectionCoordinator) SetVoiceAuthorityObserver(observer VoiceAuthorityObserver) {
+	if c == nil {
+		return
+	}
+	if observer == nil {
+		c.voiceObserver.Store(nil)
+		return
+	}
+	c.voiceObserver.Store(&voiceAuthorityObserverValue{observe: observer})
 }
 
 // SetCloseObserver installs the runtime state callback invoked after a control
@@ -423,6 +457,37 @@ func (c *ConnectionCoordinator) AuthLease(ref ControlConnectionRef) (AuthLease, 
 	return record.lease, true
 }
 
+// LeaseActive reports whether ref still names an active connection with an
+// unexpired lease at nowMillis. Command workers call it immediately before
+// mutating runtime state so a request queued before expiry cannot execute after
+// that connection's authentication window has ended.
+func (c *ConnectionCoordinator) LeaseActive(ref ControlConnectionRef, nowMillis int64) bool {
+	if c == nil || !validConnectionRef(ref) || nowMillis <= 0 {
+		return false
+	}
+	user := c.acquireUser(ref.UserID)
+	defer c.releaseUser(ref.UserID, user)
+	user.mu.Lock()
+	defer user.mu.Unlock()
+	record := user.connections[ref.ControlConnectionID]
+	return record != nil && record.ref == ref && record.state == ConnectionActive && record.lease.ExpiresAt > nowMillis
+}
+
+// LeaseMatches reports whether expected is still the exact active auth lease
+// for ref and remains unexpired. Runtime commands use it both after dequeue and
+// again at their StatePublication commit point.
+func (c *ConnectionCoordinator) LeaseMatches(ref ControlConnectionRef, expected AuthLease, nowMillis int64) bool {
+	if c == nil || !validConnectionRef(ref) || expected.Revision == 0 || expected.ExpiresAt <= nowMillis || nowMillis <= 0 {
+		return false
+	}
+	user := c.acquireUser(ref.UserID)
+	defer c.releaseUser(ref.UserID, user)
+	user.mu.Lock()
+	defer user.mu.Unlock()
+	record := user.connections[ref.ControlConnectionID]
+	return record != nil && record.ref == ref && record.state == ConnectionActive && record.lease == expected
+}
+
 // RenewAuthLease replaces ref's expiry after auth.update revalidated the same
 // user and login session. It rejects an already expired current lease, then
 // increments the revision so every older timer becomes a harmless mismatch.
@@ -494,7 +559,7 @@ func (c *ConnectionCoordinator) StageVoiceReplacement(owner ControlConnectionRef
 	}
 	if prepared != nil {
 		info := prepared.Info()
-		if info.ID == [16]byte{} {
+		if info.ID == [16]byte{} || info.UserID != owner.UserID {
 			return nil, ErrVoiceAuthorityPrecondition
 		}
 	}
@@ -533,6 +598,12 @@ func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCo
 	user := s.coordinator.acquireUser(s.owner.UserID)
 	defer s.coordinator.releaseUser(s.owner.UserID, user)
 	user.mu.Lock()
+	var notifyPrevious, notifyCurrent *VoiceAuthority
+	defer func() {
+		if notifyCurrent != nil {
+			s.coordinator.notifyVoiceAuthority(notifyPrevious, notifyCurrent, "session_replaced")
+		}
+	}()
 	defer user.mu.Unlock()
 	if !user.connectionActiveLocked(s.owner) || !sameVoiceAuthority(user.voice, s.expected) {
 		return VoiceAuthorityCommit{}, ErrVoiceAuthorityPrecondition
@@ -567,6 +638,8 @@ func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCo
 		JoinedAt:                 s.joinedAt,
 	}
 	user.voice = &current
+	notifyPrevious = previous
+	notifyCurrent = &current
 	return VoiceAuthorityCommit{Previous: previous, Current: current, Cleanup: cleanup}, nil
 }
 
@@ -574,12 +647,24 @@ func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCo
 // its UDP session. Missing protocol sessions are treated as already inactive so
 // UDP expiry can converge the binding after the transport removed it first.
 func (c *ConnectionCoordinator) BeginVoiceDisconnect(expected VoiceAuthority, manager *protocol.Manager) (VoiceAuthority, bool, error) {
+	return c.BeginVoiceDisconnectReason(expected, manager, "revoked")
+}
+
+// BeginVoiceDisconnectReason conditionally clears one complete voice authority
+// tuple and records the lifecycle reason for the ordered StatePublication.
+func (c *ConnectionCoordinator) BeginVoiceDisconnectReason(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, error) {
 	if c == nil || !expected.Valid() {
 		return VoiceAuthority{}, false, ErrVoiceAuthorityPrecondition
 	}
 	user := c.acquireUser(expected.UserID)
 	defer c.releaseUser(expected.UserID, user)
 	user.mu.Lock()
+	var notification *VoiceAuthority
+	defer func() {
+		if notification != nil {
+			c.notifyVoiceAuthority(notification, nil, reason)
+		}
+	}()
 	defer user.mu.Unlock()
 	if !sameVoiceAuthority(user.voice, &expected) {
 		return VoiceAuthority{}, false, nil
@@ -592,6 +677,7 @@ func (c *ConnectionCoordinator) BeginVoiceDisconnect(expected VoiceAuthority, ma
 	}
 	removed := *user.voice
 	user.voice = nil
+	notification = &removed
 	return removed, true, nil
 }
 
@@ -716,8 +802,10 @@ func (c *ConnectionCoordinator) State(ref ControlConnectionRef) (ConnectionState
 	return record.state, true
 }
 
-// ActiveCount returns the number of opening and active admissions. Closing
-// records are excluded as soon as their one teardown transition succeeds.
+// ActiveCount returns the number of admitted control sockets, including records
+// that are closing but whose read/write goroutines have not exited yet. Capacity
+// is released only by FinishDisconnect or Abort, preventing close-frame churn
+// from exceeding the process, user, or source hard limits.
 func (c *ConnectionCoordinator) ActiveCount() int {
 	if c == nil {
 		return 0
@@ -768,14 +856,16 @@ func (c *ConnectionCoordinator) beginDisconnectLocked(user *connectionUser, ref 
 		return connectionClosePlan{}, false
 	}
 	record.state = ConnectionClosing
-	c.releaseAdmissionLocked(user, record)
 	plan := connectionClosePlan{transport: record.transport, status: statusCode, reason: reason}
 	if user.voice != nil && user.voice.ControlConnectionID == ref.ControlConnectionID && user.voice.ConnectionGeneration == ref.Generation {
-		if stop := c.voiceStop.Load(); stop != nil {
-			plan.voiceStop = stop.stop
+		plan.voiceAuthority = cloneVoiceAuthority(user.voice)
+		plan.voiceReason = reason
+		if stop := c.voiceAuthorityStop.Load(); stop != nil {
+			plan.voiceAuthorityStop = stop.stop
 		}
-		plan.voiceID = user.voice.VoiceSessionID
-		plan.voiceUser = user.voice.UserID
+		if observer := c.voiceObserver.Load(); observer != nil {
+			plan.voiceObserver = observer.observe
+		}
 		user.voice = nil
 	}
 	return plan, true
@@ -785,11 +875,31 @@ func (c *ConnectionCoordinator) beginDisconnectLocked(user *connectionUser, ref 
 // coordinator locks have been released. Sequenced membership/presence cleanup
 // is deliberately outside this low-level lifecycle callback.
 func (c *ConnectionCoordinator) runClosePlan(plan connectionClosePlan) {
-	if plan.voiceStop != nil {
-		plan.voiceStop(plan.voiceUser, plan.voiceID, plan.reason)
+	if plan.voiceAuthorityStop != nil && plan.voiceAuthority != nil {
+		plan.voiceAuthorityStop(*plan.voiceAuthority, plan.reason)
+	}
+	if plan.voiceObserver != nil {
+		plan.voiceObserver(plan.voiceAuthority, nil, plan.voiceReason)
+	}
+	if plan.authRevoked {
+		if transport, ok := plan.transport.(AuthRevocationTransport); ok {
+			transport.RequestAuthRevoked(plan.reason, plan.status)
+			return
+		}
 	}
 	if plan.transport != nil {
 		plan.transport.RequestClose(plan.status, plan.reason)
+	}
+}
+
+// notifyVoiceAuthority dispatches an immutable tuple transition after the
+// caller has released coordinator ownership.
+func (c *ConnectionCoordinator) notifyVoiceAuthority(previous, current *VoiceAuthority, reason string) {
+	if c == nil {
+		return
+	}
+	if observer := c.voiceObserver.Load(); observer != nil && observer.observe != nil {
+		observer.observe(cloneVoiceAuthority(previous), cloneVoiceAuthority(current), reason)
 	}
 }
 
@@ -818,6 +928,7 @@ func (c *ConnectionCoordinator) disconnectMatching(userID int64, reason string, 
 		if match(record.ref) {
 			plan, ok := c.beginDisconnectLocked(user, record.ref, 4002, reason)
 			if ok {
+				plan.authRevoked = true
 				plans = append(plans, plan)
 				refs = append(refs, record.ref)
 			}

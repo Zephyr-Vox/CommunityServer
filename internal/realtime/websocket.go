@@ -43,6 +43,8 @@ const (
 	// lose its required command result.
 	MaxWebSocketResponseItems = 16
 	MaxWebSocketResponseBytes = 64 << 10
+	MaxWebSocketTerminalItems = 2
+	MaxWebSocketTerminalBytes = 8 << 10
 
 	websocketMalformedCommandLimit = 3
 	websocketRateLimitCloseLimit   = 3
@@ -92,6 +94,15 @@ type WebSocketAuthenticator interface {
 // sync-hello and liveness deadlines until the coordinator owns a terminal close
 // transition. lifecycle publishes first-active presence before ready and
 // provides the sequenced presence.set implementation.
+//
+// Errors:
+//   - 1001 malformed request: invalid remote address before upgrade
+//   - 1002 unauthorized: missing or invalid access token before upgrade
+//   - 1008 rate limited: source upgrade rate limit exceeded before upgrade
+//   - 1009 internal: realtime service is unavailable before upgrade
+//
+// After a successful upgrade failures are delivered through a WebSocket close
+// code, never an HTTP JSON envelope.
 func WebSocketHandler(authenticator WebSocketAuthenticator, coordinator *ConnectionCoordinator, upgrades *UpgradeLimiter, syncStrategy func() StateSyncStrategy, lifecycle ControlConnectionPublisher) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		if authenticator == nil || coordinator == nil || upgrades == nil || syncStrategy == nil || lifecycle == nil {
@@ -192,6 +203,7 @@ func WebSocketHandler(authenticator WebSocketAuthenticator, coordinator *Connect
 
 		phase := syncPhaseInitial
 		commands := newWebSocketCommandLimiter(time.Now)
+		requestIDs := newWebSocketRequestTracker()
 		malformedCommands := 0
 		rateLimitViolations := 0
 		for {
@@ -260,7 +272,11 @@ func WebSocketHandler(authenticator WebSocketAuthenticator, coordinator *Connect
 					coordinator.BeginDisconnect(ref, websocketCloseProtocol, "protocol error")
 					return nil
 				}
-				response := pump.ReserveResponse()
+				if !requestIDs.Reserve(envelope.RequestID) {
+					coordinator.BeginDisconnect(ref, websocketCloseProtocol, "duplicate request id")
+					return nil
+				}
+				response := pump.ReserveResponse(requestIDs, envelope.RequestID)
 				if response == nil {
 					coordinator.BeginDisconnect(ref, websocketCloseSlow, "response lane full")
 					return nil
@@ -314,7 +330,11 @@ func WebSocketHandler(authenticator WebSocketAuthenticator, coordinator *Connect
 					coordinator.BeginDisconnect(ref, websocketCloseProtocol, "protocol error")
 					return nil
 				}
-				response := pump.ReserveResponse()
+				if !requestIDs.Reserve(envelope.RequestID) {
+					coordinator.BeginDisconnect(ref, websocketCloseProtocol, "duplicate request id")
+					return nil
+				}
+				response := pump.ReserveResponse(requestIDs, envelope.RequestID)
 				if response == nil {
 					coordinator.BeginDisconnect(ref, websocketCloseSlow, "response lane full")
 					return nil
@@ -348,8 +368,13 @@ func WebSocketHandler(authenticator WebSocketAuthenticator, coordinator *Connect
 						coordinator.BeginDisconnect(ref, websocketCloseSlow, "writer unavailable")
 						return nil
 					}
+					if malformedCommands >= websocketMalformedCommandLimit {
+						coordinator.BeginDisconnect(ref, websocketCloseProtocol, "protocol error")
+						return nil
+					}
 					continue
 				}
+				malformedCommands = 0
 				commandCtx, cancel := context.WithTimeout(context.Background(), websocketCommandTimeout)
 				result, err := lifecycle.SetPresence(commandCtx, ref, status, activity)
 				cancel()
@@ -361,12 +386,20 @@ func WebSocketHandler(authenticator WebSocketAuthenticator, coordinator *Connect
 							return nil
 						}
 					case errors.Is(err, ErrInvalidPresence):
+						malformedCommands++
 						if !enqueueCommandError(pump, response, envelope.RequestID, envelope.Type, 1, "invalid presence", false) {
 							coordinator.BeginDisconnect(ref, websocketCloseSlow, "writer unavailable")
 							return nil
 						}
+						if malformedCommands >= websocketMalformedCommandLimit {
+							coordinator.BeginDisconnect(ref, websocketCloseProtocol, "protocol error")
+							return nil
+						}
 					case errors.Is(err, ErrConnectionNotActive):
 						coordinator.BeginDisconnect(ref, websocketCloseExpired, "connection inactive")
+						return nil
+					case errors.Is(err, ErrConnectionUnauthorized):
+						coordinator.BeginDisconnect(ref, websocketCloseExpired, "unauthorized")
 						return nil
 					default:
 						coordinator.BeginDisconnect(ref, websocketCloseProtocol, "presence publication failed")
@@ -374,6 +407,7 @@ func WebSocketHandler(authenticator WebSocketAuthenticator, coordinator *Connect
 					}
 					continue
 				}
+				malformedCommands = 0
 				if !pump.EnqueueResponse(response, webSocketPresenceUpdatedFrame(envelope.RequestID, result.CommandID)) {
 					coordinator.BeginDisconnect(ref, websocketCloseSlow, "writer unavailable")
 					return nil
@@ -383,6 +417,47 @@ func WebSocketHandler(authenticator WebSocketAuthenticator, coordinator *Connect
 				return nil
 			}
 		}
+	}
+}
+
+// webSocketRequestTracker retains the request IDs whose response slots are
+// still outstanding. The response lane's fixed 16-item capacity bounds this
+// set; ACK write or connection close releases the ID.
+type webSocketRequestTracker struct {
+	mu   sync.Mutex
+	used map[string]struct{}
+}
+
+// newWebSocketRequestTracker creates an empty bounded request ID reservation set.
+func newWebSocketRequestTracker() *webSocketRequestTracker {
+	return &webSocketRequestTracker{used: make(map[string]struct{}, MaxWebSocketResponseItems)}
+}
+
+// Reserve records requestID exactly once and rejects duplicates or capacity
+// exhaustion. The read pump is its only production caller.
+func (t *webSocketRequestTracker) Reserve(requestID string) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.used) >= MaxWebSocketResponseItems {
+		return false
+	}
+	if _, exists := t.used[requestID]; exists {
+		return false
+	}
+	t.used[requestID] = struct{}{}
+	return true
+}
+
+// Release returns one request ID after its correlated response is written or
+// abandoned during terminal connection teardown.
+func (t *webSocketRequestTracker) Release(requestID string) {
+	if t != nil {
+		t.mu.Lock()
+		delete(t.used, requestID)
+		t.mu.Unlock()
 	}
 }
 
@@ -687,6 +762,20 @@ func webSocketPresenceUpdatedFrame(requestID string, commandID int64) []byte {
 	return encoded
 }
 
+// webSocketAuthRevokedFrame serializes the terminal notice emitted before a
+// session/account revocation closes a live control connection.
+func webSocketAuthRevokedFrame(reason string) []byte {
+	encoded, _ := json.Marshal(struct {
+		Type string `json:"type"`
+		Data struct {
+			Reason string `json:"reason"`
+		} `json:"data"`
+	}{Type: "auth.revoked", Data: struct {
+		Reason string `json:"reason"`
+	}{Reason: reason}})
+	return encoded
+}
+
 // enqueueCommandError reserves one response-lane frame for a command whose
 // type/request_id is valid but whose payload or admission failed. It returns
 // false only when the write pump can no longer deliver the bounded response.
@@ -756,13 +845,16 @@ func webSocketAuthenticationError(err error) error {
 type webSocketWritePump struct {
 	conn *websocket.Conn
 
-	state     *webSocketStateLane
-	responses *webSocketResponseLane
-	pings     chan struct{}
-	pongs     chan []byte
-	terminal  chan webSocketTerminal
-	done      chan struct{}
-	force     sync.Once
+	state         *webSocketStateLane
+	responses     *webSocketResponseLane
+	pings         chan struct{}
+	pongs         chan []byte
+	terminal      chan webSocketTerminal
+	terminalMu    sync.Mutex
+	terminalItems int
+	terminalBytes int
+	done          chan struct{}
+	force         sync.Once
 }
 
 // webSocketSyncConnection adapts one write pump and coordinator generation to
@@ -799,6 +891,8 @@ func (c *webSocketSyncConnection) DisconnectSlowConsumer() {
 type webSocketTerminal struct {
 	status int
 	reason string
+	frame  []byte
+	close  bool
 }
 
 // webSocketResponseLane tracks capacity reserved by accepted result-bearing
@@ -821,8 +915,10 @@ type webSocketResponse struct {
 // webSocketResponseSlot belongs to exactly one accepted result-bearing command.
 // The write pump releases it only after the frame is written or discarded.
 type webSocketResponseSlot struct {
-	lane *webSocketResponseLane
-	once sync.Once
+	lane      *webSocketResponseLane
+	tracker   *webSocketRequestTracker
+	requestID string
+	once      sync.Once
 }
 
 // webSocketStateLane bounds ordinary state/control frames by both item count
@@ -1008,6 +1104,7 @@ func (s *webSocketResponseSlot) release() {
 		s.lane.items--
 		s.lane.bytes -= maxWebSocketResponseFrameBytes
 		s.lane.mu.Unlock()
+		s.tracker.Release(s.requestID)
 	})
 }
 
@@ -1035,7 +1132,7 @@ func newWebSocketWritePump(conn *websocket.Conn) *webSocketWritePump {
 		responses: newWebSocketResponseLane(),
 		pings:     make(chan struct{}, 1),
 		pongs:     make(chan []byte, 2),
-		terminal:  make(chan webSocketTerminal, 1),
+		terminal:  make(chan webSocketTerminal, MaxWebSocketTerminalItems),
 		done:      make(chan struct{}),
 	}
 	go pump.run()
@@ -1044,15 +1141,24 @@ func newWebSocketWritePump(conn *websocket.Conn) *webSocketWritePump {
 
 // ReserveResponse reserves one ACK slot before a result-bearing command
 // performs authentication, state mutation, or lease replacement.
-func (p *webSocketWritePump) ReserveResponse() *webSocketResponseSlot {
+func (p *webSocketWritePump) ReserveResponse(tracker *webSocketRequestTracker, requestID string) *webSocketResponseSlot {
 	if p == nil {
+		tracker.Release(requestID)
 		return nil
 	}
 	select {
 	case <-p.done:
+		tracker.Release(requestID)
 		return nil
 	default:
-		return p.responses.reserve()
+		slot := p.responses.reserve()
+		if slot == nil {
+			tracker.Release(requestID)
+			return nil
+		}
+		slot.tracker = tracker
+		slot.requestID = requestID
+		return slot
 	}
 }
 
@@ -1140,17 +1246,57 @@ func (p *webSocketWritePump) RequestClose(statusCode int, reason string) {
 	// Stop and claim share the state-lane gate. An item already claimed is
 	// ordered before this close; every unclaimed item is discarded here.
 	p.state.stop()
-	terminal := webSocketTerminal{status: statusCode, reason: reason}
+	terminal := webSocketTerminal{status: statusCode, reason: reason, close: true}
+	p.enqueueTerminal(terminal)
+}
+
+// RequestAuthRevoked implements AuthRevocationTransport. It reserves the
+// terminal notice and its close as one bounded sequence, then prevents normal
+// state/response delivery from overtaking it.
+func (p *webSocketWritePump) RequestAuthRevoked(reason string, statusCode int) {
+	if p == nil {
+		return
+	}
+	p.state.stop()
+	p.enqueueTerminal(webSocketTerminal{frame: webSocketAuthRevokedFrame(reason)})
+	p.enqueueTerminal(webSocketTerminal{status: statusCode, reason: reason, close: true})
+}
+
+// enqueueTerminal reserves fixed terminal capacity without blocking a caller
+// that owns coordinator lifecycle progress.
+func (p *webSocketWritePump) enqueueTerminal(terminal webSocketTerminal) {
+	if p == nil || (!terminal.close && (len(terminal.frame) == 0 || len(terminal.frame) > MaxWebSocketTerminalBytes)) {
+		return
+	}
 	select {
 	case <-p.done:
 		return
 	default:
 	}
+	p.terminalMu.Lock()
+	bytes := len(terminal.frame)
+	if p.terminalItems >= MaxWebSocketTerminalItems || p.terminalBytes+bytes > MaxWebSocketTerminalBytes {
+		p.terminalMu.Unlock()
+		return
+	}
+	p.terminalItems++
+	p.terminalBytes += bytes
+	p.terminalMu.Unlock()
 	select {
 	case p.terminal <- terminal:
 	case <-p.done:
+		p.releaseTerminal(terminal)
 	default:
+		p.releaseTerminal(terminal)
 	}
+}
+
+// releaseTerminal frees an item after the sole writer has claimed or discarded it.
+func (p *webSocketWritePump) releaseTerminal(terminal webSocketTerminal) {
+	p.terminalMu.Lock()
+	p.terminalItems--
+	p.terminalBytes -= len(terminal.frame)
+	p.terminalMu.Unlock()
 }
 
 // ForceClose implements ConnectionTransport's shutdown-deadline path. It
@@ -1177,18 +1323,19 @@ func (p *webSocketWritePump) run() {
 	defer func() {
 		p.state.close()
 		p.responses.releaseQueued()
+		p.releaseQueuedTerminal()
 		close(p.done)
 	}()
 	for {
 		select {
 		case terminal := <-p.terminal:
-			p.closeTerminal(terminal)
+			p.runTerminal(terminal)
 			return
 		default:
 		}
 		select {
 		case terminal := <-p.terminal:
-			p.closeTerminal(terminal)
+			p.runTerminal(terminal)
 			return
 		case response := <-p.responses.queue:
 			if !p.writeFrame(response.frame) {
@@ -1214,6 +1361,34 @@ func (p *webSocketWritePump) run() {
 				return
 			}
 			p.state.release(frame)
+		}
+	}
+}
+
+// runTerminal drains only the terminal lane once closing begins, ensuring an
+// auth.revoked notice cannot be overtaken by ordinary responses or state data.
+func (p *webSocketWritePump) runTerminal(terminal webSocketTerminal) {
+	for {
+		p.releaseTerminal(terminal)
+		if terminal.close {
+			p.closeTerminal(terminal)
+			return
+		}
+		if !p.writeFrame(terminal.frame) {
+			return
+		}
+		terminal = <-p.terminal
+	}
+}
+
+// releaseQueuedTerminal frees terminal reservations abandoned by a write error.
+func (p *webSocketWritePump) releaseQueuedTerminal() {
+	for {
+		select {
+		case terminal := <-p.terminal:
+			p.releaseTerminal(terminal)
+		default:
+			return
 		}
 	}
 }

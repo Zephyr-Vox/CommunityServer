@@ -488,3 +488,37 @@ func TestManagerConcurrentLazyGetAndPurgeExpireOnce(t *testing.T) {
 	default:
 	}
 }
+
+// TestManagerRevokeStagedIsSynchronousInactive proves RevokeStaged removes the
+// exact session from the Manager indexes before returning and defers only the
+// sendMu/notification work to the returned cleanup.
+func TestManagerRevokeStagedIsSynchronousInactive(t *testing.T) {
+	m, _ := newTestManager(t)
+	sess, err := activateSession(t, m, 7, "dev", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cleanup, err := m.RevokeStaged(sess.ID, 7)
+	if err != nil {
+		t.Fatalf("staged revoke = %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("staged revoke returned no cleanup")
+	}
+	if _, ok := m.Get(sess.ID); ok {
+		t.Fatal("session remained in Manager indexes after staged revoke")
+	}
+	if _, err := m.RevokeStaged(sess.ID, 7); !errors.Is(err, protocol.ErrSessionNotFound) {
+		t.Fatalf("repeated staged revoke = %v, want ErrSessionNotFound", err)
+	}
+	cleanup()
+
+	foreign, err := activateSession(t, m, 8, "other", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.RevokeStaged(foreign.ID, 7); !errors.Is(err, protocol.ErrSessionNotOwned) {
+		t.Fatalf("foreign staged revoke = %v, want ErrSessionNotOwned", err)
+	}
+}

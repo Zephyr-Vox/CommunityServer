@@ -104,6 +104,13 @@ type RevokedSessionSnapshot struct {
 // The callback runs outside Manager and Session locks.
 type RevocationHandler func(reason RevocationReason, snap RevokedSessionSnapshot)
 
+// RevocationCleanup is the best-effort work that must run after the session
+// has already been made inactive and removed from the Manager indexes. Calling
+// it may wait for an in-flight UDP Send and perform a UDP notification; callers
+// must keep it outside control-plane locks and may dispatch it to a bounded
+// worker.
+type RevocationCleanup func()
+
 // ExpiryHandler receives sessions that expired naturally and were removed by
 // Get, Send, SessionIDByUser or Purge. It runs outside Manager and Session
 // locks on the goroutine that discovered the expiry, so it must be
@@ -117,6 +124,7 @@ type ExpiryHandler func(userID int64, sessionID [16]byte)
 // negotiation response.
 type SessionInfo struct {
 	ID               [16]byte
+	UserID           int64
 	Encrypted        bool
 	MasterKey        []byte // nil in plaintext mode
 	ExpiresAt        int64  // Unix milliseconds at creation time; slides with traffic
@@ -283,7 +291,7 @@ func (m *Manager) Prepare(userID int64, deviceID string, encrypted bool) (*Prepa
 	expiresAt := sess.ExpiresAt
 	sess.mu.Unlock()
 
-	return &PreparedSession{owner: m, session: sess, info: SessionInfo{ID: id, Encrypted: encrypted, MasterKey: masterKey, ExpiresAt: expiresAt}}, nil
+	return &PreparedSession{owner: m, session: sess, info: SessionInfo{ID: id, UserID: userID, Encrypted: encrypted, MasterKey: masterKey, ExpiresAt: expiresAt}}, nil
 }
 
 // ActivationCleanup performs the old-session best-effort UDP notification after
@@ -528,6 +536,53 @@ func (m *Manager) Delete(id [16]byte, userID int64) error {
 		return ErrSessionNotFound
 	}
 	return nil
+}
+
+// Revoke removes exactly id when it belongs to userID and drains its send
+// barrier before issuing the best-effort revocation notification. It is used
+// when control-plane authority is lost; voluntary leave continues to use Delete
+// and intentionally emits no revocation frame.
+func (m *Manager) Revoke(id [16]byte, userID int64) error {
+	cleanup, err := m.RevokeStaged(id, userID)
+	if err != nil {
+		return err
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	return nil
+}
+
+// RevokeStaged makes the exact session inactive and removes it from the
+// Manager indexes synchronously, then returns the sendMu/UDP notification work
+// for execution outside caller locks. This keeps auth and coordinator teardown
+// non-blocking while preserving audio-before-revocation ordering.
+func (m *Manager) RevokeStaged(id [16]byte, userID int64) (RevocationCleanup, error) {
+	m.mu.Lock()
+	sess, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, ErrSessionNotFound
+	}
+	if sess.UserID != userID {
+		m.mu.Unlock()
+		return nil, ErrSessionNotOwned
+	}
+	nowMS := m.nowMillis()
+	sess.mu.Lock()
+	active := !sess.expiredLocked(nowMS)
+	sess.deactivateLocked()
+	sess.mu.Unlock()
+	m.deleteLocked(id, userID)
+	handler := m.onRevoke
+	m.mu.Unlock()
+	cleanup := RevocationCleanup(func() {
+		runRevocation(revocationWork{session: sess, reason: RevocationRevoked, handler: handler, notify: active})
+	})
+	if !active {
+		return cleanup, ErrSessionNotFound
+	}
+	return cleanup, nil
 }
 
 // Purge is the only full-table scan entry point. It deletes every expired

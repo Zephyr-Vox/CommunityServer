@@ -110,6 +110,52 @@ func (a *ConnectionAuthenticator) UpdateLease(ctx context.Context, accessToken s
 	return a.validate(ctx, claims, ConnectionReserve(update))
 }
 
+// RevalidateCurrent confirms that an already-admitted control connection still
+// belongs to a current, unbanned principal with a live login session. Queued WS
+// commands call it at dequeue time under the same principal read barrier used
+// for handshake authentication, so a concurrent revoke either precedes the
+// command or waits until it has completed.
+func (a *ConnectionAuthenticator) RevalidateCurrent(ctx context.Context, userID, loginSessionID int64) error {
+	release, err := a.AcquireCurrent(ctx, userID, loginSessionID)
+	if err != nil {
+		return err
+	}
+	release()
+	return nil
+}
+
+// AcquireCurrent acquires the principal read barrier, revalidates the account
+// and login session under it, and returns the barrier release function. The
+// realtime sequencer holds the result through StatePublication.
+func (a *ConnectionAuthenticator) AcquireCurrent(ctx context.Context, userID, loginSessionID int64) (func(), error) {
+	if a == nil || a.principals == nil || a.sessions == nil || a.now == nil || userID <= 0 || loginSessionID <= 0 {
+		return nil, ErrInvalidConnectionAuthenticator
+	}
+	release := a.principals.locks.rLock(userID)
+	snapshot, err := a.principals.GetUnderBarrier(ctx, userID)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	if snapshot.Banned {
+		release()
+		return nil, ErrUserBanned
+	}
+	session, err := a.sessions.GetByID(ctx, loginSessionID)
+	if err != nil {
+		release()
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, ErrLoginSessionInvalid
+		}
+		return nil, err
+	}
+	if session.UserID != userID || session.ExpiresAt <= a.now() {
+		release()
+		return nil, ErrLoginSessionInvalid
+	}
+	return release, nil
+}
+
 // validate resolves the mutable account and session state while holding the
 // user's read barrier, then invokes action before any concurrent write mutation
 // can revoke the authentication result.

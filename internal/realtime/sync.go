@@ -3,6 +3,7 @@ package realtime
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -63,11 +64,11 @@ type SnapshotServer struct {
 
 // SnapshotSelf is the recipient's own account, role and runtime projection.
 type SnapshotSelf struct {
-	User              SnapshotUser     `json:"user"`
-	ServerRoleKeys    []string         `json:"server_role_keys"`
-	ServerPermissions []string         `json:"server_permissions"`
-	Presence          SnapshotPresence `json:"presence"`
-	VoiceAuthority    json.RawMessage  `json:"voice_authority"`
+	User              SnapshotUser            `json:"user"`
+	ServerRoleKeys    []string                `json:"server_role_keys"`
+	ServerPermissions []string                `json:"server_permissions"`
+	Presence          SnapshotPresence        `json:"presence"`
+	VoiceAuthority    *SnapshotVoiceAuthority `json:"voice_authority"`
 }
 
 // SnapshotUser is one credential-free user identity.
@@ -96,7 +97,7 @@ type SnapshotUserPresence struct {
 type SnapshotRole struct {
 	Key         string `json:"key"`
 	DisplayName string `json:"display_name"`
-	Rank        string `json:"rank"`
+	Rank        int64  `json:"rank"`
 	Builtin     bool   `json:"builtin"`
 }
 
@@ -104,7 +105,7 @@ type SnapshotRole struct {
 type SnapshotGroup struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
-	Position   string `json:"position"`
+	Position   int64  `json:"position"`
 	Visibility string `json:"visibility"`
 	Version    string `json:"version"`
 }
@@ -117,8 +118,8 @@ type SnapshotChannel struct {
 	Mode       string  `json:"mode"`
 	Temporary  bool    `json:"temporary"`
 	Visibility string  `json:"visibility"`
-	Capacity   string  `json:"capacity"`
-	Position   string  `json:"position"`
+	Capacity   int64   `json:"capacity"`
+	Position   int64   `json:"position"`
 	Pinned     bool    `json:"pinned"`
 	Version    string  `json:"version"`
 }
@@ -129,6 +130,16 @@ type SnapshotVoiceMembership struct {
 	UserID    string `json:"user_id"`
 	ChannelID string `json:"channel_id"`
 	JoinedAt  int64  `json:"joined_at"`
+}
+
+// SnapshotVoiceAuthority is the recipient-owned complete authority tuple. IDs
+// and generations use decimal strings because they are snowflake/protocol
+// identifiers, while joined_at remains a Unix-millisecond number.
+type SnapshotVoiceAuthority struct {
+	ChannelID                string `json:"channel_id"`
+	ControlConnectionID      string `json:"control_connection_id"`
+	VoiceSessionID           string `json:"voice_session_id"`
+	VoiceAuthorityGeneration string `json:"voice_authority_generation"`
 }
 
 // SyncHello reports whether a hello requires a replacement HTTP snapshot. A
@@ -350,7 +361,7 @@ func (s *FullSnapshotSyncStrategy) replayFrames(userID int64, version *StateVers
 		if !eventVisibleTo(userID, event, version, s.visibility) {
 			continue
 		}
-		cursor, err := s.signer.Issue(userID, Checkpoint{StreamEpoch: version.Checkpoint().StreamEpoch, GEID: event.GEID}, version.VisibilityEpoch(userID))
+		cursor, err := s.signer.Issue(userID, Checkpoint{StreamEpoch: version.Checkpoint().StreamEpoch, GEID: event.GEID}, cursorEpochForEvent(event, userID, version))
 		if err != nil {
 			return nil, err
 		}
@@ -469,7 +480,7 @@ func snapshotStateFor(userID int64, version *StateVersion, visibility *Visibilit
 		Self: SnapshotSelf{
 			User:           snapshotUser(selfUser),
 			Presence:       snapshotPresenceFor(userID, userID, version),
-			VoiceAuthority: json.RawMessage("null"),
+			VoiceAuthority: snapshotVoiceAuthorityFor(userID, version),
 		},
 		VoiceMemberships: []SnapshotVoiceMembership{},
 	}
@@ -484,14 +495,18 @@ func snapshotStateFor(userID int64, version *StateVersion, visibility *Visibilit
 		state.Users = append(state.Users, snapshotUserPresenceFor(userID, user.ID, version))
 	}
 	for _, role := range version.Roles() {
-		state.Roles = append(state.Roles, SnapshotRole{Key: role.Key, DisplayName: role.DisplayName, Rank: strconv.FormatInt(role.Rank, 10), Builtin: role.Builtin})
+		state.Roles = append(state.Roles, SnapshotRole{Key: role.Key, DisplayName: role.DisplayName, Rank: role.Rank, Builtin: role.Builtin})
 	}
-	for _, group := range version.Groups() {
+	groups := version.Groups()
+	sort.Slice(groups, func(i, j int) bool { return groups[i].ID < groups[j].ID })
+	for _, group := range groups {
 		if visibility.CanSeeGroup(userID, group.ID, version) {
-			state.Groups = append(state.Groups, SnapshotGroup{ID: strconv.FormatInt(group.ID, 10), Name: group.Name, Position: strconv.FormatInt(group.Position, 10), Visibility: group.Visibility, Version: strconv.FormatInt(group.Version, 10)})
+			state.Groups = append(state.Groups, SnapshotGroup{ID: strconv.FormatInt(group.ID, 10), Name: group.Name, Position: group.Position, Visibility: group.Visibility, Version: strconv.FormatInt(group.Version, 10)})
 		}
 	}
-	for _, channel := range version.Channels() {
+	channels := version.Channels()
+	sort.Slice(channels, func(i, j int) bool { return channels[i].ID < channels[j].ID })
+	for _, channel := range channels {
 		if !visibility.CanAccessChannel(userID, channel.ID, version) {
 			continue
 		}
@@ -500,9 +515,28 @@ func snapshotStateFor(userID int64, version *StateVersion, visibility *Visibilit
 			id := strconv.FormatInt(*channel.GroupID, 10)
 			groupID = &id
 		}
-		state.Channels = append(state.Channels, SnapshotChannel{ID: strconv.FormatInt(channel.ID, 10), GroupID: groupID, Name: channel.Name, Mode: channel.Mode, Temporary: channel.Temporary, Visibility: channel.Visibility, Capacity: strconv.FormatInt(channel.Capacity, 10), Position: strconv.FormatInt(channel.Position, 10), Pinned: channel.Pinned, Version: strconv.FormatInt(channel.Version, 10)})
+		state.Channels = append(state.Channels, SnapshotChannel{ID: strconv.FormatInt(channel.ID, 10), GroupID: groupID, Name: channel.Name, Mode: channel.Mode, Temporary: channel.Temporary, Visibility: channel.Visibility, Capacity: channel.Capacity, Position: channel.Position, Pinned: channel.Pinned, Version: strconv.FormatInt(channel.Version, 10)})
+	}
+	for _, authority := range version.VoiceAuthorities() {
+		if visibility.CanAccessChannel(userID, authority.ChannelID, version) {
+			state.VoiceMemberships = append(state.VoiceMemberships, SnapshotVoiceMembership{UserID: strconv.FormatInt(authority.UserID, 10), ChannelID: strconv.FormatInt(authority.ChannelID, 10), JoinedAt: authority.JoinedAt})
+		}
 	}
 	return state
+}
+
+// snapshotVoiceAuthorityFor projects the recipient's own authoritative binding.
+func snapshotVoiceAuthorityFor(userID int64, version *StateVersion) *SnapshotVoiceAuthority {
+	authority, ok := version.VoiceAuthority(userID)
+	if !ok {
+		return nil
+	}
+	return &SnapshotVoiceAuthority{
+		ChannelID:                strconv.FormatInt(authority.ChannelID, 10),
+		ControlConnectionID:      fmt.Sprintf("%x", authority.ControlConnectionID),
+		VoiceSessionID:           fmt.Sprintf("%x", authority.VoiceSessionID),
+		VoiceAuthorityGeneration: strconv.FormatUint(authority.VoiceAuthorityGeneration, 10),
+	}
 }
 
 // SnapshotUserPresenceFor exposes the canonical privacy projection used by
@@ -523,18 +557,28 @@ func SnapshotSelfFor(userID int64, version *StateVersion) SnapshotSelf {
 // and private activity remain visible only to the subject itself.
 func snapshotUserPresenceFor(recipientID, subjectID int64, version *StateVersion) SnapshotUserPresence {
 	user, _ := version.User(subjectID)
+	return snapshotUserPresenceFromState(recipientID, eventSubjectState{user: user, presence: version.Presence(subjectID)})
+}
+
+// snapshotUserPresenceFromState projects one compact event-time subject state
+// without retaining the complete StateVersion in the replay ring.
+func snapshotUserPresenceFromState(recipientID int64, state eventSubjectState) SnapshotUserPresence {
 	return SnapshotUserPresence{
-		UserID:   strconv.FormatInt(user.ID, 10),
-		Nickname: user.Nickname,
-		Avatar:   user.Avatar,
-		Presence: snapshotPresenceFor(recipientID, subjectID, version),
+		UserID:   strconv.FormatInt(state.user.ID, 10),
+		Nickname: state.user.Nickname,
+		Avatar:   cloneString(state.user.Avatar),
+		Presence: snapshotPresenceValue(recipientID, state.user.ID, state.presence),
 	}
 }
 
 // snapshotPresenceFor converts one runtime presence value to its privacy-safe
 // wire projection for recipientID.
 func snapshotPresenceFor(recipientID, subjectID int64, version *StateVersion) SnapshotPresence {
-	presence := version.Presence(subjectID)
+	return snapshotPresenceValue(recipientID, subjectID, version.Presence(subjectID))
+}
+
+// snapshotPresenceValue applies privacy to one immutable presence value.
+func snapshotPresenceValue(recipientID, subjectID int64, presence Presence) SnapshotPresence {
 	if recipientID != subjectID && presence.Status == "invisible" {
 		return SnapshotPresence{Status: "offline"}
 	}
@@ -583,9 +627,15 @@ func snapshotServerPermissions(roleKeys []string, version *StateVersion) []strin
 func encodeEventForRecipient(event StateEvent, recipientID int64, version *StateVersion, cursor string) ([]byte, error) {
 	data := event.Data
 	if event.SubjectUserID > 0 && (event.EventType == "user.created" || event.EventType == "user.updated" || event.EventType == "presence.updated") {
+		var projectedUser SnapshotUserPresence
+		if event.subjectState != nil {
+			projectedUser = snapshotUserPresenceFromState(recipientID, *event.subjectState)
+		} else {
+			projectedUser = SnapshotUserPresenceFor(recipientID, event.SubjectUserID, version)
+		}
 		projected, err := json.Marshal(struct {
 			User SnapshotUserPresence `json:"user"`
-		}{User: SnapshotUserPresenceFor(recipientID, event.SubjectUserID, version)})
+		}{User: projectedUser})
 		if err != nil {
 			return nil, err
 		}
@@ -623,7 +673,7 @@ func eventsAfterCapture(events []StateEvent, highWater, geid uint64) ([]StateEve
 
 // eventVisibleTo applies the same immutable resolver used by snapshots.
 func eventVisibleTo(userID int64, event StateEvent, version *StateVersion, visibility *VisibilityResolver) bool {
-	if event.DeliveryPolicy == StateDeliveryDirectTransition {
+	if event.DeliveryPolicy == StateDeliveryDirectTransition || event.DeliveryPolicy == StateDeliveryUserTargeted {
 		return event.RecipientUserID == userID
 	}
 	switch event.Scope.Type {

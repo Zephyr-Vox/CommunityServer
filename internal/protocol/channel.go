@@ -24,6 +24,7 @@ var (
 // any channel flag set are dropped regardless of this field.
 type Capabilities struct {
 	Name         string
+	MuteKind     string
 	Fragmentable bool
 }
 
@@ -79,6 +80,22 @@ func (r *ChannelTypeRegistry) Lookup(channelType uint8) (Capabilities, bool) {
 	defer r.mu.RUnlock()
 	caps, ok := r.channels[channelType]
 	return caps, ok
+}
+
+// Snapshot returns every registered business stream in ascending channel-type
+// order. The returned map is independent from the registry and remains stable
+// after Seal, allowing application metadata to share the transport authority.
+func (r *ChannelTypeRegistry) Snapshot() map[uint8]Capabilities {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make(map[uint8]Capabilities, len(r.channels))
+	for channelType, capabilities := range r.channels {
+		result[channelType] = capabilities
+	}
+	return result
 }
 
 // Seal makes the registry read-only. The UDP server calls it exactly once

@@ -68,7 +68,19 @@ type StateEvent struct {
 	SubjectUserID            int64
 	CursorVisibilityEpoch    uint64
 	HasCursorVisibilityEpoch bool
+	cursorVisibilityEpochs   []cursorVisibilityEpoch
+	subjectState             *eventSubjectState
 	encoded                  []byte
+}
+
+type cursorVisibilityEpoch struct {
+	userID int64
+	epoch  uint64
+}
+
+type eventSubjectState struct {
+	user     User
+	presence Presence
 }
 
 // Encoded returns the canonical recipient-independent JSON event body. The
@@ -107,6 +119,23 @@ func (e StateEvent) EncodedWithDataAndCursor(data json.RawMessage, cursor string
 // Size returns the byte count used by e in the state ring.
 func (e StateEvent) Size() int {
 	return len(e.encoded)
+}
+
+// retainedSize returns the complete bounded ring footprint attributable to e,
+// including compact recipient materialization metadata that is not serialized
+// in the recipient-independent event envelope.
+func (e StateEvent) retainedSize() int {
+	size := len(e.encoded) + len(e.cursorVisibilityEpochs)*16
+	if e.subjectState != nil {
+		size += 64 + len(e.subjectState.user.Username) + len(e.subjectState.user.Nickname)
+		if e.subjectState.user.Avatar != nil {
+			size += len(*e.subjectState.user.Avatar)
+		}
+		if activity := e.subjectState.presence.Activity; activity != nil {
+			size += len(activity.Type) + len(activity.Name) + len(activity.Privacy)
+		}
+	}
+	return size
 }
 
 // StateRing retains the newest contiguous replayable events within fixed entry
@@ -235,10 +264,10 @@ func (r *StateRing) appendLocked(events []StateEvent) error {
 	}
 	for _, event := range prepared {
 		r.events = append(r.events, event)
-		r.bytes += len(event.encoded)
+		r.bytes += event.retainedSize()
 		r.highWater = event.GEID
 		for len(r.events) > r.maxEvents || r.bytes > r.maxBytes {
-			r.bytes -= len(r.events[0].encoded)
+			r.bytes -= r.events[0].retainedSize()
 			r.events = r.events[1:]
 		}
 	}
@@ -259,6 +288,9 @@ func (r *StateRing) validateAppendLocked(events []StateEvent) ([]StateEvent, err
 			return nil, err
 		}
 		if len(normalized.encoded) > maxStateEventRingBytes || len(normalized.encoded) > r.maxBytes {
+			return nil, ErrStateEventTooLarge
+		}
+		if normalized.retainedSize() > r.maxBytes {
 			return nil, ErrStateEventTooLarge
 		}
 		prepared[i] = normalized
@@ -292,10 +324,13 @@ func normalizeStateEvent(event StateEvent) (StateEvent, error) {
 	if event.GEID == 0 || event.EventType == "" || !event.Scope.Valid() || event.CausationID < 0 {
 		return StateEvent{}, ErrInvalidStateEvent
 	}
-	if event.DeliveryPolicy != 0 && event.DeliveryPolicy != StateDeliveryVisibleAfter && event.DeliveryPolicy != StateDeliveryDirectTransition {
+	if event.DeliveryPolicy != 0 && event.DeliveryPolicy != StateDeliveryVisibleAfter && event.DeliveryPolicy != StateDeliveryDirectTransition && event.DeliveryPolicy != StateDeliveryUserTargeted {
 		return StateEvent{}, ErrInvalidStateEvent
 	}
-	if event.DeliveryPolicy == StateDeliveryDirectTransition && event.RecipientUserID <= 0 {
+	if (event.DeliveryPolicy == StateDeliveryDirectTransition || event.DeliveryPolicy == StateDeliveryUserTargeted) && event.RecipientUserID <= 0 {
+		return StateEvent{}, ErrInvalidStateEvent
+	}
+	if event.DeliveryPolicy == StateDeliveryDirectTransition && !isVisibilityTransitionEvent(event.EventType) {
 		return StateEvent{}, ErrInvalidStateEvent
 	}
 	if event.SubjectUserID < 0 {
@@ -395,6 +430,13 @@ func cloneStateEvents(events []StateEvent) []StateEvent {
 	for i, event := range events {
 		cloned[i] = event
 		cloned[i].Data = append(json.RawMessage(nil), event.Data...)
+		cloned[i].cursorVisibilityEpochs = append([]cursorVisibilityEpoch(nil), event.cursorVisibilityEpochs...)
+		if event.subjectState != nil {
+			state := *event.subjectState
+			state.user = cloneUser(state.user)
+			state.presence = clonePresence(state.presence)
+			cloned[i].subjectState = &state
+		}
 		cloned[i].encoded = append([]byte(nil), event.encoded...)
 	}
 	return cloned

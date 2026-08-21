@@ -43,12 +43,41 @@ func (v *voiceRuntime) Start(ctx context.Context, host string, port int, supervi
 		return fmt.Errorf("server: start voice: %w", err)
 	}
 	v.stopPurge = v.server.StartPurge(protocol.PurgeInterval)
+	v.fatal = supervisor.Fatal
 	v.started = true
 	v.closeMu.Unlock()
 
 	// UDPServer owns PacketConn after Start. Its non-close return is fatal; the
 	// supervisor cancels the process root and owns the subsequent stop sequence.
 	supervisor.Go("udp read", func(context.Context) error { return <-errCh })
+	supervisor.Go("udp revocation", func(ctx context.Context) error {
+		for {
+			select {
+			case cleanup := <-v.revocations:
+				if cleanup != nil {
+					cleanup()
+				}
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	})
+	supervisor.Go("udp expiry cleanup", func(ctx context.Context) error {
+		for {
+			select {
+			case expiry := <-v.expiries:
+				authority, ok := v.connections.VoiceAuthority(expiry.userID)
+				if !ok || authority.VoiceSessionID != expiry.sessionID {
+					continue
+				}
+				if _, _, err := v.connections.BeginVoiceDisconnectReason(authority, nil, "udp_timeout"); err != nil {
+					return err
+				}
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	})
 	return nil
 }
 

@@ -350,9 +350,19 @@ func (p *StatePublication) reserveLocked(request PublicationRequest) (Publicatio
 	if err != nil {
 		return PublicationResult{}, err
 	}
-	events, err := p.materializeEvents(templates, before.checkpoint.GEID)
+	events, err := p.materializeEvents(templates, before.checkpoint.GEID, after)
 	if err != nil {
 		return PublicationResult{}, err
+	}
+	overrides := make([]cursorVisibilityEpoch, 0, len(changes))
+	for _, userID := range sortedIntKeys(changes) {
+		overrides = append(overrides, cursorVisibilityEpoch{userID: userID, epoch: before.VisibilityEpoch(userID)})
+	}
+	for index := range events {
+		if events[index].HasCursorVisibilityEpoch || len(changes) == 0 {
+			continue
+		}
+		events[index].cursorVisibilityEpochs = overrides
 	}
 	// Nothing outside this lock can observe after until the ring has accepted all
 	// event refs. The candidate itself is unpublished, so updating its runtime
@@ -527,16 +537,36 @@ func visibilityFragmentPayloads(userID int64, scope Scope, version *StateVersion
 				childIDs = append(childIDs, channel.ID)
 			}
 		}
+		// Fragment replace semantics require the stable snapshot ordering: the
+		// display accessor sorts by position, so re-sort by numeric ID here.
+		sort.Slice(childIDs, func(i, j int) bool { return childIDs[i] < childIDs[j] })
 		return splitGroupFragment(group, childIDs)
 	case "channel":
 		for _, channel := range state.Channels {
 			if channel.ID != fmt.Sprint(scope.ID) {
 				continue
 			}
+			var parent *SnapshotGroup
+			if channel.GroupID != nil {
+				for _, group := range state.Groups {
+					if group.ID == *channel.GroupID {
+						copy := group
+						parent = &copy
+						break
+					}
+				}
+			}
+			members := make([]SnapshotVoiceMembership, 0)
+			for _, membership := range state.VoiceMemberships {
+				if membership.ChannelID == channel.ID {
+					members = append(members, membership)
+				}
+			}
 			data, err := json.Marshal(struct {
-				Channel SnapshotChannel           `json:"channel"`
-				Members []SnapshotVoiceMembership `json:"members"`
-			}{Channel: channel, Members: []SnapshotVoiceMembership{}})
+				ParentShell *SnapshotGroup            `json:"parent_shell,omitempty"`
+				Channel     SnapshotChannel           `json:"channel"`
+				Members     []SnapshotVoiceMembership `json:"members"`
+			}{ParentShell: parent, Channel: channel, Members: members})
 			if err != nil || len(data) > maxVisibilityFragmentBytes {
 				return nil, ErrStateEventTooLarge
 			}
@@ -635,13 +665,18 @@ func (p *StatePublication) visibilityChanges(before, after *StateVersion, userID
 // materializeEvents assigns publication-owned GEIDs and one event timestamp to
 // each event in request. The all-or-nothing result is validated before ring
 // mutation, so invalid event data cannot consume a GEID.
-func (p *StatePublication) materializeEvents(templates []StateEventTemplate, baseGEID uint64) ([]StateEvent, error) {
+func (p *StatePublication) materializeEvents(templates []StateEventTemplate, baseGEID uint64, version *StateVersion) ([]StateEvent, error) {
 	events := make([]StateEvent, len(templates))
 	serverTime := p.now()
 	for i, template := range templates {
 		event, err := stateEventFromTemplate(template, baseGEID+uint64(i)+1, serverTime)
 		if err != nil {
 			return nil, err
+		}
+		if template.SubjectUserID > 0 {
+			if user, ok := version.User(template.SubjectUserID); ok {
+				event.subjectState = &eventSubjectState{user: user, presence: version.Presence(template.SubjectUserID)}
+			}
 		}
 		events[i] = event
 	}

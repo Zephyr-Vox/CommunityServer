@@ -51,6 +51,7 @@ type Service struct {
 	stores     *store.Stores
 	principals PrincipalMutations
 	publisher  StateChangePublisher
+	gate       MutationGate
 }
 
 // StateChange identifies a committed RBAC mutation requiring an immutable
@@ -67,6 +68,13 @@ type StateChange struct {
 // may leave it unset.
 type StateChangePublisher func(context.Context, StateChange) error
 
+// MutationGate serializes one persistent RBAC transaction with its following
+// StateStore publication. Server assembly shares this gate with every domain
+// that changes the persistent realtime projection.
+type MutationGate interface {
+	Acquire(context.Context) (func(), error)
+}
+
 // NewService returns a Service backed by stores and principal cache barriers.
 func NewService(stores *store.Stores, principals PrincipalMutations) *Service {
 	return &Service{stores: stores, principals: principals}
@@ -76,6 +84,9 @@ func NewService(stores *store.Stores, principals PrincipalMutations) *Service {
 func (s *Service) SetStateChangePublisher(publisher StateChangePublisher) {
 	s.publisher = publisher
 }
+
+// SetStateMutationGate installs the process-wide persistent mutation gate.
+func (s *Service) SetStateMutationGate(gate MutationGate) { s.gate = gate }
 
 // BindingInput identifies the target user, role and one exact binding scope.
 type BindingInput struct {
@@ -103,6 +114,11 @@ func (s *Service) CreateRole(ctx context.Context, actorID int64, key, displayNam
 	}
 	unlock := s.principals.LockMutation(actorID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	tx, err := s.stores.BeginTx(ctx)
 	if err != nil {
 		return nil, err
@@ -137,6 +153,11 @@ func (s *Service) CreateRole(ctx context.Context, actorID int64, key, displayNam
 func (s *Service) UpdateRole(ctx context.Context, actorID int64, key string, displayName *string, rank *int64) (*db.Role, error) {
 	unlock := s.principals.LockMutation(actorID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	tx, err := s.stores.BeginTx(ctx)
 	if err != nil {
 		return nil, err
@@ -193,6 +214,11 @@ func (s *Service) UpdateRole(ctx context.Context, actorID int64, key string, dis
 func (s *Service) DeleteRole(ctx context.Context, actorID int64, key string) error {
 	unlock := s.principals.LockMutation(actorID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return err
+	}
+	defer release()
 	tx, err := s.stores.BeginTx(ctx)
 	if err != nil {
 		return err
@@ -265,6 +291,11 @@ func (s *Service) CreateBinding(ctx context.Context, actorID int64, input Bindin
 
 	unlock := s.principals.LockMutation(actorID, input.UserID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
 	tx, err := s.stores.BeginTx(ctx)
 	if err != nil {
 		return nil, false, err
@@ -326,6 +357,11 @@ func (s *Service) DeleteBinding(ctx context.Context, actorID, bindingID int64) e
 	}
 	unlock := s.principals.LockMutation(actorID, binding.UserID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return err
+	}
+	defer release()
 	tx, err := s.stores.BeginTx(ctx)
 	if err != nil {
 		return err
@@ -375,6 +411,11 @@ func (s *Service) DeleteBinding(ctx context.Context, actorID, bindingID int64) e
 func (s *Service) TransferOwner(ctx context.Context, currentUserID, targetUserID int64) error {
 	unlock := s.principals.LockMutation(currentUserID, targetUserID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := s.stores.TransferOwner(ctx, currentUserID, targetUserID); err != nil {
 		return err
 	}
@@ -398,6 +439,11 @@ func (s *Service) UpdateConfig(ctx context.Context, actorID int64, input ConfigI
 	}
 	unlock := s.principals.LockMutation(actorID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	tx, err := s.stores.BeginTx(ctx)
 	if err != nil {
 		return nil, err
@@ -445,6 +491,11 @@ func (s *Service) UpdateConfig(ctx context.Context, actorID int64, input ConfigI
 func (s *Service) ResetConfig(ctx context.Context, actorID int64, scope store.ConfigScope) (*store.EffectiveConfig, error) {
 	unlock := s.principals.LockMutation(actorID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	tx, err := s.stores.BeginTx(ctx)
 	if err != nil {
 		return nil, err
@@ -632,6 +683,14 @@ func (s *Service) publish(ctx context.Context, change StateChange) error {
 		return nil
 	}
 	return s.publisher(ctx, change)
+}
+
+// acquireMutation returns a no-op release for standalone RBAC service tests.
+func acquireMutation(ctx context.Context, gate MutationGate) (func(), error) {
+	if gate == nil {
+		return func() {}, nil
+	}
+	return gate.Acquire(ctx)
 }
 
 // checkBindingAuthority validates actor, target and granted-role ordering

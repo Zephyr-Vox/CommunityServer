@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"zephyr.vox/server/ce/internal/snowflake"
 )
@@ -15,6 +16,10 @@ const (
 	MaxSequencerQueueItems = 1024
 	// MaxSequencerQueueBytes is the fixed ordinary-command admission byte limit.
 	MaxSequencerQueueBytes = 4 << 20
+	// MaxControlTeardownQueueItems reserves lifecycle cleanup capacity that
+	// ordinary client commands can never consume.
+	MaxControlTeardownQueueItems = 1024
+	MaxControlPlansPerItem       = 64
 )
 
 var (
@@ -45,7 +50,15 @@ var (
 // a runtime-only candidate ready for its cancellable publication point.
 type PostCommitCommand struct {
 	QueueBytes int
-	Execute    func(context.Context, int64, *CommandExecution) (CommandOutput, error)
+	// CommandID supplies an already-durable command ID for the rare mutation
+	// whose response result was persisted before its state publication. Zero
+	// allocates the next process ID at dequeue as usual.
+	CommandID int64
+	// Acquire obtains command-scoped barriers at dequeue time and returns their
+	// release function. The sequencer retains them through StatePublication so
+	// auth and principal mutations cannot interleave after revalidation.
+	Acquire func(context.Context) (release func(), err error)
+	Execute func(context.Context, int64, *CommandExecution) (CommandOutput, error)
 }
 
 // CommandOutput is command-owned result data for the HTTP or WS adapter and is
@@ -199,13 +212,16 @@ type PostCommitSequencer struct {
 	onFatal     func(error)
 
 	commands chan *queuedCommand
+	controls chan *controlBatch
 	done     chan struct{}
+	progress chan struct{}
 
-	mu          sync.Mutex
-	accepting   bool
-	closed      bool
-	failure     error
-	queuedBytes int
+	mu           sync.Mutex
+	accepting    bool
+	closed       bool
+	failure      error
+	queuedBytes  int
+	controlBytes int
 }
 
 // queuedCommand holds one admitted command and its one buffered completion.
@@ -213,6 +229,11 @@ type queuedCommand struct {
 	ctx        context.Context
 	command    PostCommitCommand
 	completion chan commandReply
+}
+
+type controlBatch struct {
+	commands []*queuedCommand
+	bytes    int
 }
 
 // commandReply publishes a command outcome without blocking the worker when a
@@ -235,19 +256,63 @@ func NewPostCommitSequencer(publication *StatePublication, idGen *snowflake.IDGe
 		idGen:       idGen,
 		onFatal:     onFatal,
 		commands:    make(chan *queuedCommand, MaxSequencerQueueItems),
+		controls:    make(chan *controlBatch, MaxControlTeardownQueueItems),
 		done:        make(chan struct{}),
+		progress:    make(chan struct{}, 1),
 		accepting:   true,
 	}
 	go sequencer.run()
 	return sequencer, nil
 }
 
+// SubmitControl admits a lifecycle teardown command to the dedicated reserve.
+// It has the same completion semantics as Submit but ordinary client work cannot
+// consume its item or byte capacity.
+func (s *PostCommitSequencer) SubmitControl(ctx context.Context, command PostCommitCommand) (CommandCompletion, error) {
+	completions, err := s.SubmitControlBatch(ctx, []PostCommitCommand{command})
+	if err != nil {
+		return CommandCompletion{}, err
+	}
+	return completions[0], nil
+}
+
+// SubmitControlBatch admits up to MaxControlPlansPerItem lifecycle commands as
+// one reserved control item. The commands still publish independently and
+// therefore retain their own command IDs, candidates and completion results,
+// while teardown admission remains bounded at the item level.
+func (s *PostCommitSequencer) SubmitControlBatch(ctx context.Context, commands []PostCommitCommand) ([]CommandCompletion, error) {
+	if ctx == nil || len(commands) == 0 || len(commands) > MaxControlPlansPerItem {
+		return nil, ErrInvalidSequencer
+	}
+	pending := make([]*queuedCommand, len(commands))
+	totalBytes := 0
+	for index, command := range commands {
+		if command.Execute == nil || command.QueueBytes <= 0 || command.QueueBytes > MaxSequencerQueueBytes || command.CommandID < 0 {
+			return nil, ErrInvalidSequencer
+		}
+		pending[index] = &queuedCommand{ctx: ctx, command: command, completion: make(chan commandReply, 1)}
+		totalBytes += command.QueueBytes
+	}
+	if err := s.enqueueControl(&controlBatch{commands: pending, bytes: totalBytes}); err != nil {
+		return nil, err
+	}
+	completions := make([]CommandCompletion, len(pending))
+	for index, command := range pending {
+		reply := <-command.completion
+		if reply.err != nil {
+			return nil, reply.err
+		}
+		completions[index] = reply.completion
+	}
+	return completions, nil
+}
+
 // Submit admits command when both ordinary queue limits permit and waits for
-// its ordered completion. A canceled context before a runtime publication
-// aborts that candidate; cancellation after a persistent commit or successful
-// runtime publication cannot roll back the command.
+// its ordered completion. Once admitted, only the worker decides whether
+// cancellation happened before its commit point; callers always receive the
+// terminal completion needed to reconcile a durable or runtime publication.
 func (s *PostCommitSequencer) Submit(ctx context.Context, command PostCommitCommand) (CommandCompletion, error) {
-	if ctx == nil || command.Execute == nil || command.QueueBytes <= 0 || command.QueueBytes > MaxSequencerQueueBytes {
+	if ctx == nil || command.Execute == nil || command.QueueBytes <= 0 || command.QueueBytes > MaxSequencerQueueBytes || command.CommandID < 0 {
 		return CommandCompletion{}, ErrInvalidSequencer
 	}
 	pending := &queuedCommand{
@@ -258,12 +323,8 @@ func (s *PostCommitSequencer) Submit(ctx context.Context, command PostCommitComm
 	if err := s.enqueue(pending); err != nil {
 		return CommandCompletion{}, err
 	}
-	select {
-	case reply := <-pending.completion:
-		return reply.completion, reply.err
-	case <-ctx.Done():
-		return CommandCompletion{}, ctx.Err()
-	}
+	reply := <-pending.completion
+	return reply.completion, reply.err
 }
 
 // Close stops ordinary admission, drains commands already accepted, and waits
@@ -279,6 +340,7 @@ func (s *PostCommitSequencer) Close(ctx context.Context) error {
 	if !s.closed {
 		s.closed = true
 		close(s.commands)
+		close(s.controls)
 	}
 	s.mu.Unlock()
 	select {
@@ -288,6 +350,10 @@ func (s *PostCommitSequencer) Close(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+// Fail escalates an unrecoverable lifecycle-control failure through the same
+// supervisor callback used for post-commit publication failures.
+func (s *PostCommitSequencer) Fail(err error) { s.fail(err) }
 
 // QueueDepth returns the admitted commands waiting behind the current worker.
 func (s *PostCommitSequencer) QueueDepth() int {
@@ -299,6 +365,38 @@ func (s *PostCommitSequencer) QueuedBytes() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.queuedBytes
+}
+
+// Done closes after the sequencer worker has drained or failed. Process
+// supervision uses it to keep database teardown behind every command that can
+// still access the persistent projection.
+func (s *PostCommitSequencer) Done() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.done
+}
+
+// Failure returns the terminal sequencer failure, if any. A nil result after
+// Done is only a normal shutdown when the owning supervisor is already
+// stopping; an unexpected clean exit is handled by the supervisor wrapper.
+func (s *PostCommitSequencer) Failure() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failure
+}
+
+// Progress emits coalesced idle/command-completion heartbeats. A silent
+// channel while the worker is alive means execution has stalled inside a
+// command or publication phase.
+func (s *PostCommitSequencer) Progress() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.progress
 }
 
 // enqueue reserves both limits before making pending visible to the worker.
@@ -325,21 +423,111 @@ func (s *PostCommitSequencer) enqueue(pending *queuedCommand) error {
 	}
 }
 
+// enqueueControl reserves the dedicated lifecycle queue before making work
+// visible. Control bytes share the same fixed cap but never consume ordinary
+// command capacity.
+func (s *PostCommitSequencer) enqueueControl(batch *controlBatch) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.accepting {
+		if s.failure != nil {
+			return s.failure
+		}
+		return ErrSequencerClosed
+	}
+	if s.controlBytes+batch.bytes > MaxSequencerQueueBytes {
+		return ErrCommandQueueFull
+	}
+	select {
+	case s.controls <- batch:
+		s.controlBytes += batch.bytes
+		return nil
+	default:
+		return ErrCommandQueueFull
+	}
+}
+
 // run processes one command at a time. Dequeue releases admission capacity
 // before user code runs so a blocked database command cannot monopolize the
 // bounded waiting queue.
 func (s *PostCommitSequencer) run() {
 	defer close(s.done)
-	for pending := range s.commands {
-		s.mu.Lock()
-		s.queuedBytes -= pending.command.QueueBytes
-		s.mu.Unlock()
-		if failure := s.failed(); failure != nil {
-			pending.completion <- commandReply{err: failure}
+	defer close(s.progress)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	commands := s.commands
+	controls := s.controls
+	for commands != nil || controls != nil {
+		var pending *queuedCommand
+		var fromControl bool
+		var batch *controlBatch
+		select {
+		case <-ticker.C:
+			s.signalProgress()
+			continue
+		case batch = <-controls:
+			fromControl = true
+			if batch == nil {
+				controls = nil
+				continue
+			}
+		case pending = <-commands:
+			if pending == nil {
+				commands = nil
+				continue
+			}
+		default:
+			select {
+			case <-ticker.C:
+				s.signalProgress()
+				continue
+			case batch = <-controls:
+				fromControl = true
+				if batch == nil {
+					controls = nil
+					continue
+				}
+			case pending = <-commands:
+				if pending == nil {
+					commands = nil
+					continue
+				}
+			}
+		}
+		if fromControl {
+			s.mu.Lock()
+			s.controlBytes -= batch.bytes
+			s.mu.Unlock()
+			for _, control := range batch.commands {
+				s.executeAndReply(control)
+			}
 			continue
 		}
-		completion, err := s.execute(pending)
-		pending.completion <- commandReply{completion: completion, err: err}
+		s.mu.Lock()
+		if !fromControl {
+			s.queuedBytes -= pending.command.QueueBytes
+		}
+		s.mu.Unlock()
+		s.executeAndReply(pending)
+	}
+}
+
+// executeAndReply runs one admitted command and never blocks the worker on an
+// unbuffered caller response.
+func (s *PostCommitSequencer) executeAndReply(pending *queuedCommand) {
+	if failure := s.failed(); failure != nil {
+		pending.completion <- commandReply{err: failure}
+		return
+	}
+	completion, err := s.execute(pending)
+	pending.completion <- commandReply{completion: completion, err: err}
+	s.signalProgress()
+}
+
+func (s *PostCommitSequencer) signalProgress() {
+	select {
+	case s.progress <- struct{}{}:
+	default:
 	}
 }
 
@@ -359,9 +547,23 @@ func (s *PostCommitSequencer) execute(pending *queuedCommand) (completion Comman
 	if err := pending.ctx.Err(); err != nil {
 		return CommandCompletion{}, err
 	}
-	commandID, err := s.idGen.Next()
-	if err != nil {
-		return CommandCompletion{}, err
+	if pending.command.Acquire != nil {
+		release, err := pending.command.Acquire(pending.ctx)
+		if err != nil {
+			return CommandCompletion{}, err
+		}
+		if release == nil {
+			return CommandCompletion{}, ErrInvalidSequencer
+		}
+		defer release()
+	}
+	commandID := pending.command.CommandID
+	if commandID == 0 {
+		var err error
+		commandID, err = s.idGen.Next()
+		if err != nil {
+			return CommandCompletion{}, err
+		}
 	}
 	execution.commandID = commandID
 	output, err := pending.command.Execute(pending.ctx, commandID, execution)
@@ -432,6 +634,7 @@ func (s *PostCommitSequencer) fail(err error) {
 	if !s.closed {
 		s.closed = true
 		close(s.commands)
+		close(s.controls)
 	}
 	s.mu.Unlock()
 	s.onFatal(err)

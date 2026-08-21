@@ -35,6 +35,7 @@ type AvatarService struct {
 	userLocks      *avatarUserLocks
 	afterMetadata  func()
 	publishState   func(context.Context, int64) error
+	gate           MutationGate
 }
 
 // SetStatePublisher installs the application callback invoked after avatar
@@ -43,6 +44,15 @@ type AvatarService struct {
 func (s *AvatarService) SetStatePublisher(publisher func(context.Context, int64) error) {
 	s.publishState = publisher
 }
+
+// MutationGate serializes avatar metadata writes with their following
+// persistent StateStore publication.
+type MutationGate interface {
+	Acquire(context.Context) (func(), error)
+}
+
+// SetStateMutationGate installs the process-wide persistent mutation gate.
+func (s *AvatarService) SetStateMutationGate(gate MutationGate) { s.gate = gate }
 
 var ErrTranscodeBusy = errors.New("image: transcode capacity exhausted")
 
@@ -157,6 +167,11 @@ func (s *AvatarService) upload(ctx context.Context, userID int64, src io.Reader,
 		return "", err
 	}
 
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	if _, err := s.users.SetAvatar(ctx, userID, &name); err != nil {
 		_ = s.objects.Delete(ctx, AvatarBucket, name) // best-effort: no orphan objects
 		return "", err
@@ -188,6 +203,11 @@ func (s *AvatarService) Reset(ctx context.Context, userID int64) error {
 		return err
 	}
 
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if _, err := s.users.SetAvatar(ctx, userID, nil); err != nil {
 		return err
 	}
@@ -209,4 +229,12 @@ func (s *AvatarService) Reset(ctx context.Context, userID int64) error {
 // callers treat the error as best-effort anyway.
 func (s *AvatarService) DeleteAvatar(ctx context.Context, name string) error {
 	return s.objects.Delete(ctx, AvatarBucket, name)
+}
+
+// acquireMutation returns a no-op release for standalone avatar tests.
+func acquireMutation(ctx context.Context, gate MutationGate) (func(), error) {
+	if gate == nil {
+		return func() {}, nil
+	}
+	return gate.Acquire(ctx)
 }

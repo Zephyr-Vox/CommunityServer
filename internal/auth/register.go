@@ -33,6 +33,7 @@ type RegisterService struct {
 	stores    *store.Stores
 	mode      RegistrationMode
 	publisher StateChangePublisher
+	gate      MutationGate
 }
 
 // SetStateChangePublisher installs the post-commit realtime projection bridge.
@@ -41,6 +42,9 @@ type RegisterService struct {
 func (s *RegisterService) SetStateChangePublisher(publisher StateChangePublisher) {
 	s.publisher = publisher
 }
+
+// SetStateMutationGate installs the process-wide persistent mutation gate.
+func (s *RegisterService) SetStateMutationGate(gate MutationGate) { s.gate = gate }
 
 // NewRegisterService returns a RegisterService.
 func NewRegisterService(stores *store.Stores, mode RegistrationMode) *RegisterService {
@@ -89,6 +93,11 @@ func (s *RegisterService) Register(ctx context.Context, username, password, nick
 	if err != nil {
 		return nil, err
 	}
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	// 3) Create the user, assign the server binding and consume the invite in one
 	//    transaction: either all three persist or none do. The invite is

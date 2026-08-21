@@ -590,7 +590,7 @@ func TestRunBindFailureDoesNotClaimReady(t *testing.T) {
 	}
 }
 
-func TestRunDoesNotBindVoiceBeforeChannelAuthorityExists(t *testing.T) {
+func TestRunFailsWhenVoicePortIsOccupied(t *testing.T) {
 	occupied, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatal(err)
@@ -606,16 +606,12 @@ func TestRunDoesNotBindVoiceBeforeChannelAuthorityExists(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer app.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- app.Run(ctx) }()
-	waitReady(t, http.DefaultClient, "http://127.0.0.1:"+strconv.Itoa(cfg.Server.HTTPPort))
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("Run with occupied UDP port = %v, want nil", err)
+	err = app.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run must fail when the voice port is already bound")
 	}
-	if !strings.Contains(buf.String(), "LINK START") {
-		t.Fatalf("server did not claim HTTP readiness: %q", buf.String())
+	if strings.Contains(buf.String(), "http listening") || strings.Contains(buf.String(), "LINK START") {
+		t.Fatalf("claimed readiness despite voice bind failure: %q", buf.String())
 	}
 }
 

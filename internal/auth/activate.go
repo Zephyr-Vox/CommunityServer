@@ -37,6 +37,7 @@ type ActivationManager struct {
 	codeHash  string
 	durable   *realtime.DurableActivationIdempotency
 	publisher StateChangePublisher
+	gate      MutationGate
 }
 
 // SetStateChangePublisher installs the post-commit realtime projection bridge
@@ -45,6 +46,9 @@ type ActivationManager struct {
 func (m *ActivationManager) SetStateChangePublisher(publisher StateChangePublisher) {
 	m.publisher = publisher
 }
+
+// SetStateMutationGate installs the process-wide persistent mutation gate.
+func (m *ActivationManager) SetStateMutationGate(gate MutationGate) { m.gate = gate }
 
 // NewActivationManager returns an ActivationManager bound to stores. identityKey
 // must be stable across restarts and contain at least 256 bits; it protects the
@@ -180,6 +184,11 @@ func (m *ActivationManager) activate(ctx context.Context, idempotencyKey, code, 
 	if err != nil {
 		return ActivationResult{}, err
 	}
+	release, err := acquireMutation(ctx, m.gate)
+	if err != nil {
+		return ActivationResult{}, err
+	}
+	defer release()
 	commandID, err := m.stores.NextID()
 	if err != nil {
 		return ActivationResult{}, err
@@ -221,7 +230,7 @@ func (m *ActivationManager) activate(ctx context.Context, idempotencyKey, code, 
 	}
 	m.codeHash = ""
 	if m.publisher != nil {
-		if err := m.publisher(ctx, StateChange{EventType: "user.created", UserID: user.ID}); err != nil {
+		if err := m.publisher(ctx, StateChange{EventType: "user.created", UserID: user.ID, CommandID: commandID}); err != nil {
 			return ActivationResult{}, err
 		}
 	}

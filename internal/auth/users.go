@@ -53,6 +53,7 @@ type UserService struct {
 	avatarCleaner AvatarCleaner
 	connections   ConnectionRevoker
 	publisher     StateChangePublisher
+	gate          MutationGate
 }
 
 // SetStateChangePublisher installs the post-commit realtime projection bridge
@@ -61,6 +62,9 @@ type UserService struct {
 func (s *UserService) SetStateChangePublisher(publisher StateChangePublisher) {
 	s.publisher = publisher
 }
+
+// SetStateMutationGate installs the process-wide persistent mutation gate.
+func (s *UserService) SetStateMutationGate(gate MutationGate) { s.gate = gate }
 
 // SetConnectionRevoker installs the lifecycle owner notified after kick, ban,
 // and account deletion. Server assembly calls it before routes accept requests.
@@ -126,6 +130,11 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 		// would overwrite a nickname committed concurrently by another request.
 		return user, nil
 	}
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	updated, err := s.users.UpdateNickname(ctx, userID, nickname)
 	if err != nil {
 		return nil, err
@@ -146,6 +155,11 @@ func (s *UserService) UpdateManagedProfile(ctx context.Context, actorID, userID 
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	var user *db.User
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserUpdate); err != nil {
@@ -206,6 +220,11 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserKick); err != nil {
 			return err
@@ -247,6 +266,11 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserUpdate); err != nil {
 			return err
@@ -280,6 +304,11 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 func (s *UserService) Unban(ctx context.Context, actorID, userID int64) error {
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserUpdate); err != nil {
 			return err
@@ -315,6 +344,11 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
+	release, err := acquireMutation(ctx, s.gate)
+	if err != nil {
+		return err
+	}
+	defer release()
 	var avatarName string
 	if err := runTx(ctx, s.stores, func(tx *store.Stores) error {
 		if err := requireServerPermission(ctx, tx, actorID, rbac.PermUserDelete); err != nil {

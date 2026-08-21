@@ -282,16 +282,7 @@ func validateServerTLS(cfg appConfig) (ServerConfig, error) {
 		VoicePort:      cfg.Server.VoicePort,
 		DBPath:         cfg.Server.DBPath,
 	}
-	if s.AdvertisedHost == "" {
-		// Older hand-written configurations predate advertised_host. Preserve a
-		// non-wildcard endpoint for their metadata response; operators serving
-		// remote clients must explicitly replace this local-safe default.
-		s.AdvertisedHost = "localhost"
-		if s.Host != "0.0.0.0" && s.Host != "::" && s.Host != "[::]" {
-			s.AdvertisedHost = s.Host
-		}
-	}
-	if s.AdvertisedHost == "0.0.0.0" || s.AdvertisedHost == "::" || s.AdvertisedHost == "[::]" || (net.ParseIP(s.AdvertisedHost) == nil && !validDNSName(s.AdvertisedHost)) {
+	if s.AdvertisedHost == "" || s.AdvertisedHost == "0.0.0.0" || s.AdvertisedHost == "::" || s.AdvertisedHost == "[::]" || (net.ParseIP(s.AdvertisedHost) == nil && !validDNSName(s.AdvertisedHost)) {
 		return ServerConfig{}, errors.New("config: server.advertised_host must be a client-reachable DNS name or IP address")
 	}
 	mode := strings.ToLower(strings.TrimSpace(cfg.Server.TLSMode))
