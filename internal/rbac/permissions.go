@@ -2,6 +2,7 @@ package rbac
 
 import (
 	"encoding/json"
+	"slices"
 )
 
 const (
@@ -55,6 +56,35 @@ var allPermissionSet = func() map[Permission]struct{} {
 func IsKnown(p Permission) bool {
 	_, ok := allPermissionSet[p]
 	return ok
+}
+
+// AllowedAtScope reports whether permission is meaningful at scopeType. Server
+// configuration may grant every known permission, while resource-local
+// configuration is restricted so scoped bindings cannot grant server powers.
+func AllowedAtScope(scopeType string, permission Permission) bool {
+	if scopeType == "server" {
+		return IsKnown(permission)
+	}
+	if scopeType == "group" {
+		return slices.Contains([]Permission{
+			PermGroupManage,
+			PermChannelCreate,
+			PermChannelCreateTemp,
+			PermChannelManage,
+			PermChannelInvite,
+			PermChannelAnnounce,
+			PermMemberMute,
+		}, permission)
+	}
+	if scopeType == "channel" {
+		return slices.Contains([]Permission{
+			PermChannelManage,
+			PermChannelInvite,
+			PermChannelAnnounce,
+			PermMemberMute,
+		}, permission)
+	}
+	return false
 }
 
 // DefaultServerPermissionConfig returns the canonical JSON config for the

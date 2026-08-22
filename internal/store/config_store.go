@@ -281,7 +281,7 @@ func (s *ConfigStore) normalize(ctx context.Context, scopeType, raw string) (str
 				if roleKey != ownerRole {
 					return "", fmt.Errorf("%w: non-owner role %q grants wildcard", ErrInvalidPermissionConfig, roleKey)
 				}
-			} else if !rbac.IsKnown(rbac.Permission(rawPermission)) || !permissionAllowedAt(scopeType, rbac.Permission(rawPermission)) {
+			} else if !rbac.IsKnown(rbac.Permission(rawPermission)) || !rbac.AllowedAtScope(scopeType, rbac.Permission(rawPermission)) {
 				return "", fmt.Errorf("%w: permission %q is invalid at %s scope", ErrInvalidPermissionConfig, rawPermission, scopeType)
 			}
 			if _, duplicate := seen[rawPermission]; duplicate {
@@ -301,31 +301,6 @@ func (s *ConfigStore) normalize(ctx context.Context, scopeType, raw string) (str
 		return "", fmt.Errorf("%w: encode: %w", ErrInvalidPermissionConfig, err)
 	}
 	return string(encoded), nil
-}
-
-// permissionAllowedAt reports whether permission can be evaluated at the
-// requested local scope. Server-only grants may never leak into local configs.
-func permissionAllowedAt(scopeType string, permission rbac.Permission) bool {
-	if scopeType == "server" {
-		return rbac.IsKnown(permission)
-	}
-	if scopeType == "group" {
-		return slices.Contains([]rbac.Permission{
-			rbac.PermGroupManage,
-			rbac.PermChannelCreate,
-			rbac.PermChannelCreateTemp,
-			rbac.PermChannelManage,
-			rbac.PermChannelInvite,
-			rbac.PermChannelAnnounce,
-			rbac.PermMemberMute,
-		}, permission)
-	}
-	return slices.Contains([]rbac.Permission{
-		rbac.PermChannelManage,
-		rbac.PermChannelInvite,
-		rbac.PermChannelAnnounce,
-		rbac.PermMemberMute,
-	}, permission)
 }
 
 // validateConfigScope checks exact scope ID nullness before querying rows.
