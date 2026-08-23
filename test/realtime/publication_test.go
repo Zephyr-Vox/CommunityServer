@@ -296,6 +296,47 @@ func TestPostCommitSequencerPreservesPublicationOrder(t *testing.T) {
 	}
 }
 
+func TestPostCommitSequencerCompletesNoopWithoutPublication(t *testing.T) {
+	loader := &staticProjectionLoader{projection: &store.StateProjection{}}
+	state, err := realtime.NewStateStoreWithEpoch(context.Background(), loader, testEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := realtime.NewStatePublication(state, realtime.NewStateRing(), realtime.NewVisibilityResolver(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := realtime.NewPostCommitSequencer(publication, idGen, func(error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sequencer.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+
+	completion, err := sequencer.Submit(context.Background(), realtime.PostCommitCommand{
+		QueueBytes: 1,
+		Execute: func(_ context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+			if err := execution.MarkNoop(); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			return realtime.CommandOutput{Value: "unchanged"}, nil
+		},
+	})
+	if err != nil || completion.CommandID <= 0 || completion.Value != "unchanged" {
+		t.Fatalf("noop completion = %+v, err = %v", completion, err)
+	}
+	if snapshot := publication.Capture(); snapshot.Version.Number() != 0 || snapshot.HighWater != 0 || len(snapshot.Events) != 0 {
+		t.Fatalf("noop changed publication state: %+v", snapshot)
+	}
+}
+
 func TestPostCommitSequencerAbortsRuntimeCommandBeforePublicationOnCancellation(t *testing.T) {
 	loader := &staticProjectionLoader{projection: &store.StateProjection{}}
 	state, err := realtime.NewStateStoreWithEpoch(context.Background(), loader, testEpoch)

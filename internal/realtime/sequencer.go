@@ -90,6 +90,7 @@ type CommandExecution struct {
 	committing   bool
 	persistent   bool
 	runtimeReady bool
+	noop         bool
 	published    bool
 }
 
@@ -163,6 +164,22 @@ func (e *CommandExecution) MarkRuntimeReady() error {
 	return nil
 }
 
+// MarkNoop completes a successfully revalidated command that made no durable
+// or runtime state change. It allocates a command ID but does not advance the
+// StateStore version, ring, checkpoint, or visibility epoch.
+func (e *CommandExecution) MarkNoop() error {
+	if e == nil {
+		return ErrInvalidSequencer
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.reservation != nil || e.committing || e.persistent || e.runtimeReady || e.noop || e.published {
+		return ErrCommandNotCommitted
+	}
+	e.noop = true
+	return nil
+}
+
 // CompletionContext returns the internal context allowed after a persistent
 // Commit. It has the request's values but ignores request cancellation and
 // deadlines; runtime commands remain cancellable until Publish succeeds.
@@ -178,12 +195,11 @@ func (e *CommandExecution) CompletionContext() (context.Context, error) {
 	return e.completionCtx, nil
 }
 
-// publicationState returns the reservation and whether its enclosing command
-// has either durably committed or become runtime-ready.
-func (e *CommandExecution) publicationState() (*PublicationReservation, bool, bool) {
+// publicationState returns the reservation and terminal execution state.
+func (e *CommandExecution) publicationState() (*PublicationReservation, bool, bool, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.reservation, e.persistent, e.runtimeReady
+	return e.reservation, e.persistent, e.runtimeReady, e.noop
 }
 
 // abort releases an uncommitted publication reservation after an ordinary
@@ -568,7 +584,7 @@ func (s *PostCommitSequencer) execute(pending *queuedCommand) (completion Comman
 	execution.commandID = commandID
 	output, err := pending.command.Execute(pending.ctx, commandID, execution)
 	if err != nil {
-		if _, persistent, runtimeReady := execution.publicationState(); persistent || runtimeReady {
+		if _, persistent, runtimeReady, _ := execution.publicationState(); persistent || runtimeReady {
 			if runtimeReady && !persistent {
 				execution.abort()
 				return CommandCompletion{}, err
@@ -580,7 +596,14 @@ func (s *PostCommitSequencer) execute(pending *queuedCommand) (completion Comman
 		execution.abort()
 		return CommandCompletion{}, err
 	}
-	reservation, persistent, runtimeReady := execution.publicationState()
+	reservation, persistent, runtimeReady, noop := execution.publicationState()
+	if noop {
+		if reservation != nil || persistent || runtimeReady {
+			execution.abort()
+			return CommandCompletion{}, ErrCommandNotCommitted
+		}
+		return CommandCompletion{CommandID: commandID, Value: output.Value}, nil
+	}
 	if (!persistent && !runtimeReady) || reservation == nil {
 		execution.abort()
 		return CommandCompletion{}, ErrCommandNotCommitted
