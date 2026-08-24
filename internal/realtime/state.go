@@ -257,9 +257,6 @@ func (v *StateVersion) Groups() []Group {
 		if groups[i].Position != groups[j].Position {
 			return groups[i].Position < groups[j].Position
 		}
-		if groups[i].CreatedAt != groups[j].CreatedAt {
-			return groups[i].CreatedAt < groups[j].CreatedAt
-		}
 		return groups[i].ID < groups[j].ID
 	})
 	return groups
@@ -280,9 +277,6 @@ func (v *StateVersion) Channels() []Channel {
 	sort.Slice(channels, func(i, j int) bool {
 		if channels[i].Position != channels[j].Position {
 			return channels[i].Position < channels[j].Position
-		}
-		if channels[i].CreatedAt != channels[j].CreatedAt {
-			return channels[i].CreatedAt < channels[j].CreatedAt
 		}
 		return channels[i].ID < channels[j].ID
 	})

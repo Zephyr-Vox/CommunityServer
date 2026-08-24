@@ -12,15 +12,20 @@ import (
 type Querier interface {
 	BumpUserAuthVersion(ctx context.Context, arg BumpUserAuthVersionParams) error
 	ConsumeInvite(ctx context.Context, arg ConsumeInviteParams) (Invite, error)
+	CountChannelGroups(ctx context.Context) (int64, error)
+	CountChannels(ctx context.Context) (int64, error)
 	CountDurableIdempotency(ctx context.Context) (int64, error)
 	CountOwners(ctx context.Context) (int64, error)
 	CountRoleReferences(ctx context.Context, roleKey string) (int64, error)
+	CountTemporaryChannels(ctx context.Context) (int64, error)
+	CountTemporaryChannelsForCreator(ctx context.Context, createdBy sql.NullInt64) (int64, error)
 	CreateChannel(ctx context.Context, arg CreateChannelParams) (Channel, error)
 	CreateChannelGroup(ctx context.Context, arg CreateChannelGroupParams) (ChannelGroup, error)
 	CreateInvite(ctx context.Context, arg CreateInviteParams) (Invite, error)
 	CreateRole(ctx context.Context, arg CreateRoleParams) (Role, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	DeleteChannel(ctx context.Context, id int64) (int64, error)
+	DeleteChannelGroup(ctx context.Context, id int64) (int64, error)
 	DeleteChannelPermissionConfig(ctx context.Context, channelID sql.NullInt64) (sql.NullInt64, error)
 	DeleteExpiredActivationIdempotency(ctx context.Context, expiresAt int64) (int64, error)
 	DeleteExpiredCommandIdempotency(ctx context.Context, expiresAt int64) (int64, error)
@@ -91,6 +96,8 @@ type Querier interface {
 	SetUserBanned(ctx context.Context, arg SetUserBannedParams) error
 	SetUserPasswordHash(ctx context.Context, arg SetUserPasswordHashParams) (int64, error)
 	TouchUserLastLogin(ctx context.Context, arg TouchUserLastLoginParams) error
+	UpdateChannel(ctx context.Context, arg UpdateChannelParams) (Channel, error)
+	UpdateChannelGroup(ctx context.Context, arg UpdateChannelGroupParams) (ChannelGroup, error)
 	UpdateRole(ctx context.Context, arg UpdateRoleParams) (Role, error)
 	UpdateServerPermissionConfig(ctx context.Context, arg UpdateServerPermissionConfigParams) (ScopePermissionConfig, error)
 	UpdateUserNickname(ctx context.Context, arg UpdateUserNicknameParams) (User, error)

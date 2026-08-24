@@ -10,6 +10,50 @@ import (
 	"database/sql"
 )
 
+const countChannelGroups = `-- name: CountChannelGroups :one
+SELECT COUNT(*) FROM channel_groups
+`
+
+func (q *Queries) CountChannelGroups(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countChannelGroups)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countChannels = `-- name: CountChannels :one
+SELECT COUNT(*) FROM channels
+`
+
+func (q *Queries) CountChannels(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countChannels)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countTemporaryChannels = `-- name: CountTemporaryChannels :one
+SELECT COUNT(*) FROM channels WHERE temporary = 1
+`
+
+func (q *Queries) CountTemporaryChannels(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countTemporaryChannels)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countTemporaryChannelsForCreator = `-- name: CountTemporaryChannelsForCreator :one
+SELECT COUNT(*) FROM channels WHERE temporary = 1 AND created_by = ?
+`
+
+func (q *Queries) CountTemporaryChannelsForCreator(ctx context.Context, createdBy sql.NullInt64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countTemporaryChannelsForCreator, createdBy)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createChannel = `-- name: CreateChannel :one
 INSERT INTO channels
     (id, group_id, name, mode, temporary, visibility, capacity, position,
@@ -116,6 +160,17 @@ func (q *Queries) DeleteChannel(ctx context.Context, id int64) (int64, error) {
 	return id_2, err
 }
 
+const deleteChannelGroup = `-- name: DeleteChannelGroup :one
+DELETE FROM channel_groups WHERE id = ? RETURNING id
+`
+
+func (q *Queries) DeleteChannelGroup(ctx context.Context, id int64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, deleteChannelGroup, id)
+	var id_2 int64
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const getChannel = `-- name: GetChannel :one
 SELECT id, group_id, name, mode, "temporary", visibility, capacity, position, pinned, created_by, created_at, updated_at, version FROM channels WHERE id = ?
 `
@@ -162,7 +217,7 @@ func (q *Queries) GetChannelGroup(ctx context.Context, id int64) (ChannelGroup, 
 
 const listChannelGroups = `-- name: ListChannelGroups :many
 SELECT id, name, position, visibility, created_at, updated_at, version FROM channel_groups
-ORDER BY position, created_at, id
+ORDER BY position, id
 `
 
 func (q *Queries) ListChannelGroups(ctx context.Context) ([]ChannelGroup, error) {
@@ -198,7 +253,7 @@ func (q *Queries) ListChannelGroups(ctx context.Context) ([]ChannelGroup, error)
 
 const listChannels = `-- name: ListChannels :many
 SELECT id, group_id, name, mode, "temporary", visibility, capacity, position, pinned, created_by, created_at, updated_at, version FROM channels
-ORDER BY position, created_at, id
+ORDER BY position, id
 `
 
 func (q *Queries) ListChannels(ctx context.Context) ([]Channel, error) {
@@ -236,4 +291,99 @@ func (q *Queries) ListChannels(ctx context.Context) ([]Channel, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const updateChannel = `-- name: UpdateChannel :one
+UPDATE channels
+SET group_id = ?,
+    name = ?,
+    visibility = ?,
+    capacity = ?,
+    position = ?,
+    pinned = ?,
+    updated_at = ?,
+    version = version + 1
+WHERE id = ?
+RETURNING id, group_id, name, mode, "temporary", visibility, capacity, position, pinned, created_by, created_at, updated_at, version
+`
+
+type UpdateChannelParams struct {
+	GroupID    sql.NullInt64 `json:"group_id"`
+	Name       string        `json:"name"`
+	Visibility string        `json:"visibility"`
+	Capacity   int64         `json:"capacity"`
+	Position   int64         `json:"position"`
+	Pinned     int64         `json:"pinned"`
+	UpdatedAt  int64         `json:"updated_at"`
+	ID         int64         `json:"id"`
+}
+
+func (q *Queries) UpdateChannel(ctx context.Context, arg UpdateChannelParams) (Channel, error) {
+	row := q.db.QueryRowContext(ctx, updateChannel,
+		arg.GroupID,
+		arg.Name,
+		arg.Visibility,
+		arg.Capacity,
+		arg.Position,
+		arg.Pinned,
+		arg.UpdatedAt,
+		arg.ID,
+	)
+	var i Channel
+	err := row.Scan(
+		&i.ID,
+		&i.GroupID,
+		&i.Name,
+		&i.Mode,
+		&i.Temporary,
+		&i.Visibility,
+		&i.Capacity,
+		&i.Position,
+		&i.Pinned,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Version,
+	)
+	return i, err
+}
+
+const updateChannelGroup = `-- name: UpdateChannelGroup :one
+UPDATE channel_groups
+SET name = ?,
+    position = ?,
+    visibility = ?,
+    updated_at = ?,
+    version = version + 1
+WHERE id = ?
+RETURNING id, name, position, visibility, created_at, updated_at, version
+`
+
+type UpdateChannelGroupParams struct {
+	Name       string `json:"name"`
+	Position   int64  `json:"position"`
+	Visibility string `json:"visibility"`
+	UpdatedAt  int64  `json:"updated_at"`
+	ID         int64  `json:"id"`
+}
+
+func (q *Queries) UpdateChannelGroup(ctx context.Context, arg UpdateChannelGroupParams) (ChannelGroup, error) {
+	row := q.db.QueryRowContext(ctx, updateChannelGroup,
+		arg.Name,
+		arg.Position,
+		arg.Visibility,
+		arg.UpdatedAt,
+		arg.ID,
+	)
+	var i ChannelGroup
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Position,
+		&i.Visibility,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Version,
+	)
+	return i, err
 }

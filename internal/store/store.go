@@ -14,7 +14,8 @@ import (
 var (
 	// ErrNotFound is returned when a single row lookup comes back empty.
 	ErrNotFound = errors.New("store: not found")
-	// ErrConflict is returned when an insert or update violates a unique constraint.
+	// ErrConflict is returned when a write violates a unique or referential
+	// constraint that represents a conflicting persisted resource state.
 	ErrConflict = errors.New("store: conflict")
 	// ErrSessionReused is returned when a rotated refresh token is presented again.
 	ErrSessionReused = errors.New("store: session token reuse detected")
@@ -56,7 +57,7 @@ func mapError(err error) error {
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
-	if isUniqueConstraint(err) {
+	if isUniqueConstraint(err) || isForeignKeyConstraint(err) {
 		return ErrConflict
 	}
 	return err
@@ -69,6 +70,17 @@ func isUniqueConstraint(err error) bool {
 			return true
 		}
 		return strings.Contains(sqliteErr.Error(), "UNIQUE constraint failed")
+	}
+	return false
+}
+
+// isForeignKeyConstraint reports whether err represents SQLite rejecting a
+// referenced-row deletion or a missing foreign-key target. modernc.org/sqlite
+// may surface this through SQLITE_CONSTRAINT_TRIGGER, so the stable driver text
+// is also part of the narrow check.
+func isForeignKeyConstraint(err error) bool {
+	if sqliteErr, ok := errors.AsType[*sqlite.Error](err); ok {
+		return strings.Contains(sqliteErr.Error(), "FOREIGN KEY constraint failed")
 	}
 	return false
 }
