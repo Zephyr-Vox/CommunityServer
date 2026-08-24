@@ -35,6 +35,9 @@ const (
 	// StateDeliveryVisibleAfter identifies ordinary state events selected from
 	// the publication's after-version visibility projection.
 	StateDeliveryVisibleAfter
+	// StateDeliveryVisibleBefore identifies sanitized delete tombstones selected
+	// from the resource's pre-mutation visible recipient set.
+	StateDeliveryVisibleBefore
 	// StateDeliveryDirectTransition identifies sanitized visibility transition
 	// events addressed directly to one user rather than resolved by scope ACL.
 	StateDeliveryDirectTransition
@@ -332,9 +335,12 @@ func (b *EventBus) liveItems(ref ControlConnectionRef, version *StateVersion, ev
 			return nil, true, nil
 		}
 		policy := StateDeliveryVisibleAfter
-		if event.DeliveryPolicy == StateDeliveryDirectTransition {
+		switch event.DeliveryPolicy {
+		case StateDeliveryVisibleBefore:
+			policy = StateDeliveryVisibleBefore
+		case StateDeliveryDirectTransition:
 			policy = StateDeliveryDirectTransition
-		} else if event.DeliveryPolicy == StateDeliveryUserTargeted {
+		case StateDeliveryUserTargeted:
 			policy = StateDeliveryUserTargeted
 		}
 		items = append(items, StateQueueItem{

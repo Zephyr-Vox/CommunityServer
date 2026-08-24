@@ -2,6 +2,8 @@
 // and channels.
 package channel
 
+import "encoding/json"
+
 // createGroupRequest is the POST /groups request payload.
 type createGroupRequest struct {
 	Name       string `json:"name" validate:"required,min=1,max=64"`
@@ -20,4 +22,44 @@ type createChannelRequest struct {
 	Capacity   *int64  `json:"capacity" validate:"omitempty,min=1,max=256"`
 	Position   *int64  `json:"position" validate:"required,gte=-2147483648,lte=2147483647"`
 	Pinned     *bool   `json:"pinned" validate:"required"`
+}
+
+// updateGroupRequest is the PATCH /groups/:id request payload.
+type updateGroupRequest struct {
+	Name       *string `json:"name" validate:"omitempty,min=1,max=64"`
+	Position   *int64  `json:"position" validate:"omitempty,gte=-2147483648,lte=2147483647"`
+	Visibility *string `json:"visibility" validate:"omitempty,oneof=public private"`
+}
+
+// optionalGroupIDRequest preserves the distinction between an omitted group_id
+// and an explicit JSON null that removes a channel from its group.
+type optionalGroupIDRequest struct {
+	Set   bool
+	Value *string
+}
+
+// UnmarshalJSON records an explicit group_id field while accepting only a JSON
+// string snowflake or null.
+func (r *optionalGroupIDRequest) UnmarshalJSON(data []byte) error {
+	var value *string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	r.Set = true
+	r.Value = value
+	return nil
+}
+
+// updateChannelRequest is the PATCH /channels/:id request payload. Immutable
+// fields are bound only so the handler can reject attempts to modify them.
+type updateChannelRequest struct {
+	GroupID    optionalGroupIDRequest `json:"group_id"`
+	Name       *string                `json:"name" validate:"omitempty,min=1,max=64"`
+	Visibility *string                `json:"visibility" validate:"omitempty,oneof=public private"`
+	Capacity   *int64                 `json:"capacity" validate:"omitempty,min=1,max=256"`
+	Position   *int64                 `json:"position" validate:"omitempty,gte=-2147483648,lte=2147483647"`
+	Pinned     *bool                  `json:"pinned" validate:"omitempty"`
+	Mode       *string                `json:"mode"`
+	Temporary  *bool                  `json:"temporary"`
+	CreatedBy  *string                `json:"created_by"`
 }

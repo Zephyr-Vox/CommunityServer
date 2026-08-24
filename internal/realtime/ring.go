@@ -43,11 +43,14 @@ var (
 // StatePublication creates one replayable event. Data must be a valid JSON
 // value; it intentionally excludes the per-recipient cursor.
 type StateEventTemplate struct {
-	EventType                string
-	Scope                    Scope
-	CausationID              int64
-	Data                     json.RawMessage
-	DeliveryPolicy           StateDeliveryPolicy
+	EventType      string
+	Scope          Scope
+	CausationID    int64
+	Data           json.RawMessage
+	DeliveryPolicy StateDeliveryPolicy
+	// VisibleBeforeUserIDs limits a visible-before tombstone to the users who
+	// could access its scope in the publication's prior StateVersion.
+	VisibleBeforeUserIDs     []int64
 	RecipientUserID          int64
 	SubjectUserID            int64
 	CursorVisibilityEpoch    uint64
@@ -64,6 +67,7 @@ type StateEvent struct {
 	ServerTime               int64
 	Data                     json.RawMessage
 	DeliveryPolicy           StateDeliveryPolicy
+	VisibleBeforeUserIDs     []int64
 	RecipientUserID          int64
 	SubjectUserID            int64
 	CursorVisibilityEpoch    uint64
@@ -125,7 +129,7 @@ func (e StateEvent) Size() int {
 // including compact recipient materialization metadata that is not serialized
 // in the recipient-independent event envelope.
 func (e StateEvent) retainedSize() int {
-	size := len(e.encoded) + len(e.cursorVisibilityEpochs)*16
+	size := len(e.encoded) + len(e.cursorVisibilityEpochs)*16 + len(e.VisibleBeforeUserIDs)*8
 	if e.subjectState != nil {
 		size += 64 + len(e.subjectState.user.Username) + len(e.subjectState.user.Nickname)
 		if e.subjectState.user.Avatar != nil {
@@ -310,6 +314,7 @@ func stateEventFromTemplate(template StateEventTemplate, geid uint64, serverTime
 		ServerTime:               serverTime,
 		Data:                     append(json.RawMessage(nil), template.Data...),
 		DeliveryPolicy:           template.DeliveryPolicy,
+		VisibleBeforeUserIDs:     append([]int64(nil), template.VisibleBeforeUserIDs...),
 		RecipientUserID:          template.RecipientUserID,
 		SubjectUserID:            template.SubjectUserID,
 		CursorVisibilityEpoch:    template.CursorVisibilityEpoch,
@@ -324,7 +329,19 @@ func normalizeStateEvent(event StateEvent) (StateEvent, error) {
 	if event.GEID == 0 || event.EventType == "" || !event.Scope.Valid() || event.CausationID < 0 {
 		return StateEvent{}, ErrInvalidStateEvent
 	}
-	if event.DeliveryPolicy != 0 && event.DeliveryPolicy != StateDeliveryVisibleAfter && event.DeliveryPolicy != StateDeliveryDirectTransition && event.DeliveryPolicy != StateDeliveryUserTargeted {
+	if event.DeliveryPolicy != 0 && event.DeliveryPolicy != StateDeliveryVisibleAfter && event.DeliveryPolicy != StateDeliveryVisibleBefore && event.DeliveryPolicy != StateDeliveryDirectTransition && event.DeliveryPolicy != StateDeliveryUserTargeted {
+		return StateEvent{}, ErrInvalidStateEvent
+	}
+	if event.DeliveryPolicy == StateDeliveryVisibleBefore {
+		if event.EventType != "group.deleted" && event.EventType != "channel.deleted" {
+			return StateEvent{}, ErrInvalidStateEvent
+		}
+		for index, userID := range event.VisibleBeforeUserIDs {
+			if userID <= 0 || (index != 0 && event.VisibleBeforeUserIDs[index-1] >= userID) {
+				return StateEvent{}, ErrInvalidStateEvent
+			}
+		}
+	} else if len(event.VisibleBeforeUserIDs) != 0 {
 		return StateEvent{}, ErrInvalidStateEvent
 	}
 	if (event.DeliveryPolicy == StateDeliveryDirectTransition || event.DeliveryPolicy == StateDeliveryUserTargeted) && event.RecipientUserID <= 0 {
@@ -430,6 +447,7 @@ func cloneStateEvents(events []StateEvent) []StateEvent {
 	for i, event := range events {
 		cloned[i] = event
 		cloned[i].Data = append(json.RawMessage(nil), event.Data...)
+		cloned[i].VisibleBeforeUserIDs = append([]int64(nil), event.VisibleBeforeUserIDs...)
 		cloned[i].cursorVisibilityEpochs = append([]cursorVisibilityEpoch(nil), event.cursorVisibilityEpochs...)
 		if event.subjectState != nil {
 			state := *event.subjectState

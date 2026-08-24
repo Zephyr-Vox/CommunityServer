@@ -696,6 +696,14 @@ func eventVisibleTo(userID int64, event StateEvent, version *StateVersion, visib
 	if event.DeliveryPolicy == StateDeliveryDirectTransition || event.DeliveryPolicy == StateDeliveryUserTargeted {
 		return event.RecipientUserID == userID
 	}
+	if event.DeliveryPolicy == StateDeliveryVisibleBefore {
+		for _, visibleUserID := range event.VisibleBeforeUserIDs {
+			if visibleUserID == userID {
+				return true
+			}
+		}
+		return false
+	}
 	switch event.Scope.Type {
 	case "server":
 		_, ok := version.User(userID)

@@ -72,6 +72,126 @@ func CreateGroupHandler(svc *Service) echo.HandlerFunc {
 	})
 }
 
+// GetGroupHandler handles GET /api/v0/groups/:id. The route must be mounted
+// behind AuthN.
+//
+// Errors:
+//   - 1 group not found: the group is absent or inaccessible to the actor
+//   - 1000 invalid request parameters: id is not a positive decimal snowflake ID
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: authenticated user is no longer eligible to read state
+//   - 1009 internal: immutable state read failed
+func GetGroupHandler(svc *Service) echo.HandlerFunc {
+	const codeNotFound = 1
+	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		groupID, err := pathID(c.Param("id"))
+		if err != nil {
+			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
+		}
+		group, etag, err := svc.GetGroup(principal.UserID, groupID)
+		switch {
+		case errors.Is(err, ErrTargetNotFound):
+			return api.NewError(codeNotFound, http.StatusNotFound, "group not found")
+		case errors.Is(err, ErrPermissionRequired):
+			return echo.ErrForbidden
+		case err != nil:
+			return err
+		}
+		c.Response().Header().Set("ETag", etag)
+		return api.OK(c, http.StatusOK, group)
+	})
+}
+
+// UpdateGroupHandler handles PATCH /api/v0/groups/:id. The route must be
+// mounted behind AuthN; Service reauthorizes group.manage at the exact group
+// scope at sequencer dequeue.
+//
+// Errors:
+//   - 1 group not found: the group is absent or inaccessible to the actor
+//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 1000 invalid request parameters: id is invalid or the patch is empty/invalid
+//   - 1001 malformed request: body could not be parsed
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: group.manage is not currently granted at group scope
+//   - 1009 internal: persistent command or publication failed
+func UpdateGroupHandler(svc *Service) echo.HandlerFunc {
+	const (
+		codeNotFound     = 1
+		codePrecondition = 2
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		groupID, err := pathID(c.Param("id"))
+		if err != nil {
+			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
+		}
+		var req updateGroupRequest
+		if err := api.Bind(c, &req); err != nil {
+			return err
+		}
+		if req.Name == nil && req.Position == nil && req.Visibility == nil {
+			return api.InvalidField("body", "at least one mutable field is required")
+		}
+		group, state, err := svc.UpdateGroup(c.Request().Context(), principal.UserID, groupID, exactIfMatch(c), UpdateGroupInput{
+			Name:       req.Name,
+			Position:   req.Position,
+			Visibility: req.Visibility,
+		})
+		switch {
+		case errors.Is(err, ErrTargetNotFound):
+			return api.NewError(codeNotFound, http.StatusNotFound, "group not found")
+		case errors.Is(err, ErrPreconditionFailed):
+			return api.NewError(codePrecondition, http.StatusPreconditionFailed, "precondition failed")
+		case errors.Is(err, ErrPermissionRequired):
+			return echo.ErrForbidden
+		case err != nil:
+			return err
+		}
+		setStateHeaders(c, state)
+		return api.OK(c, http.StatusOK, group)
+	})
+}
+
+// DeleteGroupHandler handles DELETE /api/v0/groups/:id. The route must be
+// mounted behind AuthN; Service reauthorizes group.manage at the exact group
+// scope at sequencer dequeue.
+//
+// Errors:
+//   - 1 group not found: the group is absent or inaccessible to the actor
+//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 3 group not empty: a channel still belongs to the group
+//   - 1000 invalid request parameters: id is not a positive decimal snowflake ID
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: group.manage is not currently granted at group scope
+//   - 1009 internal: persistent command or publication failed
+func DeleteGroupHandler(svc *Service) echo.HandlerFunc {
+	const (
+		codeNotFound     = 1
+		codePrecondition = 2
+		codeNonEmpty     = 3
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		groupID, err := pathID(c.Param("id"))
+		if err != nil {
+			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
+		}
+		state, err := svc.DeleteGroup(c.Request().Context(), principal.UserID, groupID, exactIfMatch(c))
+		switch {
+		case errors.Is(err, ErrTargetNotFound):
+			return api.NewError(codeNotFound, http.StatusNotFound, "group not found")
+		case errors.Is(err, ErrPreconditionFailed):
+			return api.NewError(codePrecondition, http.StatusPreconditionFailed, "precondition failed")
+		case errors.Is(err, ErrGroupNotEmpty):
+			return api.NewError(codeNonEmpty, http.StatusConflict, "group is not empty")
+		case errors.Is(err, ErrPermissionRequired):
+			return echo.ErrForbidden
+		case err != nil:
+			return err
+		}
+		setStateHeaders(c, state)
+		return api.NoContent(c, http.StatusNoContent)
+	})
+}
+
 // ListChannelsHandler handles GET /api/v0/channels. The route must be mounted
 // behind AuthN.
 //
@@ -160,6 +280,141 @@ func CreateChannelHandler(svc *Service) echo.HandlerFunc {
 	})
 }
 
+// GetChannelHandler handles GET /api/v0/channels/:id. The route must be
+// mounted behind AuthN.
+//
+// Errors:
+//   - 1 channel not found: the channel is absent or inaccessible to the actor
+//   - 1000 invalid request parameters: id is not a positive decimal snowflake ID
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: authenticated user is no longer eligible to read state
+//   - 1009 internal: immutable state read failed
+func GetChannelHandler(svc *Service) echo.HandlerFunc {
+	const codeNotFound = 1
+	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		channelID, err := pathID(c.Param("id"))
+		if err != nil {
+			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
+		}
+		channel, etag, err := svc.GetChannel(principal.UserID, channelID)
+		switch {
+		case errors.Is(err, ErrTargetNotFound):
+			return api.NewError(codeNotFound, http.StatusNotFound, "channel not found")
+		case errors.Is(err, ErrPermissionRequired):
+			return echo.ErrForbidden
+		case err != nil:
+			return err
+		}
+		c.Response().Header().Set("ETag", etag)
+		return api.OK(c, http.StatusOK, channel)
+	})
+}
+
+// UpdateChannelHandler handles PATCH /api/v0/channels/:id. The route must be
+// mounted behind AuthN; Service reauthorizes channel.manage at the exact
+// channel scope and validates any destination group at sequencer dequeue.
+//
+// Errors:
+//   - 1 channel or destination group not found: target is absent or inaccessible
+//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 3 invalid channel state: capacity would fall below active membership
+//   - 1000 invalid request parameters: id is invalid or the patch is empty/invalid
+//   - 1001 malformed request: body could not be parsed
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: required scoped authority is not currently granted
+//   - 1009 internal: persistent command or publication failed
+func UpdateChannelHandler(svc *Service) echo.HandlerFunc {
+	const (
+		codeNotFound     = 1
+		codePrecondition = 2
+		codeInvalidState = 3
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		channelID, err := pathID(c.Param("id"))
+		if err != nil {
+			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
+		}
+		var req updateChannelRequest
+		if err := api.Bind(c, &req); err != nil {
+			return err
+		}
+		if req.Mode != nil || req.Temporary != nil || req.CreatedBy != nil {
+			return api.InvalidField("body", "mode, temporary, and created_by are immutable")
+		}
+		if !req.GroupID.Set && req.Name == nil && req.Visibility == nil && req.Capacity == nil && req.Position == nil && req.Pinned == nil {
+			return api.InvalidField("body", "at least one mutable field is required")
+		}
+		groupID, err := optionalIDValue(req.GroupID.Value)
+		if err != nil {
+			return api.InvalidField("group_id", "must be a positive decimal snowflake ID")
+		}
+		channel, state, err := svc.UpdateChannel(c.Request().Context(), principal.UserID, channelID, exactIfMatch(c), UpdateChannelInput{
+			GroupIDSet: req.GroupID.Set,
+			GroupID:    groupID,
+			Name:       req.Name,
+			Visibility: req.Visibility,
+			Capacity:   req.Capacity,
+			Position:   req.Position,
+			Pinned:     req.Pinned,
+		})
+		switch {
+		case errors.Is(err, ErrTargetNotFound), errors.Is(err, ErrParentNotFound):
+			return api.NewError(codeNotFound, http.StatusNotFound, "channel or destination group not found")
+		case errors.Is(err, ErrPreconditionFailed):
+			return api.NewError(codePrecondition, http.StatusPreconditionFailed, "precondition failed")
+		case errors.Is(err, ErrInvalidChannelState):
+			return api.NewError(codeInvalidState, http.StatusConflict, "invalid channel state")
+		case errors.Is(err, ErrPermissionRequired):
+			return echo.ErrForbidden
+		case err != nil:
+			return err
+		}
+		setStateHeaders(c, state)
+		return api.OK(c, http.StatusOK, channel)
+	})
+}
+
+// DeleteChannelHandler handles DELETE /api/v0/channels/:id. The route must be
+// mounted behind AuthN; Service reauthorizes channel.manage at the exact
+// channel scope at sequencer dequeue.
+//
+// Errors:
+//   - 1 channel not found: the channel is absent or inaccessible to the actor
+//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 3 channel active: active voice authority cannot be orphaned by deletion
+//   - 1000 invalid request parameters: id is not a positive decimal snowflake ID
+//   - 1002 unauthorized: missing or invalid access token
+//   - 1003 forbidden: channel.manage is not currently granted at channel scope
+//   - 1009 internal: persistent command or publication failed
+func DeleteChannelHandler(svc *Service) echo.HandlerFunc {
+	const (
+		codeNotFound     = 1
+		codePrecondition = 2
+		codeActive       = 3
+	)
+	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		channelID, err := pathID(c.Param("id"))
+		if err != nil {
+			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
+		}
+		state, err := svc.DeleteChannel(c.Request().Context(), principal.UserID, channelID, exactIfMatch(c))
+		switch {
+		case errors.Is(err, ErrTargetNotFound):
+			return api.NewError(codeNotFound, http.StatusNotFound, "channel not found")
+		case errors.Is(err, ErrPreconditionFailed):
+			return api.NewError(codePrecondition, http.StatusPreconditionFailed, "precondition failed")
+		case errors.Is(err, ErrChannelActive):
+			return api.NewError(codeActive, http.StatusConflict, "channel has active voice authority")
+		case errors.Is(err, ErrPermissionRequired):
+			return echo.ErrForbidden
+		case err != nil:
+			return err
+		}
+		setStateHeaders(c, state)
+		return api.NoContent(c, http.StatusNoContent)
+	})
+}
+
 // pagination parses the shared bounded list query shape.
 func pagination(c *echo.Context) (limit, offset int64, err error) {
 	limit = 50
@@ -201,6 +456,25 @@ func optionalIDValue(raw *string) (*int64, error) {
 		return nil, errors.New("invalid snowflake")
 	}
 	return optionalID(*raw)
+}
+
+// pathID parses a required positive decimal snowflake path segment.
+func pathID(raw string) (int64, error) {
+	id, err := optionalID(raw)
+	if err != nil || id == nil {
+		return 0, errors.New("invalid snowflake")
+	}
+	return *id, nil
+}
+
+// exactIfMatch returns one exact If-Match field value. Missing or repeated
+// fields deliberately fail the service's strict strong-ETag comparison.
+func exactIfMatch(c *echo.Context) string {
+	values := c.Request().Header.Values("If-Match")
+	if len(values) != 1 {
+		return ""
+	}
+	return values[0]
 }
 
 // setStateHeaders exposes the exact post-publication checkpoint for a

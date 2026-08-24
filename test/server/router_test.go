@@ -11,7 +11,7 @@ import (
 // endpoints alongside empty-path routes such as PATCH /api/v0/me.
 func TestRouteTable(t *testing.T) {
 	app := newTestApp(t)
-	got := make([]string, 0, 41)
+	got := make([]string, 0, 47)
 	for _, r := range app.Echo().Router().Routes() {
 		got = append(got, r.Method+" "+r.Path)
 	}
@@ -19,6 +19,8 @@ func TestRouteTable(t *testing.T) {
 
 	want := []string{
 		"DELETE /api/v0/admin/invites/:id",
+		"DELETE /api/v0/channels/:id",
+		"DELETE /api/v0/groups/:id",
 		"DELETE /api/v0/me/avatar",
 		"DELETE /api/v0/rbac/bindings/:id",
 		"DELETE /api/v0/rbac/roles/:key",
@@ -27,7 +29,9 @@ func TestRouteTable(t *testing.T) {
 		"GET /api/v0/auth/me",
 		"GET /api/v0/auth/status",
 		"GET /api/v0/channels",
+		"GET /api/v0/channels/:id",
 		"GET /api/v0/groups",
+		"GET /api/v0/groups/:id",
 		"GET /api/v0/metadata",
 		"GET /api/v0/rbac/bindings",
 		"GET /api/v0/rbac/config",
@@ -37,6 +41,8 @@ func TestRouteTable(t *testing.T) {
 		"GET /api/v0/users/:id",
 		"GET /api/v0/ws",
 		"GET /avatar/:file",
+		"PATCH /api/v0/channels/:id",
+		"PATCH /api/v0/groups/:id",
 		"PATCH /api/v0/me",
 		"PATCH /api/v0/rbac/roles/:key",
 		"PATCH /api/v0/users/:id",
