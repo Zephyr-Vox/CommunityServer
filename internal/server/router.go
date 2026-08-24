@@ -40,7 +40,11 @@ func (a *App) routes(e *echo.Echo) error {
 	authz := rbac.NewAuthorizer(a.stores.Roles)
 	rbacSvc := rbaccontrol.NewService(a.stores, a.principals)
 	rbacSvc.SetStateMutationGate(a.mutationGate)
-	rbacSvc.SetStateChangePublisher(a.publishRBACChange)
+	state, sequencer, ok := a.realtimeComponents()
+	if !ok {
+		return fmt.Errorf("server: RBAC command runtime unavailable")
+	}
+	rbacSvc.SetStateCommandRuntime(state, sequencer)
 
 	// authed wraps the standard authentication chain; extra middleware (e.g.
 	// permission checks) runs after it.

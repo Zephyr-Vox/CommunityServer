@@ -13,7 +13,6 @@ import (
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/protocol"
-	rbaccontrol "zephyr.vox/server/ce/internal/rbac/control"
 	"zephyr.vox/server/ce/internal/realtime"
 
 	"github.com/labstack/echo/v5"
@@ -418,114 +417,6 @@ func accountStateEvents(change auth.StateChange, version *realtime.StateVersion)
 			Data:            selfData,
 			DeliveryPolicy:  realtime.StateDeliveryUserTargeted,
 			RecipientUserID: change.UserID,
-		})
-	}
-	return events, nil
-}
-
-// publishRBACChange refreshes the persistent projection after a committed role,
-// binding, owner-transfer or permission-config mutation. It emits full role
-// DTOs and targeted self.updated state for affected principals.
-func (a *App) publishRBACChange(ctx context.Context, change rbaccontrol.StateChange) error {
-	state, sequencer, ok := a.realtimeComponents()
-	if !ok {
-		return errors.New("server: realtime unavailable")
-	}
-	completionCtx := context.WithoutCancel(ctx)
-	_, err := sequencer.Submit(completionCtx, realtime.PostCommitCommand{
-		QueueBytes: 1,
-		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
-			candidate, err := state.BuildPersistentCandidate(commandCtx)
-			if err != nil {
-				return realtime.CommandOutput{}, err
-			}
-			events, err := rbacStateEvents(change, candidate.Version())
-			if err != nil {
-				return realtime.CommandOutput{}, err
-			}
-			visibilityUserIDs := make([]int64, 0)
-			for _, user := range candidate.Version().Users() {
-				visibilityUserIDs = append(visibilityUserIDs, user.ID)
-			}
-			if _, err := execution.Reserve(realtime.PublicationRequest{
-				Candidate:         candidate,
-				Events:            events,
-				VisibilityUserIDs: visibilityUserIDs,
-			}); err != nil {
-				return realtime.CommandOutput{}, err
-			}
-			if err := execution.MarkRuntimeReady(); err != nil {
-				return realtime.CommandOutput{}, err
-			}
-			return realtime.CommandOutput{}, nil
-		},
-	})
-	if err != nil {
-		a.reportRealtimeFatal(fmt.Errorf("RBAC state publication: %w", err))
-	}
-	return err
-}
-
-// rbacStateEvents creates one canonical role/config invalidation event plus
-// targeted complete self DTOs for users whose permissions may have changed.
-func rbacStateEvents(change rbaccontrol.StateChange, version *realtime.StateVersion) ([]realtime.StateEventTemplate, error) {
-	events := make([]realtime.StateEventTemplate, 0, 1+len(change.UserIDs))
-	switch change.EventType {
-	case "rbac.role.created", "rbac.role.updated":
-		role, ok := version.Role(change.RoleKey)
-		if !ok {
-			return nil, errors.New("server: role missing from realtime projection")
-		}
-		data, err := json.Marshal(realtime.SnapshotRole{
-			Key:         role.Key,
-			DisplayName: role.DisplayName,
-			Rank:        role.Rank,
-			Builtin:     role.Builtin,
-		})
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, realtime.StateEventTemplate{EventType: change.EventType, Scope: realtime.Scope{Type: "server"}, Data: data})
-	case "rbac.role.deleted":
-		data, err := json.Marshal(struct {
-			RoleKey string `json:"role_key"`
-		}{RoleKey: change.RoleKey})
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, realtime.StateEventTemplate{EventType: change.EventType, Scope: realtime.Scope{Type: "server"}, Data: data})
-	case "rbac.binding.updated", "rbac.config.updated":
-		data, err := json.Marshal(struct {
-			Scope struct {
-				Type string `json:"type"`
-			} `json:"scope"`
-			EntityVersion string `json:"entity_version"`
-		}{Scope: struct {
-			Type string `json:"type"`
-		}{Type: "server"}, EntityVersion: strconv.FormatUint(version.Number(), 10)})
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, realtime.StateEventTemplate{EventType: change.EventType, Scope: realtime.Scope{Type: "server"}, Data: data})
-	default:
-		return nil, errors.New("server: invalid RBAC state change")
-	}
-	for _, userID := range change.UserIDs {
-		if _, exists := version.User(userID); !exists {
-			continue
-		}
-		data, err := json.Marshal(struct {
-			Self realtime.SnapshotSelf `json:"self"`
-		}{Self: realtime.SnapshotSelfFor(userID, version)})
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, realtime.StateEventTemplate{
-			EventType:       "self.updated",
-			Scope:           realtime.Scope{Type: "server"},
-			Data:            data,
-			DeliveryPolicy:  realtime.StateDeliveryUserTargeted,
-			RecipientUserID: userID,
 		})
 	}
 	return events, nil

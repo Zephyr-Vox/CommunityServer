@@ -7,6 +7,7 @@ import (
 
 	"zephyr.vox/server/ce/internal/rbac"
 	"zephyr.vox/server/ce/internal/rbac/control"
+	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/store"
 )
 
@@ -110,7 +111,7 @@ func TestControlMutationsRecheckRoleManageAfterOwnerTransfer(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	svc := control.NewService(s, noOpPrincipalMutations{})
+	svc := newControlService(t, s)
 	if _, err := svc.CreateRole(ctx, oldOwner.ID, "moderator", "Moderator", 500); err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +139,34 @@ func TestControlMutationsRecheckRoleManageAfterOwnerTransfer(t *testing.T) {
 	if _, err := svc.ResetConfig(ctx, oldOwner.ID, store.ConfigScope{Type: "server"}); !errors.Is(err, control.ErrRoleManageRequired) {
 		t.Fatalf("former owner ResetConfig = %v, want ErrRoleManageRequired", err)
 	}
+}
+
+// newControlService assembles the same state command boundary used by the
+// server so control mutations cannot silently fall back to direct DB commits.
+func newControlService(t *testing.T, stores *store.Stores) *control.Service {
+	t.Helper()
+	state, err := realtime.NewStateStoreWithEpoch(context.Background(), stores, "0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication, err := realtime.NewStatePublication(state, realtime.NewStateRing(), realtime.NewVisibilityResolver(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := realtime.NewPostCommitSequencer(publication, stores.IDGenerator(), func(err error) {
+		t.Errorf("unexpected sequencer failure: %v", err)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sequencer.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	svc := control.NewService(stores, noOpPrincipalMutations{})
+	svc.SetStateCommandRuntime(state, sequencer)
+	return svc
 }
 
 func TestAuthorizerReadsPersistedConfig(t *testing.T) {

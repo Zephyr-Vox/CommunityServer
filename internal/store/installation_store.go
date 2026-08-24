@@ -121,16 +121,22 @@ func (s *Stores) TransferOwner(ctx context.Context, currentUserID, targetUserID 
 		return err
 	}
 	defer tx.Rollback()
-	if err := s.WithTx(tx).transferOwner(ctx, currentUserID, targetUserID); err != nil {
+	if err := s.WithTx(tx).TransferOwnerInTx(ctx, currentUserID, targetUserID); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// transferOwner performs the owner replacement inside a caller-owned
+// TransferOwnerInTx performs the owner replacement inside a caller-owned
 // transaction. The delete-before-insert order is required by the immediate
 // owner unique index and deliberately permits zero owners only transiently.
-func (s *Stores) transferOwner(ctx context.Context, currentUserID, targetUserID int64) error {
+func (s *Stores) TransferOwnerInTx(ctx context.Context, currentUserID, targetUserID int64) error {
+	if s == nil || s.conn != nil {
+		return ErrTransactionRequired
+	}
+	if currentUserID == targetUserID {
+		return ErrOwnerTransferTarget
+	}
 	state, err := s.Installation.Get(ctx)
 	if err != nil {
 		return err

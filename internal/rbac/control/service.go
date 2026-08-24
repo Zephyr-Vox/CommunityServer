@@ -10,6 +10,7 @@ import (
 
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/rbac"
+	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/store"
 )
 
@@ -34,6 +35,9 @@ var (
 	// ErrRoleManageRequired is returned when the actor lost role.manage after
 	// route middleware admitted the request but before its mutation began.
 	ErrRoleManageRequired = errors.New("rbac control: role.manage required")
+	// ErrRealtimeUnavailable is returned when a state-changing control command
+	// is attempted before server assembly has installed its sequencer runtime.
+	ErrRealtimeUnavailable = errors.New("rbac control: realtime command runtime unavailable")
 )
 
 var roleKeyRE = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
@@ -50,8 +54,9 @@ type PrincipalMutations interface {
 type Service struct {
 	stores     *store.Stores
 	principals PrincipalMutations
-	publisher  StateChangePublisher
 	gate       MutationGate
+	state      *realtime.StateStore
+	sequencer  *realtime.PostCommitSequencer
 }
 
 // StateChange identifies a committed RBAC mutation requiring an immutable
@@ -61,12 +66,8 @@ type StateChange struct {
 	EventType string
 	RoleKey   string
 	UserIDs   []int64
+	Scope     realtime.Scope
 }
-
-// StateChangePublisher synchronizes one committed RBAC fact into the
-// application-owned StateStore. Server assembly provides it; focused RBAC tests
-// may leave it unset.
-type StateChangePublisher func(context.Context, StateChange) error
 
 // MutationGate serializes one persistent RBAC transaction with its following
 // StateStore publication. Server assembly shares this gate with every domain
@@ -80,9 +81,12 @@ func NewService(stores *store.Stores, principals PrincipalMutations) *Service {
 	return &Service{stores: stores, principals: principals}
 }
 
-// SetStateChangePublisher installs the post-commit realtime projection bridge.
-func (s *Service) SetStateChangePublisher(publisher StateChangePublisher) {
-	s.publisher = publisher
+// SetStateCommandRuntime installs the application-owned StateStore and single
+// writer used for every persistent RBAC control mutation. Server setup calls it
+// before mounting HTTP routes and does not replace it while requests are live.
+func (s *Service) SetStateCommandRuntime(state *realtime.StateStore, sequencer *realtime.PostCommitSequencer) {
+	s.state = state
+	s.sequencer = sequencer
 }
 
 // SetStateMutationGate installs the process-wide persistent mutation gate.
@@ -112,38 +116,29 @@ func (s *Service) CreateRole(ctx context.Context, actorID int64, key, displayNam
 	if !roleKeyRE.MatchString(key) || key == "owner" || key == "admin" || key == "member" {
 		return nil, ErrInvalidRoleKey
 	}
-	unlock := s.principals.LockMutation(actorID)
-	defer unlock()
-	release, err := acquireMutation(ctx, s.gate)
+	value, err := s.runMutation(ctx, []int64{actorID}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
+			return mutationResult{}, err
+		}
+		authority, err := s.authority(commandCtx, txStores, actorID)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if rank < 0 || rank >= authority.rank || rank >= 1_000_000 {
+			return mutationResult{}, ErrRankProtected
+		}
+		role, err := txStores.Roles.Create(commandCtx, key, displayName, rank)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		return mutationResult{value: role, change: StateChange{EventType: "rbac.role.created", RoleKey: role.Key}}, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer release()
-	tx, err := s.stores.BeginTx(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	txStores := s.stores.WithTx(tx)
-	if err := requireRoleManage(ctx, txStores, actorID); err != nil {
-		return nil, err
-	}
-	authority, err := s.authority(ctx, txStores, actorID)
-	if err != nil {
-		return nil, err
-	}
-	if rank < 0 || rank >= authority.rank || rank >= 1_000_000 {
-		return nil, ErrRankProtected
-	}
-	role, err := txStores.Roles.Create(ctx, key, displayName, rank)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	if err := s.publish(ctx, StateChange{EventType: "rbac.role.created", RoleKey: role.Key}); err != nil {
-		return nil, err
+	role, ok := value.(*db.Role)
+	if !ok {
+		return nil, ErrRealtimeUnavailable
 	}
 	return role, nil
 }
@@ -151,104 +146,89 @@ func (s *Service) CreateRole(ctx context.Context, actorID int64, key, displayNam
 // UpdateRole updates a role's mutable fields while preserving rank hierarchy
 // and owner immutability. An unchanged request returns the existing role.
 func (s *Service) UpdateRole(ctx context.Context, actorID int64, key string, displayName *string, rank *int64) (*db.Role, error) {
-	unlock := s.principals.LockMutation(actorID)
-	defer unlock()
-	release, err := acquireMutation(ctx, s.gate)
+	userIDs, err := s.usersWithBindings(ctx, actorID)
 	if err != nil {
 		return nil, err
 	}
-	defer release()
-	tx, err := s.stores.BeginTx(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	txStores := s.stores.WithTx(tx)
-	if err := requireRoleManage(ctx, txStores, actorID); err != nil {
-		return nil, err
-	}
-	role, err := txStores.Roles.Get(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	authority, err := s.authority(ctx, txStores, actorID)
-	if err != nil {
-		return nil, err
-	}
-	if role.Key == "owner" {
-		if !authority.owner || rank != nil {
-			return nil, ErrImmutableRole
+	value, err := s.runMutation(ctx, userIDs, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
+			return mutationResult{}, err
 		}
-	} else if role.Rank >= authority.rank {
-		return nil, ErrRankProtected
-	}
-
-	newDisplayName := role.DisplayName
-	if displayName != nil {
-		newDisplayName = *displayName
-	}
-	newRank := role.Rank
-	if rank != nil {
-		newRank = *rank
-	}
-	if newRank < 0 || newRank >= 1_000_000 || (role.Key != "owner" && newRank >= authority.rank) {
-		return nil, ErrRankProtected
-	}
-	if newDisplayName == role.DisplayName && newRank == role.Rank {
-		return role, nil
-	}
-	updated, err := txStores.Roles.Update(ctx, key, newDisplayName, newRank)
+		role, err := txStores.Roles.Get(commandCtx, key)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		authority, err := s.authority(commandCtx, txStores, actorID)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if role.Key == "owner" {
+			if !authority.owner || rank != nil {
+				return mutationResult{}, ErrImmutableRole
+			}
+		} else if role.Rank >= authority.rank {
+			return mutationResult{}, ErrRankProtected
+		}
+		newDisplayName := role.DisplayName
+		if displayName != nil {
+			newDisplayName = *displayName
+		}
+		newRank := role.Rank
+		if rank != nil {
+			newRank = *rank
+		}
+		if newRank < 0 || newRank >= 1_000_000 || (role.Key != "owner" && newRank >= authority.rank) {
+			return mutationResult{}, ErrRankProtected
+		}
+		if newDisplayName == role.DisplayName && newRank == role.Rank {
+			return mutationResult{value: role, noop: true}, nil
+		}
+		updated, err := txStores.Roles.Update(commandCtx, key, newDisplayName, newRank)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		return mutationResult{value: updated, change: StateChange{EventType: "rbac.role.updated", RoleKey: updated.Key, UserIDs: userIDs}}, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
+	role, ok := value.(*db.Role)
+	if !ok {
+		return nil, ErrRealtimeUnavailable
 	}
-	if err := s.publish(ctx, StateChange{EventType: "rbac.role.updated", RoleKey: updated.Key}); err != nil {
-		return nil, err
-	}
-	return updated, nil
+	return role, nil
 }
 
 // DeleteRole deletes an unreferenced custom role below the actor's rank.
 func (s *Service) DeleteRole(ctx context.Context, actorID int64, key string) error {
-	unlock := s.principals.LockMutation(actorID)
-	defer unlock()
-	release, err := acquireMutation(ctx, s.gate)
+	userIDs, err := s.usersWithBindings(ctx, actorID)
 	if err != nil {
 		return err
 	}
-	defer release()
-	tx, err := s.stores.BeginTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	txStores := s.stores.WithTx(tx)
-	if err := requireRoleManage(ctx, txStores, actorID); err != nil {
-		return err
-	}
-	role, err := txStores.Roles.Get(ctx, key)
-	if err != nil {
-		return err
-	}
-	if role.Builtin != 0 {
-		return ErrBuiltinRole
-	}
-	authority, err := s.authority(ctx, txStores, actorID)
-	if err != nil {
-		return err
-	}
-	if role.Rank >= authority.rank {
-		return ErrRankProtected
-	}
-	if err := txStores.Roles.Delete(ctx, key); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return s.publish(ctx, StateChange{EventType: "rbac.role.deleted", RoleKey: key})
+	_, err = s.runMutation(ctx, userIDs, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
+			return mutationResult{}, err
+		}
+		role, err := txStores.Roles.Get(commandCtx, key)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if role.Builtin != 0 {
+			return mutationResult{}, ErrBuiltinRole
+		}
+		authority, err := s.authority(commandCtx, txStores, actorID)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if role.Rank >= authority.rank {
+			return mutationResult{}, ErrRankProtected
+		}
+		if err := txStores.Roles.Delete(commandCtx, key); err != nil {
+			return mutationResult{}, err
+		}
+		return mutationResult{change: StateChange{EventType: "rbac.role.deleted", RoleKey: key, UserIDs: userIDs}}, nil
+	})
+	return err
 }
 
 // ListBindings returns bindings the actor may manage. Non-owners do not see
@@ -288,61 +268,52 @@ func (s *Service) CreateBinding(ctx context.Context, actorID int64, input Bindin
 	if input.RoleKey == "owner" {
 		return nil, false, store.ErrOwnerBindingProtected
 	}
-
-	unlock := s.principals.LockMutation(actorID, input.UserID)
-	defer unlock()
-	release, err := acquireMutation(ctx, s.gate)
+	value, err := s.runMutation(ctx, []int64{actorID, input.UserID}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
+			return mutationResult{}, err
+		}
+		if err := s.validateScope(commandCtx, txStores, input); err != nil {
+			return mutationResult{}, err
+		}
+		if err := s.checkBindingAuthority(commandCtx, txStores, actorID, input); err != nil {
+			return mutationResult{}, err
+		}
+		// The lookup fast-path makes repeated requests idempotent. InsertBinding's
+		// unique constraint remains the authority for requests that race outside
+		// this process, so a conflict is recovered by the same lookup.
+		if existing, err := matchingBinding(commandCtx, txStores, input); err != nil {
+			return mutationResult{}, err
+		} else if existing != nil {
+			return mutationResult{value: bindingMutation{binding: existing}, noop: true}, nil
+		}
+		groupID, channelID := scopeIDs(input)
+		binding, err := txStores.Roles.InsertBinding(commandCtx, input.UserID, input.RoleKey, input.ScopeType, groupID, channelID)
+		if err != nil {
+			if !errors.Is(err, store.ErrConflict) {
+				return mutationResult{}, err
+			}
+			existing, lookupErr := matchingBinding(commandCtx, txStores, input)
+			if lookupErr != nil {
+				return mutationResult{}, lookupErr
+			}
+			if existing == nil {
+				return mutationResult{}, err
+			}
+			return mutationResult{value: bindingMutation{binding: existing}, noop: true}, nil
+		}
+		return mutationResult{
+			value:  bindingMutation{binding: binding, created: true},
+			change: StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{input.UserID}, Scope: bindingScopeFromInput(input)},
+		}, nil
+	})
 	if err != nil {
 		return nil, false, err
 	}
-	defer release()
-	tx, err := s.stores.BeginTx(ctx)
-	if err != nil {
-		return nil, false, err
+	result, ok := value.(bindingMutation)
+	if !ok || result.binding == nil {
+		return nil, false, ErrRealtimeUnavailable
 	}
-	defer tx.Rollback()
-	txStores := s.stores.WithTx(tx)
-	if err := requireRoleManage(ctx, txStores, actorID); err != nil {
-		return nil, false, err
-	}
-	if err := s.validateScope(ctx, txStores, input); err != nil {
-		return nil, false, err
-	}
-	if err := s.checkBindingAuthority(ctx, txStores, actorID, input); err != nil {
-		return nil, false, err
-	}
-	// The lookup fast-path makes repeated requests idempotent. InsertBinding's
-	// unique constraint remains the authority for requests that race outside this
-	// process's principal barrier, so an ErrConflict below is recovered by the
-	// same lookup before reporting failure.
-	if existing, err := matchingBinding(ctx, txStores, input); err != nil {
-		return nil, false, err
-	} else if existing != nil {
-		return existing, false, tx.Commit()
-	}
-	groupID, channelID := scopeIDs(input)
-	binding, err := txStores.Roles.InsertBinding(ctx, input.UserID, input.RoleKey, input.ScopeType, groupID, channelID)
-	if err != nil {
-		if !errors.Is(err, store.ErrConflict) {
-			return nil, false, err
-		}
-		existing, lookupErr := matchingBinding(ctx, txStores, input)
-		if lookupErr != nil {
-			return nil, false, lookupErr
-		}
-		if existing == nil {
-			return nil, false, err
-		}
-		return existing, false, tx.Commit()
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, false, err
-	}
-	s.principals.Invalidate(input.UserID)
-	if err := s.publish(ctx, StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{input.UserID}}); err != nil {
-		return nil, false, err
-	}
-	return binding, true, nil
+	return result.binding, result.created, nil
 }
 
 // DeleteBinding removes one non-owner binding after strict actor/target rank
@@ -355,73 +326,53 @@ func (s *Service) DeleteBinding(ctx context.Context, actorID, bindingID int64) e
 	if err != nil {
 		return err
 	}
-	unlock := s.principals.LockMutation(actorID, binding.UserID)
-	defer unlock()
-	release, err := acquireMutation(ctx, s.gate)
-	if err != nil {
-		return err
-	}
-	defer release()
-	tx, err := s.stores.BeginTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	txStores := s.stores.WithTx(tx)
-	if err := requireRoleManage(ctx, txStores, actorID); err != nil {
-		return err
-	}
-	binding, err = txStores.Roles.GetBinding(ctx, bindingID)
-	if err != nil {
-		return err
-	}
-	if binding.RoleKey == "owner" {
-		return store.ErrOwnerBindingProtected
-	}
-	actor, err := s.authority(ctx, txStores, actorID)
-	if err != nil {
-		return err
-	}
-	target, err := s.authority(ctx, txStores, binding.UserID)
-	if err != nil {
-		return err
-	}
-	if actor.rank <= target.rank {
-		return ErrRankProtected
-	}
-	role, err := txStores.Roles.Get(ctx, binding.RoleKey)
-	if err != nil {
-		return err
-	}
-	if actor.rank <= role.Rank {
-		return ErrRankProtected
-	}
-	if err := txStores.Roles.DeleteBinding(ctx, bindingID); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	s.principals.Invalidate(binding.UserID)
-	return s.publish(ctx, StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{binding.UserID}})
+	_, err = s.runMutation(ctx, []int64{actorID, binding.UserID}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
+			return mutationResult{}, err
+		}
+		current, err := txStores.Roles.GetBinding(commandCtx, bindingID)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if current.RoleKey == "owner" {
+			return mutationResult{}, store.ErrOwnerBindingProtected
+		}
+		actor, err := s.authority(commandCtx, txStores, actorID)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		target, err := s.authority(commandCtx, txStores, current.UserID)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if actor.rank <= target.rank {
+			return mutationResult{}, ErrRankProtected
+		}
+		role, err := txStores.Roles.Get(commandCtx, current.RoleKey)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if actor.rank <= role.Rank {
+			return mutationResult{}, ErrRankProtected
+		}
+		if err := txStores.Roles.DeleteBinding(commandCtx, bindingID); err != nil {
+			return mutationResult{}, err
+		}
+		return mutationResult{change: StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{current.UserID}, Scope: bindingScope(current)}}, nil
+	})
+	return err
 }
 
 // TransferOwner transfers the unique owner role after the principal mutation
 // barrier covers both users. The store performs the atomic server-binding swap.
 func (s *Service) TransferOwner(ctx context.Context, currentUserID, targetUserID int64) error {
-	unlock := s.principals.LockMutation(currentUserID, targetUserID)
-	defer unlock()
-	release, err := acquireMutation(ctx, s.gate)
-	if err != nil {
-		return err
-	}
-	defer release()
-	if err := s.stores.TransferOwner(ctx, currentUserID, targetUserID); err != nil {
-		return err
-	}
-	s.principals.Invalidate(currentUserID)
-	s.principals.Invalidate(targetUserID)
-	return s.publish(ctx, StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{currentUserID, targetUserID}})
+	_, err := s.runMutation(ctx, []int64{currentUserID, targetUserID}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		if err := txStores.TransferOwnerInTx(commandCtx, currentUserID, targetUserID); err != nil {
+			return mutationResult{}, err
+		}
+		return mutationResult{change: StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{currentUserID, targetUserID}, Scope: realtime.Scope{Type: "server"}}}, nil
+	})
+	return err
 }
 
 // GetConfig returns the requested scope's local snapshot and effective source.
@@ -437,50 +388,38 @@ func (s *Service) UpdateConfig(ctx context.Context, actorID int64, input ConfigI
 	if err != nil {
 		return nil, err
 	}
-	unlock := s.principals.LockMutation(actorID)
-	defer unlock()
-	release, err := acquireMutation(ctx, s.gate)
+	userIDs, err := s.usersWithBindings(ctx, actorID)
 	if err != nil {
 		return nil, err
 	}
-	defer release()
-	tx, err := s.stores.BeginTx(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	txStores := s.stores.WithTx(tx)
-	if err := requireRoleManage(ctx, txStores, actorID); err != nil {
-		return nil, err
-	}
-	allowed, owner, err := actorPermissions(ctx, txStores, actorID)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateGrantedPermissions(string(raw), allowed, owner); err != nil {
-		return nil, err
-	}
-	config, err := txStores.Configs.Update(ctx, input.Scope, string(raw))
-	if err != nil {
-		return nil, err
-	}
-	if input.Scope.Type == "server" && !owner {
-		if err := s.ensureManagementRetained(ctx, txStores, actorID, allowed); err != nil {
-			return nil, err
+	value, err := s.runMutation(ctx, userIDs, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
+			return mutationResult{}, err
 		}
-	}
-	// Capture affected users in the same transaction as the config write. Cache
-	// invalidation follows commit so readers never reload from rolled-back state.
-	userIDs, err := txStores.Roles.ListUsersWithBindings(ctx)
+		allowed, owner, err := actorPermissions(commandCtx, txStores, actorID)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if err := validateGrantedPermissions(string(raw), allowed, owner); err != nil {
+			return mutationResult{}, err
+		}
+		config, err := txStores.Configs.Update(commandCtx, input.Scope, string(raw))
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if input.Scope.Type == "server" && !owner {
+			if err := s.ensureManagementRetained(commandCtx, txStores, actorID, allowed); err != nil {
+				return mutationResult{}, err
+			}
+		}
+		return mutationResult{value: config, change: StateChange{EventType: "rbac.config.updated", UserIDs: userIDs, Scope: realtimeScope(input.Scope)}}, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	s.invalidatePrincipals(userIDs)
-	if err := s.publish(ctx, StateChange{EventType: "rbac.config.updated", UserIDs: userIDs}); err != nil {
-		return nil, err
+	config, ok := value.(*store.EffectiveConfig)
+	if !ok {
+		return nil, ErrRealtimeUnavailable
 	}
 	return config, nil
 }
@@ -489,50 +428,38 @@ func (s *Service) UpdateConfig(ctx context.Context, actorID int64, input ConfigI
 // The effective permissions after reset must still be a subset of the actor's
 // current grants unless the actor is owner.
 func (s *Service) ResetConfig(ctx context.Context, actorID int64, scope store.ConfigScope) (*store.EffectiveConfig, error) {
-	unlock := s.principals.LockMutation(actorID)
-	defer unlock()
-	release, err := acquireMutation(ctx, s.gate)
+	userIDs, err := s.usersWithBindings(ctx, actorID)
 	if err != nil {
 		return nil, err
 	}
-	defer release()
-	tx, err := s.stores.BeginTx(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	txStores := s.stores.WithTx(tx)
-	if err := requireRoleManage(ctx, txStores, actorID); err != nil {
-		return nil, err
-	}
-	allowed, owner, err := actorPermissions(ctx, txStores, actorID)
-	if err != nil {
-		return nil, err
-	}
-	config, err := txStores.Configs.Reset(ctx, scope)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateGrantedPermissions(config.Source.Config, allowed, owner); err != nil {
-		return nil, err
-	}
-	if scope.Type == "server" && !owner {
-		if err := s.ensureManagementRetained(ctx, txStores, actorID, allowed); err != nil {
-			return nil, err
+	value, err := s.runMutation(ctx, userIDs, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
+			return mutationResult{}, err
 		}
-	}
-	// See UpdateConfig: this snapshot and the config reset commit together; only
-	// committed permission changes may invalidate principal cache entries.
-	userIDs, err := txStores.Roles.ListUsersWithBindings(ctx)
+		allowed, owner, err := actorPermissions(commandCtx, txStores, actorID)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		config, err := txStores.Configs.Reset(commandCtx, scope)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if err := validateGrantedPermissions(config.Source.Config, allowed, owner); err != nil {
+			return mutationResult{}, err
+		}
+		if scope.Type == "server" && !owner {
+			if err := s.ensureManagementRetained(commandCtx, txStores, actorID, allowed); err != nil {
+				return mutationResult{}, err
+			}
+		}
+		return mutationResult{value: config, change: StateChange{EventType: "rbac.config.updated", UserIDs: userIDs, Scope: realtimeScope(scope)}}, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	s.invalidatePrincipals(userIDs)
-	if err := s.publish(ctx, StateChange{EventType: "rbac.config.updated", UserIDs: userIDs}); err != nil {
-		return nil, err
+	config, ok := value.(*store.EffectiveConfig)
+	if !ok {
+		return nil, ErrRealtimeUnavailable
 	}
 	return config, nil
 }
@@ -675,14 +602,6 @@ func (s *Service) invalidatePrincipals(userIDs []int64) {
 	for _, userID := range userIDs {
 		s.principals.Invalidate(userID)
 	}
-}
-
-// publish forwards one committed RBAC fact to the optional realtime bridge.
-func (s *Service) publish(ctx context.Context, change StateChange) error {
-	if s.publisher == nil {
-		return nil
-	}
-	return s.publisher(ctx, change)
 }
 
 // acquireMutation returns a no-op release for standalone RBAC service tests.
