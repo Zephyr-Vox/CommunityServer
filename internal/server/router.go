@@ -8,6 +8,7 @@ import (
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/auth"
+	"zephyr.vox/server/ce/internal/channel"
 	"zephyr.vox/server/ce/internal/image"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbaccontrol "zephyr.vox/server/ce/internal/rbac/control"
@@ -56,6 +57,10 @@ func (a *App) routes(e *echo.Echo) error {
 	api.GET("/metadata", realtime.MetadataHandler(a.metadata))
 	api.GET("/state/snapshot", realtime.SnapshotHandler(a.currentStateSync), authed()...)
 	api.GET("/ws", realtime.WebSocketHandler(a.connectionAuthenticator(), a.connections, a.upgradeLimiter(), a.currentStateSync, a.connectionStatePublisher()))
+	api.GET("/groups", channel.ListGroupsHandler(a.channels), authed()...)
+	api.POST("/groups", channel.CreateGroupHandler(a.channels), authed()...)
+	api.GET("/channels", channel.ListChannelsHandler(a.channels), authed()...)
+	api.POST("/channels", channel.CreateChannelHandler(a.channels), authed()...)
 	authGroup := api.Group("/auth")
 	authGroup.GET("/status", auth.StatusHandler(a.stores, auth.RegistrationMode(a.cfg.RegistrationMode)))
 	authGroup.POST("/register", auth.RegisterHandler(a.register), auth.IPRateLimit(a.cfg.LoginRateLimit))

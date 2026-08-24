@@ -34,6 +34,13 @@ type StateSyncStrategy interface {
 	OnDisconnect(ref ControlConnectionRef)
 }
 
+// StateCursorIssuer issues an opaque cursor for an already-published immutable
+// state version. Sequenced HTTP mutations use it to return the exact checkpoint
+// they committed rather than recapturing a possibly newer snapshot.
+type StateCursorIssuer interface {
+	IssueStateCursor(userID int64, version *StateVersion) (string, error)
+}
+
 // StateSnapshot is the complete replace-style v1 state response for one user.
 type StateSnapshot struct {
 	Cursor       string        `json:"cursor"`
@@ -222,6 +229,19 @@ func (s *FullSnapshotSyncStrategy) CaptureSnapshot(userID int64) (StateSnapshot,
 		StateVersion: strconv.FormatUint(capture.Version.Number(), 10),
 		State:        snapshotStateFor(userID, capture.Version, s.visibility),
 	}, nil
+}
+
+// IssueStateCursor returns a cursor bound to userID and version's final
+// checkpoint and visibility epoch. The caller must supply a version published
+// by this strategy's StatePublication; another stream epoch is rejected.
+func (s *FullSnapshotSyncStrategy) IssueStateCursor(userID int64, version *StateVersion) (string, error) {
+	if s == nil || s.signer == nil || version == nil || userID <= 0 {
+		return "", ErrInvalidStateSync
+	}
+	if _, exists := version.User(userID); !exists {
+		return "", ErrInvalidStateSync
+	}
+	return s.signer.Issue(userID, version.Checkpoint(), version.VisibilityEpoch(userID))
 }
 
 // OnHello validates cursor and registers connection under one publication
