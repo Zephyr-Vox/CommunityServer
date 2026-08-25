@@ -51,6 +51,22 @@ func (s *AccessStore) ListGroup(ctx context.Context, groupID int64) ([]db.GroupA
 	return entries, nil
 }
 
+// CountGroup returns the number of ACL entries attached to groupID.
+func (s *AccessStore) CountGroup(ctx context.Context, groupID int64) (int64, error) {
+	count, err := s.q.CountGroupAccess(ctx, groupID)
+	return count, mapError(err)
+}
+
+// DeleteGroup removes accessID only when it belongs to groupID. A missing or
+// mismatched entry returns ErrNotFound without revealing another group's ACL.
+func (s *AccessStore) DeleteGroup(ctx context.Context, groupID, accessID int64) (*db.GroupAccess, error) {
+	entry, err := s.q.DeleteGroupAccess(ctx, db.DeleteGroupAccessParams{GroupID: groupID, ID: accessID})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &entry, nil
+}
+
 // ListAllGroups returns every group ACL entry in ascending ID order for an
 // internal state projection.
 func (s *AccessStore) ListAllGroups(ctx context.Context) ([]db.GroupAccess, error) {
@@ -89,6 +105,23 @@ func (s *AccessStore) ListChannel(ctx context.Context, channelID int64) ([]db.Ch
 		return nil, mapError(err)
 	}
 	return entries, nil
+}
+
+// CountChannel returns the number of ACL entries attached to channelID.
+func (s *AccessStore) CountChannel(ctx context.Context, channelID int64) (int64, error) {
+	count, err := s.q.CountChannelAccess(ctx, channelID)
+	return count, mapError(err)
+}
+
+// DeleteChannel removes accessID only when it belongs to channelID. A missing
+// or mismatched entry returns ErrNotFound without revealing another channel's
+// ACL.
+func (s *AccessStore) DeleteChannel(ctx context.Context, channelID, accessID int64) (*db.ChannelAccess, error) {
+	entry, err := s.q.DeleteChannelAccess(ctx, db.DeleteChannelAccessParams{ChannelID: channelID, ID: accessID})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &entry, nil
 }
 
 // ListAllChannels returns every channel ACL entry in ascending ID order for

@@ -63,3 +63,13 @@ type updateChannelRequest struct {
 	Temporary  *bool                  `json:"temporary"`
 	CreatedBy  *string                `json:"created_by"`
 }
+
+// accessRequest is the POST /groups/:id/access and POST /channels/:id/access
+// payload. Principal exact-one validation is completed by the handler because
+// it depends on principal_type rather than independent field constraints.
+type accessRequest struct {
+	PrincipalType string  `json:"principal_type" validate:"required,oneof=user role"`
+	UserID        *string `json:"user_id" validate:"omitempty"`
+	RoleKey       *string `json:"role_key" validate:"omitempty,min=1,max=64"`
+	GrantParent   bool    `json:"grant_parent"`
+}

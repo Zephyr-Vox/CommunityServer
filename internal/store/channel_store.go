@@ -77,6 +77,16 @@ func (s *ChannelStore) UpdateGroup(ctx context.Context, id int64, name string, p
 	return &group, nil
 }
 
+// TouchGroup increments a group's resource version after one ACL mutation.
+// Callers own the encompassing transaction and precondition comparison.
+func (s *ChannelStore) TouchGroup(ctx context.Context, id int64) (*db.ChannelGroup, error) {
+	group, err := s.q.TouchChannelGroup(ctx, db.TouchChannelGroupParams{UpdatedAt: s.now(), ID: id})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &group, nil
+}
+
 // DeleteGroup removes an empty group. The schema rejects a deletion while any
 // channel still references the group, preserving the application's explicit
 // voice teardown path.
@@ -191,6 +201,16 @@ func (s *ChannelStore) Update(ctx context.Context, id int64, input ChannelUpdate
 		UpdatedAt:  s.now(),
 		ID:         id,
 	})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &channel, nil
+}
+
+// Touch increments a channel's resource version after one ACL mutation.
+// Callers own the encompassing transaction and precondition comparison.
+func (s *ChannelStore) Touch(ctx context.Context, id int64) (*db.Channel, error) {
+	channel, err := s.q.TouchChannel(ctx, db.TouchChannelParams{UpdatedAt: s.now(), ID: id})
 	if err != nil {
 		return nil, mapError(err)
 	}

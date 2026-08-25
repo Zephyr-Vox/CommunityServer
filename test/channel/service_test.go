@@ -222,6 +222,114 @@ func TestGroupAndChannelReadsAndMutations(t *testing.T) {
 	assertDeletedEvent(t, fixture.publication, "group.deleted", realtime.Scope{Type: "group", ID: emptyGroupID}, "group_id", emptyGroupID, 1)
 }
 
+// TestACLCommandsAdvanceEntityVersionsAndPreservePrivateParentGates verifies
+// ACL writes use the sequencer, emit canonical/invalidation event pairs, retain
+// duplicate no-op behavior, and atomically add required private-parent access.
+func TestACLCommandsAdvanceEntityVersionsAndPreservePrivateParentGates(t *testing.T) {
+	fixture := newFixture(t)
+	ctx := context.Background()
+
+	group, _, err := fixture.service.CreateGroup(ctx, fixture.adminID, channel.CreateGroupInput{
+		Name:       "Private ACL",
+		Position:   1,
+		Visibility: "private",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupID := mustID(t, group.ID)
+	_, groupETag, err := fixture.service.GetGroup(fixture.adminID, groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	access, err := fixture.service.AddGroupAccess(ctx, fixture.adminID, groupID, groupETag, channel.AccessPrincipalInput{
+		Type:   "user",
+		UserID: &fixture.memberID,
+	})
+	if err != nil || !access.Created || access.Entry.UserID == nil || *access.Entry.UserID != fixture.memberID {
+		t.Fatalf("group access add = %+v, err = %v", access, err)
+	}
+	if access.ETag == groupETag || access.State.Checkpoint.GEID == 0 {
+		t.Fatalf("group access mutation did not advance entity/checkpoint: %+v", access)
+	}
+	assertACLEventTypes(t, fixture.publication, []string{"group.updated", "group.access.updated"})
+	if _, _, err := fixture.service.GetGroup(fixture.memberID, groupID); err != nil {
+		t.Fatalf("member group read after access grant = %v", err)
+	}
+
+	duplicate, err := fixture.service.AddGroupAccess(ctx, fixture.adminID, groupID, access.ETag, channel.AccessPrincipalInput{
+		Type:   "user",
+		UserID: &fixture.memberID,
+	})
+	if err != nil || duplicate.Created || duplicate.ETag != access.ETag || duplicate.State.Checkpoint.StreamEpoch != "" {
+		t.Fatalf("duplicate group access = %+v, err = %v", duplicate, err)
+	}
+	deleted, err := fixture.service.DeleteGroupAccess(ctx, fixture.adminID, groupID, access.Entry.ID, duplicate.ETag)
+	if err != nil || deleted.ETag == duplicate.ETag || deleted.State.Checkpoint.GEID == 0 {
+		t.Fatalf("group access delete = %+v, err = %v", deleted, err)
+	}
+	if _, _, err := fixture.service.GetGroup(fixture.memberID, groupID); !errors.Is(err, channel.ErrTargetNotFound) {
+		t.Fatalf("member group read after access delete = %v, want target not found", err)
+	}
+
+	parent, _, err := fixture.service.CreateGroup(ctx, fixture.adminID, channel.CreateGroupInput{
+		Name:       "Private Parent",
+		Position:   2,
+		Visibility: "private",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := mustID(t, parent.ID)
+	createdChannel, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		GroupID:    &parentID,
+		Name:       "Private Child",
+		Mode:       "voice",
+		Visibility: "private",
+		Capacity:   8,
+		Position:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channelID := mustID(t, createdChannel.ID)
+	_, channelETag, err := fixture.service.GetChannel(fixture.adminID, channelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, parentETag, err := fixture.service.GetGroup(fixture.adminID, parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := channel.AccessPrincipalInput{Type: "user", UserID: &fixture.memberID}
+	if _, err := fixture.service.AddChannelAccess(ctx, fixture.adminID, channelID, channelETag, "", channel.ChannelAccessInput{Principal: principal}); !errors.Is(err, channel.ErrParentAccessRequired) {
+		t.Fatalf("private parent channel access without parent grant = %v, want parent access required", err)
+	}
+	if _, err := fixture.service.AddChannelAccess(ctx, fixture.adminID, channelID, channelETag, "", channel.ChannelAccessInput{Principal: principal, GrantParent: true}); !errors.Is(err, channel.ErrPreconditionFailed) {
+		t.Fatalf("grant_parent without parent ETag = %v, want precondition failure", err)
+	}
+	channelAccess, err := fixture.service.AddChannelAccess(ctx, fixture.adminID, channelID, channelETag, parentETag, channel.ChannelAccessInput{Principal: principal, GrantParent: true})
+	if err != nil || !channelAccess.Created || channelAccess.ParentETag == "" || channelAccess.State.Checkpoint.GEID == 0 {
+		t.Fatalf("grant_parent channel access = %+v, err = %v", channelAccess, err)
+	}
+	assertACLEventTypes(t, fixture.publication, []string{"group.updated", "group.access.updated", "channel.updated", "channel.access.updated"})
+	if _, _, err := fixture.service.GetChannel(fixture.memberID, channelID); err != nil {
+		t.Fatalf("member child read after atomic parent/channel grant = %v", err)
+	}
+
+	duplicate, err = fixture.service.AddChannelAccess(ctx, fixture.adminID, channelID, channelAccess.ETag, channelAccess.ParentETag, channel.ChannelAccessInput{Principal: principal, GrantParent: true})
+	if err != nil || duplicate.Created || duplicate.State.Checkpoint.StreamEpoch != "" {
+		t.Fatalf("duplicate channel access = %+v, err = %v", duplicate, err)
+	}
+	deleted, err = fixture.service.DeleteChannelAccess(ctx, fixture.adminID, channelID, channelAccess.Entry.ID, duplicate.ETag)
+	if err != nil || deleted.ETag == duplicate.ETag || deleted.State.Checkpoint.GEID == 0 {
+		t.Fatalf("channel access delete = %+v, err = %v", deleted, err)
+	}
+	if _, _, err := fixture.service.GetChannel(fixture.memberID, channelID); !errors.Is(err, channel.ErrTargetNotFound) {
+		t.Fatalf("member child read after channel access delete = %v, want target not found", err)
+	}
+}
+
 // TestChannelMoveFreezesInheritedConfigAndProtectsVoiceAuthority verifies that
 // moving an inheriting channel creates a same-transaction local configuration,
 // and that runtime voice state blocks unsafe capacity reduction and deletion.
@@ -427,6 +535,39 @@ func assertEnvelopeCode(t *testing.T, response *httptest.ResponseRecorder, want 
 	if envelope.Code != want {
 		t.Fatalf("response code = %d, want %d; body = %s", envelope.Code, want, response.Body.String())
 	}
+}
+
+// assertACLEventTypes verifies that a command emitted the ordered canonical and
+// ACL invalidation event sequence. Visibility transition controls may follow
+// these events when the ACL changes a user's visible scope set.
+func assertACLEventTypes(t *testing.T, publication *realtime.StatePublication, want []string) {
+	t.Helper()
+	events := publication.Capture().Events
+	if len(events) < len(want) {
+		t.Fatalf("events = %+v, want suffix %v", events, want)
+	}
+	for start := len(events) - len(want); start >= 0; start-- {
+		matched := true
+		for index, eventType := range want {
+			if events[start+index].EventType != eventType {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return
+		}
+	}
+	t.Fatalf("event sequence = %v, want %v", eventTypes(events), want)
+}
+
+// eventTypes converts event records to a compact sequence for failed assertions.
+func eventTypes(events []realtime.StateEvent) []string {
+	values := make([]string, 0, len(events))
+	for _, event := range events {
+		values = append(values, event.EventType)
+	}
+	return values
 }
 
 // stringPtr returns a stable optional string test value.

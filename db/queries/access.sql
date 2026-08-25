@@ -7,6 +7,14 @@ RETURNING *;
 -- name: ListGroupAccess :many
 SELECT * FROM group_access WHERE group_id = ? ORDER BY id;
 
+-- name: CountGroupAccess :one
+SELECT COUNT(*) FROM group_access WHERE group_id = ?;
+
+-- name: DeleteGroupAccess :one
+DELETE FROM group_access
+WHERE group_id = ? AND id = ?
+RETURNING *;
+
 -- name: ListAllGroupAccess :many
 SELECT * FROM group_access ORDER BY id;
 
@@ -18,6 +26,14 @@ RETURNING *;
 
 -- name: ListChannelAccess :many
 SELECT * FROM channel_access WHERE channel_id = ? ORDER BY id;
+
+-- name: CountChannelAccess :one
+SELECT COUNT(*) FROM channel_access WHERE channel_id = ?;
+
+-- name: DeleteChannelAccess :one
+DELETE FROM channel_access
+WHERE channel_id = ? AND id = ?
+RETURNING *;
 
 -- name: ListAllChannelAccess :many
 SELECT * FROM channel_access ORDER BY id;

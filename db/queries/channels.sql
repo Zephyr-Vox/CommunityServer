@@ -24,6 +24,13 @@ SET name = ?,
 WHERE id = ?
 RETURNING *;
 
+-- name: TouchChannelGroup :one
+UPDATE channel_groups
+SET updated_at = ?,
+    version = version + 1
+WHERE id = ?
+RETURNING *;
+
 -- name: DeleteChannelGroup :one
 DELETE FROM channel_groups WHERE id = ? RETURNING id;
 
@@ -59,6 +66,13 @@ SET group_id = ?,
     position = ?,
     pinned = ?,
     updated_at = ?,
+    version = version + 1
+WHERE id = ?
+RETURNING *;
+
+-- name: TouchChannel :one
+UPDATE channels
+SET updated_at = ?,
     version = version + 1
 WHERE id = ?
 RETURNING *;

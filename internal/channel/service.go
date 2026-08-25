@@ -17,6 +17,7 @@ const (
 	maxChannels                 = 2048
 	maxTemporaryChannels        = 512
 	maxTemporaryChannelsCreator = 5
+	maxAccessEntries            = 1024
 	defaultChannelCapacity      = 256
 )
 
@@ -51,6 +52,15 @@ var (
 	// ErrChannelActive is returned when deletion would orphan a runtime voice
 	// authority before the voice-join lifecycle is implemented.
 	ErrChannelActive = errors.New("channel: channel has active voice authority")
+	// ErrParentAccessRequired is returned when a channel ACL grant into a
+	// private parent would leave its principal unable to see that parent.
+	ErrParentAccessRequired = errors.New("channel: private parent access required")
+	// ErrAccessPrincipalNotFound is returned when an ACL request names a user or
+	// role absent from the immutable command state.
+	ErrAccessPrincipalNotFound = errors.New("channel: access principal not found")
+	// ErrInvalidAccessPrincipal is returned when an ACL principal does not have
+	// exactly one valid user or role identity.
+	ErrInvalidAccessPrincipal = errors.New("channel: invalid access principal")
 )
 
 // PrincipalMutations supplies the authenticated principal write barrier. The
@@ -114,6 +124,31 @@ type UpdateChannelInput struct {
 	Capacity   *int64
 	Position   *int64
 	Pinned     *bool
+}
+
+// AccessPrincipalInput identifies exactly one user or role to receive an ACL
+// entry. UserID and RoleKey are mutually exclusive according to Type.
+type AccessPrincipalInput struct {
+	Type    string
+	UserID  *int64
+	RoleKey *string
+}
+
+// ChannelAccessInput supplies one channel ACL principal and an optional atomic
+// grant of that same principal to the channel's parent group.
+type ChannelAccessInput struct {
+	Principal   AccessPrincipalInput
+	GrantParent bool
+}
+
+// AccessMutation is the completed response state for one ACL POST. Created is
+// false only for a fully duplicate request, which therefore has no checkpoint.
+type AccessMutation struct {
+	Entry      realtime.AccessEntry
+	ETag       string
+	ParentETag string
+	Created    bool
+	State      StateCommand
 }
 
 // NewService builds a channel service over the persistent stores and principal
@@ -244,6 +279,410 @@ func (s *Service) GetChannel(actorID, channelID int64) (realtime.SnapshotChannel
 		return realtime.SnapshotChannel{}, "", err
 	}
 	return snapshotChannel(channel), etag, nil
+}
+
+// ListGroupAccess returns one actor-manageable page of a group's ACL entries
+// and the group entity ETag required by later ACL writes. The same immutable
+// state version supplies visibility, scoped authorization, and page contents.
+func (s *Service) ListGroupAccess(ctx context.Context, actorID, groupID, limit, offset int64) (accessPageResponse, string, error) {
+	version, err := s.currentVersion()
+	if err != nil {
+		return accessPageResponse{}, "", err
+	}
+	group, decision, err := s.authorizeGroupTarget(ctx, actorID, groupID, rbac.PermGroupManage, version)
+	if err != nil {
+		return accessPageResponse{}, "", err
+	}
+	if !decision.Allow {
+		return accessPageResponse{}, "", ErrPermissionRequired
+	}
+	etag, err := realtime.NumericEntityETag("group", group.ID, group.Version)
+	if err != nil {
+		return accessPageResponse{}, "", err
+	}
+	entries := version.GroupAccess(groupID)
+	paged := page(entries, limit, offset)
+	items := make([]accessResponse, 0, len(paged))
+	for _, entry := range paged {
+		items = append(items, snapshotAccessResponse(entry))
+	}
+	return accessPageResponse{Items: items, Limit: limit, Offset: offset, Total: int64(len(entries))}, etag, nil
+}
+
+// ListChannelAccess returns one actor-manageable page of a channel's ACL
+// entries and the channel entity ETag required by later ACL writes. It uses the
+// channel.manage read authority rather than the narrower invite authority.
+func (s *Service) ListChannelAccess(ctx context.Context, actorID, channelID, limit, offset int64) (accessPageResponse, string, error) {
+	version, err := s.currentVersion()
+	if err != nil {
+		return accessPageResponse{}, "", err
+	}
+	channel, decision, err := s.authorizeChannelTarget(ctx, actorID, channelID, rbac.PermChannelManage, version)
+	if err != nil {
+		return accessPageResponse{}, "", err
+	}
+	if !decision.Allow {
+		return accessPageResponse{}, "", ErrPermissionRequired
+	}
+	etag, err := realtime.NumericEntityETag("channel", channel.ID, channel.Version)
+	if err != nil {
+		return accessPageResponse{}, "", err
+	}
+	entries := version.ChannelAccess(channelID)
+	paged := page(entries, limit, offset)
+	items := make([]accessResponse, 0, len(paged))
+	for _, entry := range paged {
+		items = append(items, snapshotAccessResponse(entry))
+	}
+	return accessPageResponse{Items: items, Limit: limit, Offset: offset, Total: int64(len(entries))}, etag, nil
+}
+
+// AddGroupAccess creates one group ACL entry after exact group.manage
+// reauthorization and ETag comparison inside the sequencer. Duplicate entries
+// are no-ops and retain the group's current ETag without allocating a GEID.
+func (s *Service) AddGroupAccess(ctx context.Context, actorID, groupID int64, expectedETag string, principal AccessPrincipalInput) (AccessMutation, error) {
+	if err := validateAccessPrincipal(principal); err != nil {
+		return AccessMutation{}, err
+	}
+	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+		version, err := s.currentVersion()
+		if err != nil {
+			return mutationValue{}, err
+		}
+		group, decision, err := s.authorizeGroupTarget(commandCtx, actorID, groupID, rbac.PermGroupManage, version)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		if err := entityETagMatches("group", group.ID, group.Version, expectedETag); err != nil {
+			return mutationValue{}, err
+		}
+		if !decision.Allow {
+			return mutationValue{}, ErrPermissionRequired
+		}
+		if !accessPrincipalExists(principal, version) {
+			return mutationValue{}, ErrAccessPrincipalNotFound
+		}
+		if entry, exists := matchingAccess(version.GroupAccess(groupID), principal); exists {
+			etag, err := realtime.NumericEntityETag("group", group.ID, group.Version)
+			if err != nil {
+				return mutationValue{}, err
+			}
+			return mutationValue{access: entry, etag: etag, noop: true}, nil
+		}
+		count, err := txStores.Access.CountGroup(commandCtx, groupID)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		if count >= maxAccessEntries {
+			return mutationValue{}, ErrResourceLimit
+		}
+		if _, err := txStores.Access.AddGroup(commandCtx, groupID, accessPrincipalStoreValue(principal)); err != nil {
+			return mutationValue{}, err
+		}
+		if _, err := txStores.Channels.TouchGroup(commandCtx, groupID); err != nil {
+			return mutationValue{}, err
+		}
+		candidate, err := s.state.BuildPersistentCandidateFrom(commandCtx, txStores)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		updated, exists := candidate.Version().Group(groupID)
+		if !exists {
+			return mutationValue{}, ErrRealtimeUnavailable
+		}
+		entry, exists := matchingAccess(candidate.Version().GroupAccess(groupID), principal)
+		if !exists {
+			return mutationValue{}, ErrRealtimeUnavailable
+		}
+		events, err := groupAccessEvents(updated)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+			return mutationValue{}, err
+		}
+		etag, err := realtime.NumericEntityETag("group", updated.ID, updated.Version)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		return mutationValue{access: entry, etag: etag, created: true}, nil
+	})
+	if err != nil {
+		return AccessMutation{}, err
+	}
+	return AccessMutation{Entry: result.value.access, ETag: result.value.etag, Created: result.value.created, State: result.state}, nil
+}
+
+// DeleteGroupAccess removes one group ACL entry after exact group.manage
+// reauthorization and ETag comparison inside the sequencer. A mismatched ACL
+// ID is not distinguished from an absent one.
+func (s *Service) DeleteGroupAccess(ctx context.Context, actorID, groupID, accessID int64, expectedETag string) (AccessMutation, error) {
+	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+		version, err := s.currentVersion()
+		if err != nil {
+			return mutationValue{}, err
+		}
+		group, decision, err := s.authorizeGroupTarget(commandCtx, actorID, groupID, rbac.PermGroupManage, version)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		if err := entityETagMatches("group", group.ID, group.Version, expectedETag); err != nil {
+			return mutationValue{}, err
+		}
+		if !decision.Allow {
+			return mutationValue{}, ErrPermissionRequired
+		}
+		if !accessEntryIDExists(version.GroupAccess(groupID), accessID) {
+			return mutationValue{}, ErrTargetNotFound
+		}
+		if _, err := txStores.Access.DeleteGroup(commandCtx, groupID, accessID); err != nil {
+			return mutationValue{}, err
+		}
+		if _, err := txStores.Channels.TouchGroup(commandCtx, groupID); err != nil {
+			return mutationValue{}, err
+		}
+		candidate, err := s.state.BuildPersistentCandidateFrom(commandCtx, txStores)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		updated, exists := candidate.Version().Group(groupID)
+		if !exists {
+			return mutationValue{}, ErrRealtimeUnavailable
+		}
+		events, err := groupAccessEvents(updated)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+			return mutationValue{}, err
+		}
+		etag, err := realtime.NumericEntityETag("group", updated.ID, updated.Version)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		return mutationValue{etag: etag}, nil
+	})
+	if err != nil {
+		return AccessMutation{}, err
+	}
+	return AccessMutation{ETag: result.value.etag, State: result.state}, nil
+}
+
+// AddChannelAccess creates one channel ACL entry after exact channel.invite
+// reauthorization and ETag comparison inside the sequencer. When GrantParent
+// is set, the same principal is atomically added to the parent group after a
+// second group.manage authorization and parent ETag comparison.
+func (s *Service) AddChannelAccess(ctx context.Context, actorID, channelID int64, expectedETag, expectedParentETag string, input ChannelAccessInput) (AccessMutation, error) {
+	if err := validateAccessPrincipal(input.Principal); err != nil {
+		return AccessMutation{}, err
+	}
+	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+		version, err := s.currentVersion()
+		if err != nil {
+			return mutationValue{}, err
+		}
+		channel, decision, err := s.authorizeChannelTarget(commandCtx, actorID, channelID, rbac.PermChannelInvite, version)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		if err := entityETagMatches("channel", channel.ID, channel.Version, expectedETag); err != nil {
+			return mutationValue{}, err
+		}
+		if !decision.Allow {
+			return mutationValue{}, ErrPermissionRequired
+		}
+		if !accessPrincipalExists(input.Principal, version) {
+			return mutationValue{}, ErrAccessPrincipalNotFound
+		}
+
+		childEntry, childExists := matchingAccess(version.ChannelAccess(channelID), input.Principal)
+		var parent realtime.Group
+		parentExists := false
+		parentChanged := false
+		if channel.GroupID != nil {
+			var exists bool
+			parent, exists = version.Group(*channel.GroupID)
+			if !exists {
+				return mutationValue{}, ErrRealtimeUnavailable
+			}
+			_, parentExists = matchingAccess(version.GroupAccess(parent.ID), input.Principal)
+			if parent.Visibility == "private" && !parentExists && !input.GrantParent {
+				return mutationValue{}, ErrParentAccessRequired
+			}
+			if input.GrantParent {
+				parentDecision, err := s.authorize(commandCtx, actorID, realtime.Scope{Type: "group", ID: parent.ID}, rbac.PermGroupManage, version)
+				if err != nil {
+					return mutationValue{}, err
+				}
+				if !parentDecision.Visible {
+					return mutationValue{}, ErrTargetNotFound
+				}
+				if err := entityETagMatches("group", parent.ID, parent.Version, expectedParentETag); err != nil {
+					return mutationValue{}, err
+				}
+				if !parentDecision.Allow {
+					return mutationValue{}, ErrPermissionRequired
+				}
+				parentChanged = !parentExists
+			}
+		} else if input.GrantParent {
+			return mutationValue{}, ErrParentAccessRequired
+		}
+
+		childChanged := !childExists
+		if !childChanged && !parentChanged {
+			etag, err := realtime.NumericEntityETag("channel", channel.ID, channel.Version)
+			if err != nil {
+				return mutationValue{}, err
+			}
+			parentETag := ""
+			if input.GrantParent {
+				parentETag, err = realtime.NumericEntityETag("group", parent.ID, parent.Version)
+				if err != nil {
+					return mutationValue{}, err
+				}
+			}
+			return mutationValue{access: childEntry, etag: etag, parentETag: parentETag, noop: true}, nil
+		}
+		if parentChanged {
+			count, err := txStores.Access.CountGroup(commandCtx, parent.ID)
+			if err != nil {
+				return mutationValue{}, err
+			}
+			if count >= maxAccessEntries {
+				return mutationValue{}, ErrResourceLimit
+			}
+			if _, err := txStores.Access.AddGroup(commandCtx, parent.ID, accessPrincipalStoreValue(input.Principal)); err != nil {
+				return mutationValue{}, err
+			}
+			if _, err := txStores.Channels.TouchGroup(commandCtx, parent.ID); err != nil {
+				return mutationValue{}, err
+			}
+		}
+		if childChanged {
+			count, err := txStores.Access.CountChannel(commandCtx, channelID)
+			if err != nil {
+				return mutationValue{}, err
+			}
+			if count >= maxAccessEntries {
+				return mutationValue{}, ErrResourceLimit
+			}
+			if _, err := txStores.Access.AddChannel(commandCtx, channelID, accessPrincipalStoreValue(input.Principal)); err != nil {
+				return mutationValue{}, err
+			}
+			if _, err := txStores.Channels.Touch(commandCtx, channelID); err != nil {
+				return mutationValue{}, err
+			}
+		}
+		candidate, err := s.state.BuildPersistentCandidateFrom(commandCtx, txStores)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		updatedChannel, exists := candidate.Version().Channel(channelID)
+		if !exists {
+			return mutationValue{}, ErrRealtimeUnavailable
+		}
+		entry, exists := matchingAccess(candidate.Version().ChannelAccess(channelID), input.Principal)
+		if !exists {
+			return mutationValue{}, ErrRealtimeUnavailable
+		}
+		events := make([]realtime.StateEventTemplate, 0, 4)
+		parentETag := ""
+		if parentChanged {
+			updatedParent, exists := candidate.Version().Group(parent.ID)
+			if !exists {
+				return mutationValue{}, ErrRealtimeUnavailable
+			}
+			parentEvents, err := groupAccessEvents(updatedParent)
+			if err != nil {
+				return mutationValue{}, err
+			}
+			events = append(events, parentEvents...)
+			parentETag, err = realtime.NumericEntityETag("group", updatedParent.ID, updatedParent.Version)
+			if err != nil {
+				return mutationValue{}, err
+			}
+		} else if input.GrantParent {
+			parentETag, err = realtime.NumericEntityETag("group", parent.ID, parent.Version)
+			if err != nil {
+				return mutationValue{}, err
+			}
+		}
+		if childChanged {
+			channelEvents, err := channelAccessEvents(updatedChannel)
+			if err != nil {
+				return mutationValue{}, err
+			}
+			events = append(events, channelEvents...)
+		}
+		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+			return mutationValue{}, err
+		}
+		etag, err := realtime.NumericEntityETag("channel", updatedChannel.ID, updatedChannel.Version)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		return mutationValue{access: entry, etag: etag, parentETag: parentETag, created: true}, nil
+	})
+	if err != nil {
+		return AccessMutation{}, err
+	}
+	return AccessMutation{Entry: result.value.access, ETag: result.value.etag, ParentETag: result.value.parentETag, Created: result.value.created, State: result.state}, nil
+}
+
+// DeleteChannelAccess removes one channel ACL entry after exact channel.invite
+// reauthorization and ETag comparison inside the sequencer. A mismatched ACL
+// ID is not distinguished from an absent one.
+func (s *Service) DeleteChannelAccess(ctx context.Context, actorID, channelID, accessID int64, expectedETag string) (AccessMutation, error) {
+	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+		version, err := s.currentVersion()
+		if err != nil {
+			return mutationValue{}, err
+		}
+		channel, decision, err := s.authorizeChannelTarget(commandCtx, actorID, channelID, rbac.PermChannelInvite, version)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		if err := entityETagMatches("channel", channel.ID, channel.Version, expectedETag); err != nil {
+			return mutationValue{}, err
+		}
+		if !decision.Allow {
+			return mutationValue{}, ErrPermissionRequired
+		}
+		if !accessEntryIDExists(version.ChannelAccess(channelID), accessID) {
+			return mutationValue{}, ErrTargetNotFound
+		}
+		if _, err := txStores.Access.DeleteChannel(commandCtx, channelID, accessID); err != nil {
+			return mutationValue{}, err
+		}
+		if _, err := txStores.Channels.Touch(commandCtx, channelID); err != nil {
+			return mutationValue{}, err
+		}
+		candidate, err := s.state.BuildPersistentCandidateFrom(commandCtx, txStores)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		updated, exists := candidate.Version().Channel(channelID)
+		if !exists {
+			return mutationValue{}, ErrRealtimeUnavailable
+		}
+		events, err := channelAccessEvents(updated)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+			return mutationValue{}, err
+		}
+		etag, err := realtime.NumericEntityETag("channel", updated.ID, updated.Version)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		return mutationValue{etag: etag}, nil
+	})
+	if err != nil {
+		return AccessMutation{}, err
+	}
+	return AccessMutation{ETag: result.value.etag, State: result.state}, nil
 }
 
 // UpdateGroup applies a mutable group PATCH after exact-scope authorization and
@@ -696,9 +1135,13 @@ func (s *Service) CreateChannel(ctx context.Context, actorID int64, input Create
 // mutationValue is the HTTP result retained while the sequencer publishes the
 // exact candidate constructed in the transaction callback.
 type mutationValue struct {
-	group   realtime.SnapshotGroup
-	channel realtime.SnapshotChannel
-	noop    bool
+	group      realtime.SnapshotGroup
+	channel    realtime.SnapshotChannel
+	access     realtime.AccessEntry
+	etag       string
+	parentETag string
+	created    bool
+	noop       bool
 }
 
 // mutationResult combines one command-owned API result with its final
@@ -832,6 +1275,71 @@ func entityETagMatches(kind string, id, version int64, expected string) error {
 		return ErrPreconditionFailed
 	}
 	return nil
+}
+
+// validateAccessPrincipal enforces the exact-one ACL principal shape before a
+// command is admitted. The service repeats this boundary validation so callers
+// outside HTTP cannot create malformed ACL rows.
+func validateAccessPrincipal(principal AccessPrincipalInput) error {
+	if principal.Type == "user" && principal.UserID != nil && *principal.UserID > 0 && principal.RoleKey == nil {
+		return nil
+	}
+	if principal.Type == "role" && principal.UserID == nil && principal.RoleKey != nil && *principal.RoleKey != "" {
+		return nil
+	}
+	return ErrInvalidAccessPrincipal
+}
+
+// accessPrincipalStoreValue converts an already validated service principal to
+// the persistence-layer representation used by the ACL stores.
+func accessPrincipalStoreValue(principal AccessPrincipalInput) store.AccessPrincipal {
+	return store.AccessPrincipal{Type: principal.Type, UserID: principal.UserID, RoleKey: principal.RoleKey}
+}
+
+// accessPrincipalExists verifies that an ACL principal still exists in the
+// immutable command state before a database insert can rely on its foreign key.
+func accessPrincipalExists(principal AccessPrincipalInput, version *realtime.StateVersion) bool {
+	if version == nil {
+		return false
+	}
+	if principal.Type == "user" && principal.UserID != nil {
+		_, exists := version.User(*principal.UserID)
+		return exists
+	}
+	if principal.Type == "role" && principal.RoleKey != nil {
+		_, exists := version.Role(*principal.RoleKey)
+		return exists
+	}
+	return false
+}
+
+// matchingAccess returns the ACL entry whose principal exactly matches input.
+// It deliberately does not resolve role applicability because parent ACL
+// checks must prove that this exact requested principal has a stored entry.
+func matchingAccess(entries []realtime.AccessEntry, principal AccessPrincipalInput) (realtime.AccessEntry, bool) {
+	for _, entry := range entries {
+		if entry.PrincipalType != principal.Type {
+			continue
+		}
+		if principal.Type == "user" && principal.UserID != nil && entry.UserID != nil && *entry.UserID == *principal.UserID {
+			return entry, true
+		}
+		if principal.Type == "role" && principal.RoleKey != nil && entry.RoleKey != nil && *entry.RoleKey == *principal.RoleKey {
+			return entry, true
+		}
+	}
+	return realtime.AccessEntry{}, false
+}
+
+// accessEntryIDExists reports whether accessID belongs to one resource's
+// immutable ACL slice, preventing nested DELETE paths from leaking other IDs.
+func accessEntryIDExists(entries []realtime.AccessEntry, accessID int64) bool {
+	for _, entry := range entries {
+		if entry.ID == accessID {
+			return true
+		}
+	}
+	return false
 }
 
 // groupHasChannels reports whether groupID still owns any persisted channel in
@@ -1012,6 +1520,31 @@ func groupUpdatedEvents(group realtime.Group) ([]realtime.StateEventTemplate, er
 	}}, nil
 }
 
+// groupAccessEvents emits the canonical replacement group event followed by a
+// compact ACL invalidation event. Both are built from the same after-candidate
+// resource version, so access caches cannot outlive the parent entity ETag.
+func groupAccessEvents(group realtime.Group) ([]realtime.StateEventTemplate, error) {
+	events, err := groupUpdatedEvents(group)
+	if err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(struct {
+		GroupID string `json:"group_id"`
+		Version string `json:"version"`
+	}{
+		GroupID: strconv.FormatInt(group.ID, 10),
+		Version: strconv.FormatInt(group.Version, 10),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return append(events, realtime.StateEventTemplate{
+		EventType: "group.access.updated",
+		Scope:     realtime.Scope{Type: "group", ID: group.ID},
+		Data:      data,
+	}), nil
+}
+
 // groupDeletedEvents builds the canonical sanitized tombstone for users that
 // could see the group before its deletion. The entity's final existing version
 // permits clients to order the delete against earlier replacement payloads.
@@ -1062,6 +1595,32 @@ func channelUpdatedEvents(channel realtime.Channel) ([]realtime.StateEventTempla
 		Scope:     realtime.Scope{Type: "channel", ID: channel.ID},
 		Data:      data,
 	}}, nil
+}
+
+// channelAccessEvents emits the canonical replacement channel event followed
+// by a compact ACL invalidation event. Both are built from the same
+// after-candidate resource version, so access caches cannot outlive the parent
+// entity ETag.
+func channelAccessEvents(channel realtime.Channel) ([]realtime.StateEventTemplate, error) {
+	events, err := channelUpdatedEvents(channel)
+	if err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(struct {
+		ChannelID string `json:"channel_id"`
+		Version   string `json:"version"`
+	}{
+		ChannelID: strconv.FormatInt(channel.ID, 10),
+		Version:   strconv.FormatInt(channel.Version, 10),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return append(events, realtime.StateEventTemplate{
+		EventType: "channel.access.updated",
+		Scope:     realtime.Scope{Type: "channel", ID: channel.ID},
+		Data:      data,
+	}), nil
 }
 
 // channelDeletedEvents builds the canonical sanitized tombstone for users that

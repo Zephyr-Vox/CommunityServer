@@ -12,9 +12,11 @@ import (
 type Querier interface {
 	BumpUserAuthVersion(ctx context.Context, arg BumpUserAuthVersionParams) error
 	ConsumeInvite(ctx context.Context, arg ConsumeInviteParams) (Invite, error)
+	CountChannelAccess(ctx context.Context, channelID int64) (int64, error)
 	CountChannelGroups(ctx context.Context) (int64, error)
 	CountChannels(ctx context.Context) (int64, error)
 	CountDurableIdempotency(ctx context.Context) (int64, error)
+	CountGroupAccess(ctx context.Context, groupID int64) (int64, error)
 	CountOwners(ctx context.Context) (int64, error)
 	CountRoleReferences(ctx context.Context, roleKey string) (int64, error)
 	CountTemporaryChannels(ctx context.Context) (int64, error)
@@ -25,11 +27,13 @@ type Querier interface {
 	CreateRole(ctx context.Context, arg CreateRoleParams) (Role, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	DeleteChannel(ctx context.Context, id int64) (int64, error)
+	DeleteChannelAccess(ctx context.Context, arg DeleteChannelAccessParams) (ChannelAccess, error)
 	DeleteChannelGroup(ctx context.Context, id int64) (int64, error)
 	DeleteChannelPermissionConfig(ctx context.Context, channelID sql.NullInt64) (sql.NullInt64, error)
 	DeleteExpiredActivationIdempotency(ctx context.Context, expiresAt int64) (int64, error)
 	DeleteExpiredCommandIdempotency(ctx context.Context, expiresAt int64) (int64, error)
 	DeleteExpiredSessions(ctx context.Context, expiresAt int64) (int64, error)
+	DeleteGroupAccess(ctx context.Context, arg DeleteGroupAccessParams) (GroupAccess, error)
 	DeleteGroupPermissionConfig(ctx context.Context, groupID sql.NullInt64) (sql.NullInt64, error)
 	DeleteInvite(ctx context.Context, id int64) (int64, error)
 	DeleteMute(ctx context.Context, id int64) (int64, error)
@@ -95,6 +99,8 @@ type Querier interface {
 	SetUserAvatar(ctx context.Context, arg SetUserAvatarParams) (User, error)
 	SetUserBanned(ctx context.Context, arg SetUserBannedParams) error
 	SetUserPasswordHash(ctx context.Context, arg SetUserPasswordHashParams) (int64, error)
+	TouchChannel(ctx context.Context, arg TouchChannelParams) (Channel, error)
+	TouchChannelGroup(ctx context.Context, arg TouchChannelGroupParams) (ChannelGroup, error)
 	TouchUserLastLogin(ctx context.Context, arg TouchUserLastLoginParams) error
 	UpdateChannel(ctx context.Context, arg UpdateChannelParams) (Channel, error)
 	UpdateChannelGroup(ctx context.Context, arg UpdateChannelGroupParams) (ChannelGroup, error)

@@ -10,6 +10,78 @@ import (
 	"database/sql"
 )
 
+const countChannelAccess = `-- name: CountChannelAccess :one
+SELECT COUNT(*) FROM channel_access WHERE channel_id = ?
+`
+
+func (q *Queries) CountChannelAccess(ctx context.Context, channelID int64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countChannelAccess, channelID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countGroupAccess = `-- name: CountGroupAccess :one
+SELECT COUNT(*) FROM group_access WHERE group_id = ?
+`
+
+func (q *Queries) CountGroupAccess(ctx context.Context, groupID int64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countGroupAccess, groupID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const deleteChannelAccess = `-- name: DeleteChannelAccess :one
+DELETE FROM channel_access
+WHERE channel_id = ? AND id = ?
+RETURNING id, channel_id, principal_type, user_id, role_key, created_at
+`
+
+type DeleteChannelAccessParams struct {
+	ChannelID int64 `json:"channel_id"`
+	ID        int64 `json:"id"`
+}
+
+func (q *Queries) DeleteChannelAccess(ctx context.Context, arg DeleteChannelAccessParams) (ChannelAccess, error) {
+	row := q.db.QueryRowContext(ctx, deleteChannelAccess, arg.ChannelID, arg.ID)
+	var i ChannelAccess
+	err := row.Scan(
+		&i.ID,
+		&i.ChannelID,
+		&i.PrincipalType,
+		&i.UserID,
+		&i.RoleKey,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const deleteGroupAccess = `-- name: DeleteGroupAccess :one
+DELETE FROM group_access
+WHERE group_id = ? AND id = ?
+RETURNING id, group_id, principal_type, user_id, role_key, created_at
+`
+
+type DeleteGroupAccessParams struct {
+	GroupID int64 `json:"group_id"`
+	ID      int64 `json:"id"`
+}
+
+func (q *Queries) DeleteGroupAccess(ctx context.Context, arg DeleteGroupAccessParams) (GroupAccess, error) {
+	row := q.db.QueryRowContext(ctx, deleteGroupAccess, arg.GroupID, arg.ID)
+	var i GroupAccess
+	err := row.Scan(
+		&i.ID,
+		&i.GroupID,
+		&i.PrincipalType,
+		&i.UserID,
+		&i.RoleKey,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const insertChannelAccess = `-- name: InsertChannelAccess :one
 INSERT INTO channel_access
     (id, channel_id, principal_type, user_id, role_key, created_at)

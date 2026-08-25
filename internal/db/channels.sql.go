@@ -293,6 +293,68 @@ func (q *Queries) ListChannels(ctx context.Context) ([]Channel, error) {
 	return items, nil
 }
 
+const touchChannel = `-- name: TouchChannel :one
+UPDATE channels
+SET updated_at = ?,
+    version = version + 1
+WHERE id = ?
+RETURNING id, group_id, name, mode, "temporary", visibility, capacity, position, pinned, created_by, created_at, updated_at, version
+`
+
+type TouchChannelParams struct {
+	UpdatedAt int64 `json:"updated_at"`
+	ID        int64 `json:"id"`
+}
+
+func (q *Queries) TouchChannel(ctx context.Context, arg TouchChannelParams) (Channel, error) {
+	row := q.db.QueryRowContext(ctx, touchChannel, arg.UpdatedAt, arg.ID)
+	var i Channel
+	err := row.Scan(
+		&i.ID,
+		&i.GroupID,
+		&i.Name,
+		&i.Mode,
+		&i.Temporary,
+		&i.Visibility,
+		&i.Capacity,
+		&i.Position,
+		&i.Pinned,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Version,
+	)
+	return i, err
+}
+
+const touchChannelGroup = `-- name: TouchChannelGroup :one
+UPDATE channel_groups
+SET updated_at = ?,
+    version = version + 1
+WHERE id = ?
+RETURNING id, name, position, visibility, created_at, updated_at, version
+`
+
+type TouchChannelGroupParams struct {
+	UpdatedAt int64 `json:"updated_at"`
+	ID        int64 `json:"id"`
+}
+
+func (q *Queries) TouchChannelGroup(ctx context.Context, arg TouchChannelGroupParams) (ChannelGroup, error) {
+	row := q.db.QueryRowContext(ctx, touchChannelGroup, arg.UpdatedAt, arg.ID)
+	var i ChannelGroup
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Position,
+		&i.Visibility,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Version,
+	)
+	return i, err
+}
+
 const updateChannel = `-- name: UpdateChannel :one
 UPDATE channels
 SET group_id = ?,
