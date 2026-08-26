@@ -328,15 +328,17 @@ func GetConfigHandler(svc *Service) echo.HandlerFunc {
 		codeInvalidScope = 1
 		codeNotFound     = 2
 	)
-	return func(c *echo.Context) error {
+	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
 		scope, err := configScopeFromQuery(c)
 		if err != nil {
 			return api.NewError(codeInvalidScope, http.StatusBadRequest, "invalid permission config scope")
 		}
-		config, err := svc.GetConfig(c.Request().Context(), scope)
+		config, etag, err := svc.GetConfig(c.Request().Context(), principal.UserID, scope)
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "permission config scope not found")
+		case errors.Is(err, ErrRoleManageRequired):
+			return echo.ErrForbidden
 		case err != nil:
 			return err
 		}
@@ -344,8 +346,9 @@ func GetConfigHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		c.Response().Header().Set("ETag", etag)
 		return api.OK(c, http.StatusOK, response)
-	}
+	})
 }
 
 // UpdateConfigHandler handles PUT /api/v0/rbac/config. The route must be
@@ -353,9 +356,10 @@ func GetConfigHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 invalid scope: scope and scope ID do not match
-//   - 2 permission protected: request grants a permission the actor lacks
-//   - 3 scope not found
-//   - 4 invalid config: roles or permissions violate config constraints
+//   - 2 precondition failed: If-Match is missing or does not match effective config
+//   - 3 permission protected: request grants a permission the actor lacks
+//   - 4 scope not found
+//   - 5 invalid config: roles or permissions violate config constraints
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -364,9 +368,10 @@ func GetConfigHandler(svc *Service) echo.HandlerFunc {
 func UpdateConfigHandler(svc *Service) echo.HandlerFunc {
 	const (
 		codeInvalidScope = 1
-		codeProtected    = 2
-		codeNotFound     = 3
-		codeInvalid      = 4
+		codePrecondition = 2
+		codeProtected    = 3
+		codeNotFound     = 4
+		codeInvalid      = 5
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
 		var req updateConfigRequest
@@ -377,8 +382,10 @@ func UpdateConfigHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.NewError(codeInvalidScope, http.StatusBadRequest, "invalid permission config scope")
 		}
-		config, err := svc.UpdateConfig(c.Request().Context(), principal.UserID, ConfigInput{Scope: scope, Config: req.Config})
+		config, etag, err := svc.UpdateConfig(c.Request().Context(), principal.UserID, exactIfMatch(c), ConfigInput{Scope: scope, Config: req.Config})
 		switch {
+		case errors.Is(err, ErrPreconditionFailed):
+			return api.NewError(codePrecondition, http.StatusPreconditionFailed, "precondition failed")
 		case errors.Is(err, ErrRankProtected), errors.Is(err, ErrManagementLost):
 			return api.NewError(codeProtected, http.StatusForbidden, "permission grant is protected")
 		case errors.Is(err, store.ErrNotFound):
@@ -394,6 +401,7 @@ func UpdateConfigHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		c.Response().Header().Set("ETag", etag)
 		return api.OK(c, http.StatusOK, response)
 	})
 }
@@ -403,8 +411,9 @@ func UpdateConfigHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 invalid scope: scope and scope ID do not match
-//   - 2 permission protected: reset would grant a permission the actor lacks
-//   - 3 scope not found
+//   - 2 precondition failed: If-Match is missing or does not match effective config
+//   - 3 permission protected: reset would grant a permission the actor lacks
+//   - 4 scope not found
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -413,8 +422,9 @@ func UpdateConfigHandler(svc *Service) echo.HandlerFunc {
 func ResetConfigHandler(svc *Service) echo.HandlerFunc {
 	const (
 		codeInvalidScope = 1
-		codeProtected    = 2
-		codeNotFound     = 3
+		codePrecondition = 2
+		codeProtected    = 3
+		codeNotFound     = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
 		var req resetConfigRequest
@@ -425,8 +435,10 @@ func ResetConfigHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.NewError(codeInvalidScope, http.StatusBadRequest, "invalid permission config scope")
 		}
-		config, err := svc.ResetConfig(c.Request().Context(), principal.UserID, scope)
+		config, etag, err := svc.ResetConfig(c.Request().Context(), principal.UserID, exactIfMatch(c), scope)
 		switch {
+		case errors.Is(err, ErrPreconditionFailed):
+			return api.NewError(codePrecondition, http.StatusPreconditionFailed, "precondition failed")
 		case errors.Is(err, ErrRankProtected), errors.Is(err, ErrManagementLost):
 			return api.NewError(codeProtected, http.StatusForbidden, "permission grant is protected")
 		case errors.Is(err, store.ErrNotFound):
@@ -440,6 +452,7 @@ func ResetConfigHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		c.Response().Header().Set("ETag", etag)
 		return api.OK(c, http.StatusOK, response)
 	})
 }
@@ -469,6 +482,16 @@ func parsePositiveID(raw string) (int64, error) {
 		return 0, errors.New("invalid id")
 	}
 	return id, nil
+}
+
+// exactIfMatch returns one exact If-Match field value. Missing or repeated
+// field values deliberately fail the strong precondition inside Service.
+func exactIfMatch(c *echo.Context) string {
+	values := c.Request().Header.Values("If-Match")
+	if len(values) != 1 {
+		return ""
+	}
+	return values[0]
 }
 
 // configScopeFromQuery parses the exact permission-config scope query shape.

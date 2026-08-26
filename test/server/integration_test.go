@@ -38,9 +38,20 @@ func postJSONToken(t *testing.T, app *server.App, path, token, body string) *htt
 }
 
 func requestToken(t *testing.T, app *server.App, method, path, token, body string) *httptest.ResponseRecorder {
+	return requestTokenWithHeaders(t, app, method, path, token, body, nil)
+}
+
+// requestTokenWithHeaders issues one authenticated JSON request with the exact
+// caller-supplied concurrency headers needed by resource mutation tests.
+func requestTokenWithHeaders(t *testing.T, app *server.App, method, path, token, body string, headers http.Header) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
 	if token != "" {
 		req.Header.Set(echo.HeaderAuthorization, "Bearer "+token)
 	}
@@ -223,9 +234,17 @@ func TestRoleBindingsAndOwnerTransfer(t *testing.T) {
 		t.Fatalf("new owner role create status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	permissionConfig := `{"scope":{"type":"server"},"config":{"owner":["*"],"admin":[],"member":[],"moderator":["invite.manage"]}}`
-	rec = requestToken(t, app, http.MethodPut, "/api/v0/rbac/config", aliceToken, permissionConfig)
+	configRead := getToken(t, app, "/api/v0/rbac/config?scope_type=server", aliceToken)
+	if configRead.Code != http.StatusOK || configRead.Header().Get("ETag") == "" {
+		t.Fatalf("permission config read = %d, etag=%q, body=%s", configRead.Code, configRead.Header().Get("ETag"), configRead.Body.String())
+	}
+	rec = requestTokenWithHeaders(t, app, http.MethodPut, "/api/v0/rbac/config", aliceToken, permissionConfig, http.Header{"If-Match": {configRead.Header().Get("ETag")}})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("permission config update status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	configETag := rec.Header().Get("ETag")
+	if configETag == "" {
+		t.Fatal("permission config update omitted ETag")
 	}
 	moderatorBinding := `{"user_id":` + strconv.FormatInt(bobID, 10) + `,"role_key":"moderator","scope":{"type":"server"}}`
 	rec = postJSONToken(t, app, "/api/v0/rbac/bindings", aliceToken, moderatorBinding)
@@ -245,7 +264,7 @@ func TestRoleBindingsAndOwnerTransfer(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("role patch status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	rec = requestToken(t, app, http.MethodPost, "/api/v0/rbac/config/reset", aliceToken, `{"scope":{"type":"server"}}`)
+	rec = requestTokenWithHeaders(t, app, http.MethodPost, "/api/v0/rbac/config/reset", aliceToken, `{"scope":{"type":"server"}}`, http.Header{"If-Match": {configETag}})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("permission config reset status = %d, body = %s", rec.Code, rec.Body.String())
 	}

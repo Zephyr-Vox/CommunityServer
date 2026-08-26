@@ -133,10 +133,10 @@ func TestControlMutationsRecheckRoleManageAfterOwnerTransfer(t *testing.T) {
 			"member": {},
 		},
 	}
-	if _, err := svc.UpdateConfig(ctx, oldOwner.ID, root); !errors.Is(err, control.ErrRoleManageRequired) {
+	if _, _, err := svc.UpdateConfig(ctx, oldOwner.ID, "", root); !errors.Is(err, control.ErrRoleManageRequired) {
 		t.Fatalf("former owner UpdateConfig = %v, want ErrRoleManageRequired", err)
 	}
-	if _, err := svc.ResetConfig(ctx, oldOwner.ID, store.ConfigScope{Type: "server"}); !errors.Is(err, control.ErrRoleManageRequired) {
+	if _, _, err := svc.ResetConfig(ctx, oldOwner.ID, "", store.ConfigScope{Type: "server"}); !errors.Is(err, control.ErrRoleManageRequired) {
 		t.Fatalf("former owner ResetConfig = %v, want ErrRoleManageRequired", err)
 	}
 }
@@ -179,6 +179,63 @@ func TestAuthorizerReadsPersistedConfig(t *testing.T) {
 	p := rbac.Principal{UserID: user.ID, Bindings: []rbac.RoleBinding{{RoleKey: "admin", ScopeType: "server"}}}
 	if !rbac.NewAuthorizer(s.Roles).Check(ctx, p, rbac.PermInviteManage).Allow {
 		t.Fatal("admin should have persisted invite.manage")
+	}
+}
+
+func TestControlConfigUsesStateVisibilityAndEffectiveETags(t *testing.T) {
+	stores, _ := newTestEnv(t)
+	ctx := context.Background()
+	owner := mustCreateUser(t, stores, "owner")
+	admin := mustCreateUser(t, stores, "admin")
+	tx, err := stores.BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stores.WithTx(tx).ActivateFirstOwner(ctx, owner.ID); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stores.Roles.InsertBinding(ctx, admin.ID, "admin", "server", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	group, err := stores.Channels.CreateGroup(ctx, "Private", 1, "private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := newControlService(t, stores)
+	scope := store.ConfigScope{Type: "group", ID: &group.ID}
+
+	if _, _, err := svc.GetConfig(ctx, admin.ID, scope); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("invisible private config = %v, want ErrNotFound", err)
+	}
+	current, etag, err := svc.GetConfig(ctx, owner.ID, scope)
+	if err != nil || current.Local != nil || etag == "" {
+		t.Fatalf("inherited config = %+v, etag=%q, err=%v", current, etag, err)
+	}
+	input := control.ConfigInput{
+		Scope: scope,
+		Config: map[string][]string{
+			"owner":  {"*"},
+			"admin":  {"group.manage"},
+			"member": {},
+		},
+	}
+	if _, _, err := svc.UpdateConfig(ctx, owner.ID, `"stale"`, input); !errors.Is(err, control.ErrPreconditionFailed) {
+		t.Fatalf("stale config update = %v, want precondition failure", err)
+	}
+	updated, updatedETag, err := svc.UpdateConfig(ctx, owner.ID, etag, input)
+	if err != nil || updated.Local == nil || updated.Local.Version != 1 || updatedETag == etag {
+		t.Fatalf("local config update = %+v, etag=%q, err=%v", updated, updatedETag, err)
+	}
+	if _, _, err := svc.ResetConfig(ctx, owner.ID, etag, scope); !errors.Is(err, control.ErrPreconditionFailed) {
+		t.Fatalf("stale config reset = %v, want precondition failure", err)
+	}
+	reset, resetETag, err := svc.ResetConfig(ctx, owner.ID, updatedETag, scope)
+	if err != nil || reset.Local != nil || resetETag == updatedETag {
+		t.Fatalf("config reset = %+v, etag=%q, err=%v", reset, resetETag, err)
 	}
 }
 

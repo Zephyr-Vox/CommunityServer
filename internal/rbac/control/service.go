@@ -10,6 +10,7 @@ import (
 
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/rbac"
+	rbacscope "zephyr.vox/server/ce/internal/rbac/scope"
 	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/store"
 )
@@ -38,6 +39,9 @@ var (
 	// ErrRealtimeUnavailable is returned when a state-changing control command
 	// is attempted before server assembly has installed its sequencer runtime.
 	ErrRealtimeUnavailable = errors.New("rbac control: realtime command runtime unavailable")
+	// ErrPreconditionFailed is returned when a requested config ETag differs
+	// from the effective config revalidated at command dequeue.
+	ErrPreconditionFailed = errors.New("rbac control: precondition failed")
 )
 
 var roleKeyRE = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
@@ -57,6 +61,8 @@ type Service struct {
 	gate       MutationGate
 	state      *realtime.StateStore
 	sequencer  *realtime.PostCommitSequencer
+	visibility *realtime.VisibilityResolver
+	scopedAuth *rbacscope.Authorizer
 }
 
 // StateChange identifies a committed RBAC mutation requiring an immutable
@@ -78,7 +84,12 @@ type MutationGate interface {
 
 // NewService returns a Service backed by stores and principal cache barriers.
 func NewService(stores *store.Stores, principals PrincipalMutations) *Service {
-	return &Service{stores: stores, principals: principals}
+	return &Service{
+		stores:     stores,
+		principals: principals,
+		visibility: realtime.NewVisibilityResolver(),
+		scopedAuth: rbacscope.NewAuthorizer(),
+	}
 }
 
 // SetStateCommandRuntime installs the application-owned StateStore and single
@@ -375,26 +386,62 @@ func (s *Service) TransferOwner(ctx context.Context, currentUserID, targetUserID
 	return err
 }
 
-// GetConfig returns the requested scope's local snapshot and effective source.
-func (s *Service) GetConfig(ctx context.Context, scope store.ConfigScope) (*store.EffectiveConfig, error) {
-	return s.stores.Configs.Effective(ctx, scope)
+// GetConfig returns the requested visible scope's local snapshot, effective
+// source, and effective-config ETag from one immutable StateStore version.
+// Group and channel scopes remain indistinguishable from not found when the
+// actor cannot see them.
+func (s *Service) GetConfig(ctx context.Context, actorID int64, scope store.ConfigScope) (*store.EffectiveConfig, string, error) {
+	version, err := s.currentState()
+	if err != nil {
+		return nil, "", err
+	}
+	if err := s.authorizeConfigScope(ctx, actorID, scope, version); err != nil {
+		return nil, "", err
+	}
+	config, err := effectiveConfigFromState(scope, version)
+	if err != nil {
+		return nil, "", err
+	}
+	etag, err := effectiveConfigETag(config)
+	if err != nil {
+		return nil, "", err
+	}
+	return config, etag, nil
 }
 
 // UpdateConfig validates that the actor cannot grant permissions they do not
 // already hold, persists the complete scope snapshot, and invalidates bound
 // principals after the transaction commits.
-func (s *Service) UpdateConfig(ctx context.Context, actorID int64, input ConfigInput) (*store.EffectiveConfig, error) {
+func (s *Service) UpdateConfig(ctx context.Context, actorID int64, expectedETag string, input ConfigInput) (*store.EffectiveConfig, string, error) {
 	raw, err := json.Marshal(input.Config)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	userIDs, err := s.usersWithBindings(ctx, actorID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	value, err := s.runMutation(ctx, userIDs, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		version, err := s.currentState()
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if _, err := s.visibleConfigScope(actorID, input.Scope, version); err != nil {
+			return mutationResult{}, err
+		}
 		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
 			return mutationResult{}, err
+		}
+		current, err := effectiveConfigFromState(input.Scope, version)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		currentETag, err := effectiveConfigETag(current)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if expectedETag != currentETag {
+			return mutationResult{}, ErrPreconditionFailed
 		}
 		allowed, owner, err := actorPermissions(commandCtx, txStores, actorID)
 		if err != nil {
@@ -402,6 +449,13 @@ func (s *Service) UpdateConfig(ctx context.Context, actorID int64, input ConfigI
 		}
 		if err := validateGrantedPermissions(string(raw), allowed, owner); err != nil {
 			return mutationResult{}, err
+		}
+		canonical, err := txStores.Configs.Canonicalize(commandCtx, input.Scope.Type, string(raw))
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if current.Local != nil && current.Local.Config == canonical {
+			return mutationResult{value: configMutation{config: current, etag: currentETag}, noop: true}, nil
 		}
 		config, err := txStores.Configs.Update(commandCtx, input.Scope, string(raw))
 		if err != nil {
@@ -412,33 +466,58 @@ func (s *Service) UpdateConfig(ctx context.Context, actorID int64, input ConfigI
 				return mutationResult{}, err
 			}
 		}
-		return mutationResult{value: config, change: StateChange{EventType: "rbac.config.updated", UserIDs: userIDs, Scope: realtimeScope(input.Scope)}}, nil
+		etag, err := effectiveConfigETag(config)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		return mutationResult{value: configMutation{config: config, etag: etag}, change: StateChange{EventType: "rbac.config.updated", UserIDs: userIDs, Scope: realtimeScope(input.Scope)}}, nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	config, ok := value.(*store.EffectiveConfig)
-	if !ok {
-		return nil, ErrRealtimeUnavailable
+	result, ok := value.(configMutation)
+	if !ok || result.config == nil {
+		return nil, "", ErrRealtimeUnavailable
 	}
-	return config, nil
+	return result.config, result.etag, nil
 }
 
 // ResetConfig restores the default server matrix or removes a local snapshot.
 // The effective permissions after reset must still be a subset of the actor's
 // current grants unless the actor is owner.
-func (s *Service) ResetConfig(ctx context.Context, actorID int64, scope store.ConfigScope) (*store.EffectiveConfig, error) {
+func (s *Service) ResetConfig(ctx context.Context, actorID int64, expectedETag string, scope store.ConfigScope) (*store.EffectiveConfig, string, error) {
 	userIDs, err := s.usersWithBindings(ctx, actorID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	value, err := s.runMutation(ctx, userIDs, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		version, err := s.currentState()
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if _, err := s.visibleConfigScope(actorID, scope, version); err != nil {
+			return mutationResult{}, err
+		}
 		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
 			return mutationResult{}, err
+		}
+		current, err := effectiveConfigFromState(scope, version)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		currentETag, err := effectiveConfigETag(current)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		if expectedETag != currentETag {
+			return mutationResult{}, ErrPreconditionFailed
 		}
 		allowed, owner, err := actorPermissions(commandCtx, txStores, actorID)
 		if err != nil {
 			return mutationResult{}, err
+		}
+		if scope.Type != "server" && current.Local == nil {
+			return mutationResult{value: configMutation{config: current, etag: currentETag}, noop: true}, nil
 		}
 		config, err := txStores.Configs.Reset(commandCtx, scope)
 		if err != nil {
@@ -452,16 +531,27 @@ func (s *Service) ResetConfig(ctx context.Context, actorID int64, scope store.Co
 				return mutationResult{}, err
 			}
 		}
-		return mutationResult{value: config, change: StateChange{EventType: "rbac.config.updated", UserIDs: userIDs, Scope: realtimeScope(scope)}}, nil
+		etag, err := effectiveConfigETag(config)
+		if err != nil {
+			return mutationResult{}, err
+		}
+		return mutationResult{value: configMutation{config: config, etag: etag}, change: StateChange{EventType: "rbac.config.updated", UserIDs: userIDs, Scope: realtimeScope(scope)}}, nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	config, ok := value.(*store.EffectiveConfig)
-	if !ok {
-		return nil, ErrRealtimeUnavailable
+	result, ok := value.(configMutation)
+	if !ok || result.config == nil {
+		return nil, "", ErrRealtimeUnavailable
 	}
-	return config, nil
+	return result.config, result.etag, nil
+}
+
+// configMutation keeps one config response and its exact effective-config ETag
+// together while the sequencer owns publication completion.
+type configMutation struct {
+	config *store.EffectiveConfig
+	etag   string
 }
 
 type authority struct {

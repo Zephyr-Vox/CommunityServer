@@ -81,6 +81,15 @@ func (s *ConfigStore) ListAll(ctx context.Context) ([]db.ScopePermissionConfig, 
 	return configs, nil
 }
 
+// Canonicalize validates one permission config for scopeType and returns the
+// stable JSON representation used for no-op comparisons before an update.
+func (s *ConfigStore) Canonicalize(ctx context.Context, scopeType, raw string) (string, error) {
+	if scopeType != "server" && scopeType != "group" && scopeType != "channel" {
+		return "", ErrInvalidPermissionConfig
+	}
+	return s.normalize(ctx, scopeType, raw)
+}
+
 // PutGroup stores a local group config snapshot.
 func (s *ConfigStore) PutGroup(ctx context.Context, groupID int64, config string, version, now int64) (*db.ScopePermissionConfig, error) {
 	config, err := s.normalize(ctx, "group", config)
