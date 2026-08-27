@@ -112,17 +112,17 @@ func TestControlMutationsRecheckRoleManageAfterOwnerTransfer(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc := newControlService(t, s)
-	if _, err := svc.CreateRole(ctx, oldOwner.ID, "moderator", "Moderator", 500); err != nil {
+	if _, _, err := svc.CreateRole(ctx, oldOwner.ID, "moderator", "Moderator", 500); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.TransferOwner(ctx, oldOwner.ID, newOwner.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.CreateRole(ctx, oldOwner.ID, "helper", "Helper", 100); !errors.Is(err, control.ErrRoleManageRequired) {
+	if _, _, err := svc.CreateRole(ctx, oldOwner.ID, "helper", "Helper", 100); !errors.Is(err, control.ErrRoleManageRequired) {
 		t.Fatalf("former owner CreateRole = %v, want ErrRoleManageRequired", err)
 	}
 	name := "Moderation"
-	if _, err := svc.UpdateRole(ctx, oldOwner.ID, "moderator", &name, nil); !errors.Is(err, control.ErrRoleManageRequired) {
+	if _, _, err := svc.UpdateRole(ctx, oldOwner.ID, "moderator", &name, nil); !errors.Is(err, control.ErrRoleManageRequired) {
 		t.Fatalf("former owner UpdateRole = %v, want ErrRoleManageRequired", err)
 	}
 	root := control.ConfigInput{
@@ -133,10 +133,10 @@ func TestControlMutationsRecheckRoleManageAfterOwnerTransfer(t *testing.T) {
 			"member": {},
 		},
 	}
-	if _, _, err := svc.UpdateConfig(ctx, oldOwner.ID, "", root); !errors.Is(err, control.ErrRoleManageRequired) {
+	if _, _, _, err := svc.UpdateConfig(ctx, oldOwner.ID, "", root); !errors.Is(err, control.ErrRoleManageRequired) {
 		t.Fatalf("former owner UpdateConfig = %v, want ErrRoleManageRequired", err)
 	}
-	if _, _, err := svc.ResetConfig(ctx, oldOwner.ID, "", store.ConfigScope{Type: "server"}); !errors.Is(err, control.ErrRoleManageRequired) {
+	if _, _, _, err := svc.ResetConfig(ctx, oldOwner.ID, "", store.ConfigScope{Type: "server"}); !errors.Is(err, control.ErrRoleManageRequired) {
 		t.Fatalf("former owner ResetConfig = %v, want ErrRoleManageRequired", err)
 	}
 }
@@ -223,17 +223,17 @@ func TestControlConfigUsesStateVisibilityAndEffectiveETags(t *testing.T) {
 			"member": {},
 		},
 	}
-	if _, _, err := svc.UpdateConfig(ctx, owner.ID, `"stale"`, input); !errors.Is(err, control.ErrPreconditionFailed) {
+	if _, _, _, err := svc.UpdateConfig(ctx, owner.ID, `"stale"`, input); !errors.Is(err, control.ErrPreconditionFailed) {
 		t.Fatalf("stale config update = %v, want precondition failure", err)
 	}
-	updated, updatedETag, err := svc.UpdateConfig(ctx, owner.ID, etag, input)
+	updated, updatedETag, _, err := svc.UpdateConfig(ctx, owner.ID, etag, input)
 	if err != nil || updated.Local == nil || updated.Local.Version != 1 || updatedETag == etag {
 		t.Fatalf("local config update = %+v, etag=%q, err=%v", updated, updatedETag, err)
 	}
-	if _, _, err := svc.ResetConfig(ctx, owner.ID, etag, scope); !errors.Is(err, control.ErrPreconditionFailed) {
+	if _, _, _, err := svc.ResetConfig(ctx, owner.ID, etag, scope); !errors.Is(err, control.ErrPreconditionFailed) {
 		t.Fatalf("stale config reset = %v, want precondition failure", err)
 	}
-	reset, resetETag, err := svc.ResetConfig(ctx, owner.ID, updatedETag, scope)
+	reset, resetETag, _, err := svc.ResetConfig(ctx, owner.ID, updatedETag, scope)
 	if err != nil || reset.Local != nil || resetETag == updatedETag {
 		t.Fatalf("config reset = %+v, etag=%q, err=%v", reset, resetETag, err)
 	}

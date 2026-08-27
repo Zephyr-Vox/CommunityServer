@@ -41,6 +41,7 @@ var (
 // they must be suppressed after a process epoch change.
 type IdempotencyHeaders struct {
 	ETag         string
+	ParentETag   string
 	Location     string
 	CacheControl string
 	Pragma       string
@@ -155,6 +156,7 @@ func (s *IdempotencyStore) Save(ctx context.Context, record CommandIdempotencyRe
 		Status:         record.Status,
 		ResultBody:     string(record.ResultBody),
 		Etag:           nullString(optionalNonEmpty(record.Headers.ETag)),
+		ParentEtag:     nullString(optionalNonEmpty(record.Headers.ParentETag)),
 		Location:       nullString(optionalNonEmpty(record.Headers.Location)),
 		CacheControl:   nullString(optionalNonEmpty(record.Headers.CacheControl)),
 		Pragma:         nullString(optionalNonEmpty(record.Headers.Pragma)),
@@ -202,6 +204,7 @@ func commandIdempotencyRecordFromDB(row db.CommandIdempotency) (*CommandIdempote
 		ResultBody:     append(json.RawMessage(nil), row.ResultBody...),
 		Headers: IdempotencyHeaders{
 			ETag:         optionalStringValue(row.Etag),
+			ParentETag:   optionalStringValue(row.ParentEtag),
 			Location:     optionalStringValue(row.Location),
 			CacheControl: optionalStringValue(row.CacheControl),
 			Pragma:       optionalStringValue(row.Pragma),
@@ -227,7 +230,7 @@ func validCommandIdempotencyRecord(record CommandIdempotencyRecord) bool {
 	if _, err := hex.DecodeString(record.RequestHMAC); err != nil {
 		return false
 	}
-	if !json.Valid(record.ResultBody) || hasInvalidHeaderValue(record.Headers.ETag) || hasInvalidHeaderValue(record.Headers.Location) || hasInvalidHeaderValue(record.Headers.CacheControl) || hasInvalidHeaderValue(record.Headers.Pragma) {
+	if !json.Valid(record.ResultBody) || hasInvalidHeaderValue(record.Headers.ETag) || hasInvalidHeaderValue(record.Headers.ParentETag) || hasInvalidHeaderValue(record.Headers.Location) || hasInvalidHeaderValue(record.Headers.CacheControl) || hasInvalidHeaderValue(record.Headers.Pragma) {
 		return false
 	}
 	return record.GEID <= uint64(^uint64(0)>>1)

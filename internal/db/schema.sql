@@ -218,6 +218,7 @@ CREATE TABLE IF NOT EXISTS command_idempotency (
     status           INTEGER NOT NULL CHECK (status BETWEEN 100 AND 599),
     result_body      TEXT    NOT NULL CHECK (json_valid(result_body)),
     etag             TEXT,
+    parent_etag      TEXT,
     location         TEXT,
     cache_control    TEXT,
     pragma           TEXT,

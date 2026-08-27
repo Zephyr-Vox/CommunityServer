@@ -118,6 +118,21 @@ func (e *CommandExecution) Reserve(request PublicationRequest) (PublicationResul
 	return reservation.Result(), nil
 }
 
+// ReservedResult returns the final unpublished publication result after Reserve
+// succeeds. Persistent HTTP commands use its checkpoint and version to save a
+// durable response before committing their transaction.
+func (e *CommandExecution) ReservedResult() (PublicationResult, error) {
+	if e == nil {
+		return PublicationResult{}, ErrInvalidSequencer
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.reservation == nil || e.committing || e.persistent || e.runtimeReady || e.published {
+		return PublicationResult{}, ErrCommandNotCommitted
+	}
+	return e.reservation.Result(), nil
+}
+
 // Commit commits tx and atomically enters the post-commit phase. tx must
 // contain the domain mutation, the candidate used by Reserve, and its durable
 // idempotency result. All work after this call must use its returned internal
@@ -145,6 +160,33 @@ func (e *CommandExecution) Commit(tx *sql.Tx) (context.Context, error) {
 	e.committing = false
 	e.persistent = true
 	return e.completionCtx, nil
+}
+
+// CommitNoop commits a transaction that contains only a durable HTTP replay
+// result for a successfully revalidated no-op. It retains the sequencer's
+// no-publication semantics while making that completed response durable.
+func (e *CommandExecution) CommitNoop(tx *sql.Tx) error {
+	if e == nil || tx == nil {
+		return ErrInvalidSequencer
+	}
+	e.mu.Lock()
+	if e.reservation != nil || e.committing || e.persistent || e.runtimeReady || e.noop || e.published {
+		e.mu.Unlock()
+		return ErrCommandNotCommitted
+	}
+	e.committing = true
+	e.mu.Unlock()
+	if err := tx.Commit(); err != nil {
+		e.mu.Lock()
+		e.committing = false
+		e.mu.Unlock()
+		return err
+	}
+	e.mu.Lock()
+	e.committing = false
+	e.noop = true
+	e.mu.Unlock()
+	return nil
 }
 
 // MarkRuntimeReady marks a runtime-only command as fully prepared. It does not

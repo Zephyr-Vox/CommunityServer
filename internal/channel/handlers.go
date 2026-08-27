@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -8,8 +9,10 @@ import (
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/api"
+	"zephyr.vox/server/ce/internal/commandhttp"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
+	"zephyr.vox/server/ce/internal/realtime"
 )
 
 // ListGroupsHandler handles GET /api/v0/groups. The route must be mounted
@@ -42,23 +45,45 @@ func ListGroupsHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 4 resource limit reached: the server already has 256 groups
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: group.create is not currently granted at server scope
 //   - 1009 internal: persistent command or publication failed
 func CreateGroupHandler(svc *Service) echo.HandlerFunc {
-	const codeResourceLimit = 4
+	const (
+		codeResourceLimit = 4
+	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req createGroupRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		group, state, err := svc.CreateGroup(c.Request().Context(), principal.UserID, CreateGroupInput{
+		input := CreateGroupInput{
 			Name:       req.Name,
 			Position:   *req.Position,
 			Visibility: req.Visibility,
-		})
+		}
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/groups", nil, nil, input)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		group, state, err := svc.CreateGroup(ctx, principal.UserID, input)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrResourceLimit):
 			return api.NewError(codeResourceLimit, http.StatusConflict, "group resource limit reached")
@@ -68,7 +93,7 @@ func CreateGroupHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setStateHeaders(c, state)
-		return api.OK(c, http.StatusCreated, group)
+		return commandhttp.OK(c, http.StatusCreated, group)
 	})
 }
 
@@ -109,6 +134,7 @@ func GetGroupHandler(svc *Service) echo.HandlerFunc {
 // Errors:
 //   - 1 group not found: the group is absent or inaccessible to the actor
 //   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: id is invalid or the patch is empty/invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -120,6 +146,10 @@ func UpdateGroupHandler(svc *Service) echo.HandlerFunc {
 		codePrecondition = 2
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		groupID, err := pathID(c.Param("id"))
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
@@ -131,11 +161,27 @@ func UpdateGroupHandler(svc *Service) echo.HandlerFunc {
 		if req.Name == nil && req.Position == nil && req.Visibility == nil {
 			return api.InvalidField("body", "at least one mutable field is required")
 		}
-		group, state, err := svc.UpdateGroup(c.Request().Context(), principal.UserID, groupID, exactIfMatch(c), UpdateGroupInput{
+		input := UpdateGroupInput{
 			Name:       req.Name,
 			Position:   req.Position,
 			Visibility: req.Visibility,
-		})
+		}
+		expectedETag := exactIfMatch(c)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPatch, "/api/v0/groups/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(groupID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, input)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		group, state, err := svc.UpdateGroup(ctx, principal.UserID, groupID, expectedETag, input)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "group not found")
@@ -147,7 +193,7 @@ func UpdateGroupHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setStateHeaders(c, state)
-		return api.OK(c, http.StatusOK, group)
+		return commandhttp.OK(c, http.StatusOK, group)
 	})
 }
 
@@ -159,6 +205,7 @@ func UpdateGroupHandler(svc *Service) echo.HandlerFunc {
 //   - 1 group not found: the group is absent or inaccessible to the actor
 //   - 2 precondition failed: If-Match is missing or does not exactly match
 //   - 3 group not empty: a channel still belongs to the group
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: id is not a positive decimal snowflake ID
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: group.manage is not currently granted at group scope
@@ -170,11 +217,30 @@ func DeleteGroupHandler(svc *Service) echo.HandlerFunc {
 		codeNonEmpty     = 3
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		groupID, err := pathID(c.Param("id"))
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
 		}
-		state, err := svc.DeleteGroup(c.Request().Context(), principal.UserID, groupID, exactIfMatch(c))
+		expectedETag := exactIfMatch(c)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/groups/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(groupID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		state, err := svc.DeleteGroup(ctx, principal.UserID, groupID, expectedETag)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "group not found")
@@ -188,7 +254,7 @@ func DeleteGroupHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setStateHeaders(c, state)
-		return api.NoContent(c, http.StatusNoContent)
+		return commandhttp.NoContent(c, http.StatusNoContent)
 	})
 }
 
@@ -233,6 +299,7 @@ func ListChannelsHandler(svc *Service) echo.HandlerFunc {
 //   - 1 parent group not found: the requested parent is absent or not visible
 //   - 3 invalid target state: a temporary channel must use voice mode
 //   - 4 resource limit reached: a channel or temporary-channel cap was reached
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -245,6 +312,10 @@ func CreateChannelHandler(svc *Service) echo.HandlerFunc {
 		codeResourceLimit  = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req createChannelRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
@@ -253,7 +324,7 @@ func CreateChannelHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("group_id", "must be a positive decimal snowflake ID")
 		}
-		channel, state, err := svc.CreateChannel(c.Request().Context(), principal.UserID, CreateChannelInput{
+		input := CreateChannelInput{
 			GroupID:    groupID,
 			Name:       req.Name,
 			Mode:       req.Mode,
@@ -262,7 +333,22 @@ func CreateChannelHandler(svc *Service) echo.HandlerFunc {
 			Capacity:   defaultCapacity(req.Capacity),
 			Position:   *req.Position,
 			Pinned:     *req.Pinned,
-		})
+		}
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/channels", nil, nil, input)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		channel, state, err := svc.CreateChannel(ctx, principal.UserID, input)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrParentNotFound):
 			return api.NewError(codeParentNotFound, http.StatusNotFound, "parent group not found")
@@ -276,7 +362,7 @@ func CreateChannelHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setStateHeaders(c, state)
-		return api.OK(c, http.StatusCreated, channel)
+		return commandhttp.OK(c, http.StatusCreated, channel)
 	})
 }
 
@@ -318,6 +404,7 @@ func GetChannelHandler(svc *Service) echo.HandlerFunc {
 //   - 1 channel or destination group not found: target is absent or inaccessible
 //   - 2 precondition failed: If-Match is missing or does not exactly match
 //   - 3 invalid channel state: capacity would fall below active membership
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: id is invalid or the patch is empty/invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -330,6 +417,10 @@ func UpdateChannelHandler(svc *Service) echo.HandlerFunc {
 		codeInvalidState = 3
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		channelID, err := pathID(c.Param("id"))
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
@@ -348,7 +439,7 @@ func UpdateChannelHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("group_id", "must be a positive decimal snowflake ID")
 		}
-		channel, state, err := svc.UpdateChannel(c.Request().Context(), principal.UserID, channelID, exactIfMatch(c), UpdateChannelInput{
+		input := UpdateChannelInput{
 			GroupIDSet: req.GroupID.Set,
 			GroupID:    groupID,
 			Name:       req.Name,
@@ -356,7 +447,23 @@ func UpdateChannelHandler(svc *Service) echo.HandlerFunc {
 			Capacity:   req.Capacity,
 			Position:   req.Position,
 			Pinned:     req.Pinned,
-		})
+		}
+		expectedETag := exactIfMatch(c)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPatch, "/api/v0/channels/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(channelID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, input)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		channel, state, err := svc.UpdateChannel(ctx, principal.UserID, channelID, expectedETag, input)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound), errors.Is(err, ErrParentNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "channel or destination group not found")
@@ -370,7 +477,7 @@ func UpdateChannelHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setStateHeaders(c, state)
-		return api.OK(c, http.StatusOK, channel)
+		return commandhttp.OK(c, http.StatusOK, channel)
 	})
 }
 
@@ -382,6 +489,7 @@ func UpdateChannelHandler(svc *Service) echo.HandlerFunc {
 //   - 1 channel not found: the channel is absent or inaccessible to the actor
 //   - 2 precondition failed: If-Match is missing or does not exactly match
 //   - 3 channel active: active voice authority cannot be orphaned by deletion
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: id is not a positive decimal snowflake ID
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: channel.manage is not currently granted at channel scope
@@ -393,11 +501,30 @@ func DeleteChannelHandler(svc *Service) echo.HandlerFunc {
 		codeActive       = 3
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		channelID, err := pathID(c.Param("id"))
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
 		}
-		state, err := svc.DeleteChannel(c.Request().Context(), principal.UserID, channelID, exactIfMatch(c))
+		expectedETag := exactIfMatch(c)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/channels/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(channelID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		state, err := svc.DeleteChannel(ctx, principal.UserID, channelID, expectedETag)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "channel not found")
@@ -411,7 +538,7 @@ func DeleteChannelHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setStateHeaders(c, state)
-		return api.NoContent(c, http.StatusNoContent)
+		return commandhttp.NoContent(c, http.StatusNoContent)
 	})
 }
 
@@ -458,6 +585,7 @@ func ListGroupAccessHandler(svc *Service) echo.HandlerFunc {
 //   - 1 group or access principal not found: a referenced resource is absent or inaccessible
 //   - 2 precondition failed: If-Match is missing or does not exactly match
 //   - 4 resource limit reached: the group already has 1024 ACL entries
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: id or principal shape is invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -470,6 +598,10 @@ func AddGroupAccessHandler(svc *Service) echo.HandlerFunc {
 		codeResourceLimit = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		groupID, err := pathID(c.Param("id"))
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
@@ -485,7 +617,22 @@ func AddGroupAccessHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("body.principal", "must contain exactly one valid principal matching principal_type")
 		}
-		result, err := svc.AddGroupAccess(c.Request().Context(), principal.UserID, groupID, exactIfMatch(c), accessPrincipal)
+		expectedETag := exactIfMatch(c)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/groups/:id/access", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(groupID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, accessPrincipal)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		result, err := svc.AddGroupAccess(ctx, principal.UserID, groupID, expectedETag, accessPrincipal)
+		if result.State.Replay != nil {
+			return commandhttp.ReplayDurable(c, *result.State.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound), errors.Is(err, ErrAccessPrincipalNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "group or access principal not found")
@@ -505,7 +652,7 @@ func AddGroupAccessHandler(svc *Service) echo.HandlerFunc {
 		if result.Created {
 			status = http.StatusCreated
 		}
-		return api.OK(c, status, snapshotAccessResponse(result.Entry))
+		return commandhttp.OK(c, status, snapshotAccessResponse(result.Entry))
 	})
 }
 
@@ -516,6 +663,7 @@ func AddGroupAccessHandler(svc *Service) echo.HandlerFunc {
 // Errors:
 //   - 1 group or access entry not found: a referenced resource is absent or inaccessible
 //   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: id or access_id is invalid
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: group.manage is not currently granted at group scope
@@ -526,6 +674,10 @@ func DeleteGroupAccessHandler(svc *Service) echo.HandlerFunc {
 		codePrecondition = 2
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		groupID, err := pathID(c.Param("id"))
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
@@ -534,7 +686,22 @@ func DeleteGroupAccessHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("path.access_id", "must be a positive decimal snowflake ID")
 		}
-		result, err := svc.DeleteGroupAccess(c.Request().Context(), principal.UserID, groupID, accessID, exactIfMatch(c))
+		expectedETag := exactIfMatch(c)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/groups/:id/access/:access_id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(groupID, 10)}, {Name: "access_id", Value: strconv.FormatInt(accessID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		result, err := svc.DeleteGroupAccess(ctx, principal.UserID, groupID, accessID, expectedETag)
+		if result.State.Replay != nil {
+			return commandhttp.ReplayDurable(c, *result.State.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "group or access entry not found")
@@ -546,7 +713,7 @@ func DeleteGroupAccessHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setAccessMutationHeaders(c, result)
-		return api.NoContent(c, http.StatusNoContent)
+		return commandhttp.NoContent(c, http.StatusNoContent)
 	})
 }
 
@@ -594,6 +761,7 @@ func ListChannelAccessHandler(svc *Service) echo.HandlerFunc {
 //   - 2 precondition failed: If-Match or X-Zephyr-Parent-If-Match does not exactly match
 //   - 4 resource limit reached: a group or channel already has 1024 ACL entries
 //   - 5 private parent access required: the principal lacks an ACL entry for the private parent
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: id or principal shape is invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -607,6 +775,10 @@ func AddChannelAccessHandler(svc *Service) echo.HandlerFunc {
 		codeParentAccess  = 5
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		channelID, err := pathID(c.Param("id"))
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
@@ -619,10 +791,27 @@ func AddChannelAccessHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("body.principal", "must contain exactly one valid principal matching principal_type")
 		}
-		result, err := svc.AddChannelAccess(c.Request().Context(), principal.UserID, channelID, exactIfMatch(c), exactParentIfMatch(c), ChannelAccessInput{
+		expectedETag := exactIfMatch(c)
+		expectedParentETag := exactParentIfMatch(c)
+		input := ChannelAccessInput{
 			Principal:   accessPrincipal,
 			GrantParent: req.GrantParent,
-		})
+		}
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/channels/:id/access", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(channelID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}, {Name: "X-Zephyr-Parent-If-Match", Value: expectedParentETag}}, input)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		result, err := svc.AddChannelAccess(ctx, principal.UserID, channelID, expectedETag, expectedParentETag, input)
+		if result.State.Replay != nil {
+			return commandhttp.ReplayDurable(c, *result.State.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound), errors.Is(err, ErrAccessPrincipalNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "channel or access principal not found")
@@ -644,7 +833,7 @@ func AddChannelAccessHandler(svc *Service) echo.HandlerFunc {
 		if result.Created {
 			status = http.StatusCreated
 		}
-		return api.OK(c, status, snapshotAccessResponse(result.Entry))
+		return commandhttp.OK(c, status, snapshotAccessResponse(result.Entry))
 	})
 }
 
@@ -655,6 +844,7 @@ func AddChannelAccessHandler(svc *Service) echo.HandlerFunc {
 // Errors:
 //   - 1 channel or access entry not found: a referenced resource is absent or inaccessible
 //   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: id or access_id is invalid
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: channel.invite is not currently granted at channel scope
@@ -665,6 +855,10 @@ func DeleteChannelAccessHandler(svc *Service) echo.HandlerFunc {
 		codePrecondition = 2
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		channelID, err := pathID(c.Param("id"))
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
@@ -673,7 +867,22 @@ func DeleteChannelAccessHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("path.access_id", "must be a positive decimal snowflake ID")
 		}
-		result, err := svc.DeleteChannelAccess(c.Request().Context(), principal.UserID, channelID, accessID, exactIfMatch(c))
+		expectedETag := exactIfMatch(c)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/channels/:id/access/:access_id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(channelID, 10)}, {Name: "access_id", Value: strconv.FormatInt(accessID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		result, err := svc.DeleteChannelAccess(ctx, principal.UserID, channelID, accessID, expectedETag)
+		if result.State.Replay != nil {
+			return commandhttp.ReplayDurable(c, *result.State.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "channel or access entry not found")
@@ -685,7 +894,7 @@ func DeleteChannelAccessHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setAccessMutationHeaders(c, result)
-		return api.NoContent(c, http.StatusNoContent)
+		return commandhttp.NoContent(c, http.StatusNoContent)
 	})
 }
 
@@ -789,13 +998,7 @@ func accessPrincipalFromRequest(req accessRequest) (AccessPrincipalInput, error)
 // successful mutation. Focused service tests may omit the cursor signer, but
 // assembled HTTP routes always install it during server startup.
 func setStateHeaders(c *echo.Context, state StateCommand) {
-	if state.Cursor != "" {
-		c.Response().Header().Set("X-Zephyr-State-Cursor", state.Cursor)
-	}
-	if state.Checkpoint.StreamEpoch != "" {
-		c.Response().Header().Set("X-Zephyr-Stream-Epoch", state.Checkpoint.StreamEpoch)
-		c.Response().Header().Set("X-Zephyr-Geid", strconv.FormatUint(state.Checkpoint.GEID, 10))
-	}
+	commandhttp.SetStateCommandHeaders(c, state.CommandID, state.Checkpoint, state.Cursor)
 }
 
 // setAccessMutationHeaders exposes the post-command parent entity ETag along
@@ -807,4 +1010,34 @@ func setAccessMutationHeaders(c *echo.Context, result AccessMutation) {
 		c.Response().Header().Set("X-Zephyr-Parent-ETag", result.ParentETag)
 	}
 	setStateHeaders(c, result.State)
+}
+
+// idempotencyKey validates the one required retry key field for Step 6 HTTP
+// mutations. Repeated fields are rejected instead of silently choosing one.
+func idempotencyKey(c *echo.Context) (string, error) {
+	values := c.Request().Header.Values("Idempotency-Key")
+	if len(values) != 1 || !realtime.IdempotencyKeyValid(values[0]) {
+		return "", api.InvalidField("header.Idempotency-Key", "must be 16-64 characters using letters, digits, underscore, or hyphen")
+	}
+	return values[0], nil
+}
+
+// prepareHTTPMutation checks one completed durable result before a new command
+// enters the service's sequenced authorization path.
+func prepareHTTPMutation(c *echo.Context, svc *Service, key string, identity realtime.HTTPCommandIdentity) (context.Context, bool, error) {
+	command, err := realtime.NewHTTPMutationCommand(identity, key)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, replay, found, err := svc.PrepareHTTPMutation(c.Request().Context(), command)
+	if errors.Is(err, realtime.ErrIdempotencyMismatch) {
+		return nil, false, api.NewError(9, http.StatusConflict, "idempotency key reused with different request")
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if found {
+		return nil, true, commandhttp.ReplayDurable(c, replay)
+	}
+	return ctx, false, nil
 }

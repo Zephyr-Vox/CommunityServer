@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"regexp"
 
 	"zephyr.vox/server/ce/internal/db"
@@ -63,6 +64,8 @@ type Service struct {
 	sequencer  *realtime.PostCommitSequencer
 	visibility *realtime.VisibilityResolver
 	scopedAuth *rbacscope.Authorizer
+	cursors    realtime.StateCursorIssuer
+	durable    *realtime.DurableIdempotency
 }
 
 // StateChange identifies a committed RBAC mutation requiring an immutable
@@ -103,6 +106,41 @@ func (s *Service) SetStateCommandRuntime(state *realtime.StateStore, sequencer *
 // SetStateMutationGate installs the process-wide persistent mutation gate.
 func (s *Service) SetStateMutationGate(gate MutationGate) { s.gate = gate }
 
+// SetStateCursorIssuer installs the process-local cursor issuer used for
+// durable HTTP command results.
+func (s *Service) SetStateCursorIssuer(cursors realtime.StateCursorIssuer) { s.cursors = cursors }
+
+// SetDurableIdempotency installs restart-safe completed HTTP command storage.
+func (s *Service) SetDurableIdempotency(durable *realtime.DurableIdempotency) {
+	s.durable = durable
+}
+
+// StateCommand identifies the exact command and state checkpoint completed by
+// one RBAC control mutation.
+type StateCommand struct {
+	CommandID  int64
+	Cursor     string
+	Checkpoint realtime.Checkpoint
+	Replay     *realtime.DurableReplay
+}
+
+// PrepareHTTPMutation checks durable completion before a new RBAC command
+// reauthorizes role management in its sequenced transaction.
+func (s *Service) PrepareHTTPMutation(ctx context.Context, command realtime.HTTPMutationCommand) (context.Context, realtime.DurableReplay, bool, error) {
+	if s == nil || s.durable == nil {
+		return nil, realtime.DurableReplay{}, false, ErrRealtimeUnavailable
+	}
+	version, err := s.currentState()
+	if err != nil {
+		return nil, realtime.DurableReplay{}, false, err
+	}
+	replay, found, err := s.durable.Lookup(ctx, command.Identity, command.IdempotencyKey, version.Checkpoint().StreamEpoch)
+	if err != nil || found {
+		return nil, replay, found, err
+	}
+	return realtime.WithHTTPMutationCommand(ctx, command), realtime.DurableReplay{}, false, nil
+}
+
 // BindingInput identifies the target user, role and one exact binding scope.
 type BindingInput struct {
 	UserID    int64
@@ -123,11 +161,13 @@ func (s *Service) ListRoles(ctx context.Context) ([]db.Role, error) {
 }
 
 // CreateRole creates a custom role only below the actor's server rank.
-func (s *Service) CreateRole(ctx context.Context, actorID int64, key, displayName string, rank int64) (*db.Role, error) {
+func (s *Service) CreateRole(ctx context.Context, actorID int64, key, displayName string, rank int64) (*db.Role, StateCommand, error) {
 	if !roleKeyRE.MatchString(key) || key == "owner" || key == "admin" || key == "member" {
-		return nil, ErrInvalidRoleKey
+		return nil, StateCommand{}, ErrInvalidRoleKey
 	}
-	value, err := s.runMutation(ctx, []int64{actorID}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+	completion, err := s.runMutation(ctx, []int64{actorID}, func(value any) (int, any, store.IdempotencyHeaders) {
+		return http.StatusCreated, newRoleResponse(value.(*db.Role)), store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
 		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
 			return mutationResult{}, err
 		}
@@ -145,23 +185,25 @@ func (s *Service) CreateRole(ctx context.Context, actorID int64, key, displayNam
 		return mutationResult{value: role, change: StateChange{EventType: "rbac.role.created", RoleKey: role.Key}}, nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, StateCommand{}, err
 	}
-	role, ok := value.(*db.Role)
+	role, ok := completion.value.(*db.Role)
 	if !ok {
-		return nil, ErrRealtimeUnavailable
+		return nil, StateCommand{}, ErrRealtimeUnavailable
 	}
-	return role, nil
+	return role, completion.state, nil
 }
 
 // UpdateRole updates a role's mutable fields while preserving rank hierarchy
 // and owner immutability. An unchanged request returns the existing role.
-func (s *Service) UpdateRole(ctx context.Context, actorID int64, key string, displayName *string, rank *int64) (*db.Role, error) {
+func (s *Service) UpdateRole(ctx context.Context, actorID int64, key string, displayName *string, rank *int64) (*db.Role, StateCommand, error) {
 	userIDs, err := s.usersWithBindings(ctx, actorID)
 	if err != nil {
-		return nil, err
+		return nil, StateCommand{}, err
 	}
-	value, err := s.runMutation(ctx, userIDs, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+	completion, err := s.runMutation(ctx, userIDs, func(value any) (int, any, store.IdempotencyHeaders) {
+		return http.StatusOK, newRoleResponse(value.(*db.Role)), store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
 		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
 			return mutationResult{}, err
 		}
@@ -201,22 +243,24 @@ func (s *Service) UpdateRole(ctx context.Context, actorID int64, key string, dis
 		return mutationResult{value: updated, change: StateChange{EventType: "rbac.role.updated", RoleKey: updated.Key, UserIDs: userIDs}}, nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, StateCommand{}, err
 	}
-	role, ok := value.(*db.Role)
+	role, ok := completion.value.(*db.Role)
 	if !ok {
-		return nil, ErrRealtimeUnavailable
+		return nil, StateCommand{}, ErrRealtimeUnavailable
 	}
-	return role, nil
+	return role, completion.state, nil
 }
 
 // DeleteRole deletes an unreferenced custom role below the actor's rank.
-func (s *Service) DeleteRole(ctx context.Context, actorID int64, key string) error {
+func (s *Service) DeleteRole(ctx context.Context, actorID int64, key string) (StateCommand, error) {
 	userIDs, err := s.usersWithBindings(ctx, actorID)
 	if err != nil {
-		return err
+		return StateCommand{}, err
 	}
-	_, err = s.runMutation(ctx, userIDs, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+	completion, err := s.runMutation(ctx, userIDs, func(any) (int, any, store.IdempotencyHeaders) {
+		return http.StatusNoContent, nil, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
 		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
 			return mutationResult{}, err
 		}
@@ -239,7 +283,10 @@ func (s *Service) DeleteRole(ctx context.Context, actorID int64, key string) err
 		}
 		return mutationResult{change: StateChange{EventType: "rbac.role.deleted", RoleKey: key, UserIDs: userIDs}}, nil
 	})
-	return err
+	if err != nil {
+		return StateCommand{}, err
+	}
+	return completion.state, nil
 }
 
 // ListBindings returns bindings the actor may manage. Non-owners do not see
@@ -272,14 +319,21 @@ func (s *Service) ListBindings(ctx context.Context, actorID, limit, offset int64
 // CreateBinding adds one non-owner binding after checking server rank against
 // both the target user and the role being granted. Duplicate requests return
 // the existing binding with created=false.
-func (s *Service) CreateBinding(ctx context.Context, actorID int64, input BindingInput) (*db.UserRoleBinding, bool, error) {
+func (s *Service) CreateBinding(ctx context.Context, actorID int64, input BindingInput) (*db.UserRoleBinding, bool, StateCommand, error) {
 	if err := validateScopeShape(input); err != nil {
-		return nil, false, err
+		return nil, false, StateCommand{}, err
 	}
 	if input.RoleKey == "owner" {
-		return nil, false, store.ErrOwnerBindingProtected
+		return nil, false, StateCommand{}, store.ErrOwnerBindingProtected
 	}
-	value, err := s.runMutation(ctx, []int64{actorID, input.UserID}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+	completion, err := s.runMutation(ctx, []int64{actorID, input.UserID}, func(value any) (int, any, store.IdempotencyHeaders) {
+		result := value.(bindingMutation)
+		status := http.StatusOK
+		if result.created {
+			status = http.StatusCreated
+		}
+		return status, newBindingResponse(result.binding), store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
 		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
 			return mutationResult{}, err
 		}
@@ -318,26 +372,28 @@ func (s *Service) CreateBinding(ctx context.Context, actorID int64, input Bindin
 		}, nil
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, false, StateCommand{}, err
 	}
-	result, ok := value.(bindingMutation)
+	result, ok := completion.value.(bindingMutation)
 	if !ok || result.binding == nil {
-		return nil, false, ErrRealtimeUnavailable
+		return nil, false, StateCommand{}, ErrRealtimeUnavailable
 	}
-	return result.binding, result.created, nil
+	return result.binding, result.created, completion.state, nil
 }
 
 // DeleteBinding removes one non-owner binding after strict actor/target rank
 // validation. Owner bindings are rejected by the store and must use transfer.
-func (s *Service) DeleteBinding(ctx context.Context, actorID, bindingID int64) error {
+func (s *Service) DeleteBinding(ctx context.Context, actorID, bindingID int64) (StateCommand, error) {
 	// Discover the target before acquiring locks so deletion serializes with
 	// mutations for both actor and target. The binding is read again inside the
 	// transaction because it may have changed or been deleted while waiting.
 	binding, err := s.stores.Roles.GetBinding(ctx, bindingID)
 	if err != nil {
-		return err
+		return StateCommand{}, err
 	}
-	_, err = s.runMutation(ctx, []int64{actorID, binding.UserID}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+	completion, err := s.runMutation(ctx, []int64{actorID, binding.UserID}, func(any) (int, any, store.IdempotencyHeaders) {
+		return http.StatusNoContent, nil, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
 		if err := requireRoleManage(commandCtx, txStores, actorID); err != nil {
 			return mutationResult{}, err
 		}
@@ -371,19 +427,27 @@ func (s *Service) DeleteBinding(ctx context.Context, actorID, bindingID int64) e
 		}
 		return mutationResult{change: StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{current.UserID}, Scope: bindingScope(current)}}, nil
 	})
-	return err
+	if err != nil {
+		return StateCommand{}, err
+	}
+	return completion.state, nil
 }
 
 // TransferOwner transfers the unique owner role after the principal mutation
 // barrier covers both users. The store performs the atomic server-binding swap.
-func (s *Service) TransferOwner(ctx context.Context, currentUserID, targetUserID int64) error {
-	_, err := s.runMutation(ctx, []int64{currentUserID, targetUserID}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+func (s *Service) TransferOwner(ctx context.Context, currentUserID, targetUserID int64) (StateCommand, error) {
+	completion, err := s.runMutation(ctx, []int64{currentUserID, targetUserID}, func(any) (int, any, store.IdempotencyHeaders) {
+		return http.StatusOK, ownerTransferResponse{PreviousOwnerID: currentUserID, NewOwnerID: targetUserID}, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
 		if err := txStores.TransferOwnerInTx(commandCtx, currentUserID, targetUserID); err != nil {
 			return mutationResult{}, err
 		}
 		return mutationResult{change: StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{currentUserID, targetUserID}, Scope: realtime.Scope{Type: "server"}}}, nil
 	})
-	return err
+	if err != nil {
+		return StateCommand{}, err
+	}
+	return completion.state, nil
 }
 
 // GetConfig returns the requested visible scope's local snapshot, effective
@@ -412,16 +476,23 @@ func (s *Service) GetConfig(ctx context.Context, actorID int64, scope store.Conf
 // UpdateConfig validates that the actor cannot grant permissions they do not
 // already hold, persists the complete scope snapshot, and invalidates bound
 // principals after the transaction commits.
-func (s *Service) UpdateConfig(ctx context.Context, actorID int64, expectedETag string, input ConfigInput) (*store.EffectiveConfig, string, error) {
+func (s *Service) UpdateConfig(ctx context.Context, actorID int64, expectedETag string, input ConfigInput) (*store.EffectiveConfig, string, StateCommand, error) {
 	raw, err := json.Marshal(input.Config)
 	if err != nil {
-		return nil, "", err
+		return nil, "", StateCommand{}, err
 	}
 	userIDs, err := s.usersWithBindings(ctx, actorID)
 	if err != nil {
-		return nil, "", err
+		return nil, "", StateCommand{}, err
 	}
-	value, err := s.runMutation(ctx, userIDs, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+	completion, err := s.runMutation(ctx, userIDs, func(value any) (int, any, store.IdempotencyHeaders) {
+		result := value.(configMutation)
+		response, err := newPermissionConfigResponse(result.config)
+		if err != nil {
+			return http.StatusInternalServerError, nil, store.IdempotencyHeaders{}
+		}
+		return http.StatusOK, response, store.IdempotencyHeaders{ETag: result.etag}
+	}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
 		version, err := s.currentState()
 		if err != nil {
 			return mutationResult{}, err
@@ -473,24 +544,31 @@ func (s *Service) UpdateConfig(ctx context.Context, actorID int64, expectedETag 
 		return mutationResult{value: configMutation{config: config, etag: etag}, change: StateChange{EventType: "rbac.config.updated", UserIDs: userIDs, Scope: realtimeScope(input.Scope)}}, nil
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, "", StateCommand{}, err
 	}
-	result, ok := value.(configMutation)
+	result, ok := completion.value.(configMutation)
 	if !ok || result.config == nil {
-		return nil, "", ErrRealtimeUnavailable
+		return nil, "", StateCommand{}, ErrRealtimeUnavailable
 	}
-	return result.config, result.etag, nil
+	return result.config, result.etag, completion.state, nil
 }
 
 // ResetConfig restores the default server matrix or removes a local snapshot.
 // The effective permissions after reset must still be a subset of the actor's
 // current grants unless the actor is owner.
-func (s *Service) ResetConfig(ctx context.Context, actorID int64, expectedETag string, scope store.ConfigScope) (*store.EffectiveConfig, string, error) {
+func (s *Service) ResetConfig(ctx context.Context, actorID int64, expectedETag string, scope store.ConfigScope) (*store.EffectiveConfig, string, StateCommand, error) {
 	userIDs, err := s.usersWithBindings(ctx, actorID)
 	if err != nil {
-		return nil, "", err
+		return nil, "", StateCommand{}, err
 	}
-	value, err := s.runMutation(ctx, userIDs, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+	completion, err := s.runMutation(ctx, userIDs, func(value any) (int, any, store.IdempotencyHeaders) {
+		result := value.(configMutation)
+		response, err := newPermissionConfigResponse(result.config)
+		if err != nil {
+			return http.StatusInternalServerError, nil, store.IdempotencyHeaders{}
+		}
+		return http.StatusOK, response, store.IdempotencyHeaders{ETag: result.etag}
+	}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
 		version, err := s.currentState()
 		if err != nil {
 			return mutationResult{}, err
@@ -538,13 +616,13 @@ func (s *Service) ResetConfig(ctx context.Context, actorID int64, expectedETag s
 		return mutationResult{value: configMutation{config: config, etag: etag}, change: StateChange{EventType: "rbac.config.updated", UserIDs: userIDs, Scope: realtimeScope(scope)}}, nil
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, "", StateCommand{}, err
 	}
-	result, ok := value.(configMutation)
+	result, ok := completion.value.(configMutation)
 	if !ok || result.config == nil {
-		return nil, "", ErrRealtimeUnavailable
+		return nil, "", StateCommand{}, ErrRealtimeUnavailable
 	}
-	return result.config, result.etag, nil
+	return result.config, result.etag, completion.state, nil
 }
 
 // configMutation keeps one config response and its exact effective-config ETag

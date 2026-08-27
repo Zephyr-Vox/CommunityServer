@@ -3,16 +3,20 @@ package server_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/server"
 )
+
+var testCommandKeyCounter atomic.Int64
 
 func postJSON(t *testing.T, app *server.App, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -50,6 +54,11 @@ func requestTokenWithHeaders(t *testing.T, app *server.App, method, path, token,
 	for key, values := range headers {
 		for _, value := range values {
 			req.Header.Add(key, value)
+		}
+	}
+	if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete {
+		if len(req.Header.Values("Idempotency-Key")) == 0 {
+			req.Header.Set("Idempotency-Key", fmt.Sprintf("test-command-%016d", testCommandKeyCounter.Add(1)))
 		}
 	}
 	if token != "" {

@@ -434,6 +434,7 @@ func TestResourceHandlersVerifyETagsAndCheckpointHeaders(t *testing.T) {
 
 	missing := httptest.NewRequest(http.MethodPatch, "/api/v0/groups/"+strconv.FormatInt(groupID, 10), strings.NewReader(`{"name":"Renamed"}`))
 	missing.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	missing.Header.Set("Idempotency-Key", "handler-missing-0001")
 	missingRec := httptest.NewRecorder()
 	app.ServeHTTP(missingRec, missing)
 	if missingRec.Code != http.StatusPreconditionFailed {
@@ -444,6 +445,7 @@ func TestResourceHandlersVerifyETagsAndCheckpointHeaders(t *testing.T) {
 	patch := httptest.NewRequest(http.MethodPatch, "/api/v0/groups/"+strconv.FormatInt(groupID, 10), strings.NewReader(`{"name":"Renamed"}`))
 	patch.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 	patch.Header.Set("If-Match", etag)
+	patch.Header.Set("Idempotency-Key", "handler-patch-00001")
 	patchRec := httptest.NewRecorder()
 	app.ServeHTTP(patchRec, patch)
 	if patchRec.Code != http.StatusOK {
@@ -660,6 +662,20 @@ func newFixture(t *testing.T) fixture {
 	service := channel.NewService(stores, &testPrincipalMutations{})
 	service.SetStateMutationGate(realtime.NewMutationGate())
 	service.SetStateCommandRuntime(state, sequencer)
+	requestSigner, err := realtime.NewRequestIdentitySigner([]byte(strings.Repeat("i", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable, err := realtime.NewDurableIdempotency(stores, requestSigner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursorSigner, err := realtime.NewCursorSignerWithKey(testEpoch, []byte(strings.Repeat("c", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetDurableIdempotency(durable)
+	service.SetStateCursorIssuer(testCursorIssuer{signer: cursorSigner})
 	return fixture{
 		service:     service,
 		state:       state,
@@ -668,6 +684,15 @@ func newFixture(t *testing.T) fixture {
 		adminID:     admin.ID,
 		memberID:    member.ID,
 	}
+}
+
+// testCursorIssuer signs the reserved candidate checkpoint used by handler
+// tests without constructing a full HTTP snapshot strategy.
+type testCursorIssuer struct{ signer *realtime.CursorSigner }
+
+// IssueStateCursor returns a cursor bound to one candidate's final visibility.
+func (i testCursorIssuer) IssueStateCursor(userID int64, version *realtime.StateVersion) (string, error) {
+	return i.signer.Issue(userID, version.Checkpoint(), version.VisibilityEpoch(userID))
 }
 
 // testPrincipalMutations serializes every fixture mutation like the production

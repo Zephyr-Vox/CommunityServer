@@ -1,6 +1,7 @@
 package moderation
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -8,8 +9,10 @@ import (
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/api"
+	"zephyr.vox/server/ce/internal/commandhttp"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
+	"zephyr.vox/server/ce/internal/realtime"
 )
 
 // ListHandler handles GET /api/v0/mutes. The route must be mounted behind
@@ -61,6 +64,7 @@ func ListHandler(svc *Service) echo.HandlerFunc {
 //   - 3 invalid mute state: duplicate or expired-at-submit mute request
 //   - 4 resource limit reached: active mute cap is exhausted
 //   - 6 protected target: self, owner, peer, or higher-rank users cannot be muted
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: request fields are invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -74,6 +78,10 @@ func CreateHandler(svc *Service) echo.HandlerFunc {
 		codeProtected = 6
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req createRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
@@ -86,13 +94,28 @@ func CreateHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("user_id", "must be a positive decimal snowflake ID")
 		}
-		mute, state, err := svc.Create(c.Request().Context(), principal.UserID, CreateInput{
+		input := CreateInput{
 			Scope:     scope,
 			UserID:    userID,
 			Kind:      req.Kind,
 			ExpiresAt: req.ExpiresAt,
 			Reason:    req.Reason,
-		})
+		}
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/mutes", nil, nil, input)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		mute, state, err := svc.Create(ctx, principal.UserID, input)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "mute target not found")
@@ -108,7 +131,7 @@ func CreateHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setStateHeaders(c, state)
-		return api.OK(c, http.StatusCreated, mute)
+		return commandhttp.OK(c, http.StatusCreated, mute)
 	})
 }
 
@@ -120,6 +143,7 @@ func CreateHandler(svc *Service) echo.HandlerFunc {
 //   - 2 precondition failed: If-Match is missing or does not match the mute
 //   - 3 invalid mute state: patch is empty or expiry is not in the future
 //   - 6 protected target: self, owner, peer, or higher-rank users cannot be changed
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: id or request fields are invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -133,6 +157,10 @@ func UpdateHandler(svc *Service) echo.HandlerFunc {
 		codeProtected    = 6
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		muteID, err := requiredID(c.Param("id"))
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
@@ -141,7 +169,23 @@ func UpdateHandler(svc *Service) echo.HandlerFunc {
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		mute, state, err := svc.Update(c.Request().Context(), principal.UserID, muteID, exactIfMatch(c), UpdateInput{ExpiresAtSet: req.ExpiresAt.Set, ExpiresAt: req.ExpiresAt.Value, Reason: req.Reason})
+		input := UpdateInput{ExpiresAtSet: req.ExpiresAt.Set, ExpiresAt: req.ExpiresAt.Value, Reason: req.Reason}
+		expectedETag := exactIfMatch(c)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPatch, "/api/v0/mutes/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(muteID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, input)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		mute, state, err := svc.Update(ctx, principal.UserID, muteID, expectedETag, input)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "mute not found")
@@ -157,7 +201,7 @@ func UpdateHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setStateHeaders(c, state)
-		return api.OK(c, http.StatusOK, mute)
+		return commandhttp.OK(c, http.StatusOK, mute)
 	})
 }
 
@@ -168,6 +212,7 @@ func UpdateHandler(svc *Service) echo.HandlerFunc {
 //   - 1 mute or scope not found: resource is absent or inaccessible
 //   - 2 precondition failed: If-Match is missing or does not match the mute
 //   - 6 protected target: self, owner, peer, or higher-rank users cannot be changed
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: id is invalid
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: member.mute is not granted at the mute scope
@@ -179,11 +224,30 @@ func DeleteHandler(svc *Service) echo.HandlerFunc {
 		codeProtected    = 6
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		muteID, err := requiredID(c.Param("id"))
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
 		}
-		state, err := svc.Delete(c.Request().Context(), principal.UserID, muteID, exactIfMatch(c))
+		expectedETag := exactIfMatch(c)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/mutes/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(muteID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		state, err := svc.Delete(ctx, principal.UserID, muteID, expectedETag)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrTargetNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "mute not found")
@@ -197,7 +261,7 @@ func DeleteHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		setStateHeaders(c, state)
-		return api.NoContent(c, http.StatusNoContent)
+		return commandhttp.NoContent(c, http.StatusNoContent)
 	})
 }
 
@@ -284,11 +348,34 @@ func exactIfMatch(c *echo.Context) string {
 
 // setStateHeaders exposes one completed StatePublication checkpoint.
 func setStateHeaders(c *echo.Context, state StateCommand) {
-	if state.Cursor != "" {
-		c.Response().Header().Set("X-Zephyr-State-Cursor", state.Cursor)
+	commandhttp.SetStateCommandHeaders(c, state.CommandID, state.Checkpoint, state.Cursor)
+}
+
+// idempotencyKey validates the one required retry key field for a mute command.
+func idempotencyKey(c *echo.Context) (string, error) {
+	values := c.Request().Header.Values("Idempotency-Key")
+	if len(values) != 1 || !realtime.IdempotencyKeyValid(values[0]) {
+		return "", api.InvalidField("header.Idempotency-Key", "must be 16-64 characters using letters, digits, underscore, or hyphen")
 	}
-	if state.Checkpoint.StreamEpoch != "" {
-		c.Response().Header().Set("X-Zephyr-Stream-Epoch", state.Checkpoint.StreamEpoch)
-		c.Response().Header().Set("X-Zephyr-Geid", strconv.FormatUint(state.Checkpoint.GEID, 10))
+	return values[0], nil
+}
+
+// prepareHTTPMutation checks durable completion before a mute service command
+// performs its sequenced scope and rank authorization.
+func prepareHTTPMutation(c *echo.Context, svc *Service, key string, identity realtime.HTTPCommandIdentity) (context.Context, bool, error) {
+	command, err := realtime.NewHTTPMutationCommand(identity, key)
+	if err != nil {
+		return nil, false, err
 	}
+	ctx, replay, found, err := svc.PrepareHTTPMutation(c.Request().Context(), command)
+	if errors.Is(err, realtime.ErrIdempotencyMismatch) {
+		return nil, false, api.NewError(9, http.StatusConflict, "idempotency key reused with different request")
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if found {
+		return nil, true, commandhttp.ReplayDurable(c, replay)
+	}
+	return ctx, false, nil
 }

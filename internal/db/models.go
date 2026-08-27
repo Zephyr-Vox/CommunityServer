@@ -68,6 +68,7 @@ type CommandIdempotency struct {
 	Status         int64          `json:"status"`
 	ResultBody     string         `json:"result_body"`
 	Etag           sql.NullString `json:"etag"`
+	ParentEtag     sql.NullString `json:"parent_etag"`
 	Location       sql.NullString `json:"location"`
 	CacheControl   sql.NullString `json:"cache_control"`
 	Pragma         sql.NullString `json:"pragma"`

@@ -47,6 +47,10 @@ func (a *App) routes(e *echo.Echo) error {
 		return fmt.Errorf("server: RBAC command runtime unavailable")
 	}
 	rbacSvc.SetStateCommandRuntime(state, sequencer)
+	rbacSvc.SetDurableIdempotency(a.durableCommands)
+	if cursors, ok := a.syncStrategy.(realtime.StateCursorIssuer); ok {
+		rbacSvc.SetStateCursorIssuer(cursors)
+	}
 
 	// authed wraps the standard authentication chain; extra middleware (e.g.
 	// permission checks) runs after it.
@@ -104,18 +108,18 @@ func (a *App) routes(e *echo.Echo) error {
 
 	rbacGroup := api.Group("/rbac")
 	rbacGroup.GET("/roles", rbaccontrol.ListRolesHandler(rbacSvc), authed()...)
-	rbacGroup.POST("/roles", rbaccontrol.CreateRoleHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
-	rbacGroup.PATCH("/roles/:key", rbaccontrol.UpdateRoleHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
-	rbacGroup.DELETE("/roles/:key", rbaccontrol.DeleteRoleHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.POST("/roles", rbaccontrol.CreateRoleHandler(rbacSvc), authed()...)
+	rbacGroup.PATCH("/roles/:key", rbaccontrol.UpdateRoleHandler(rbacSvc), authed()...)
+	rbacGroup.DELETE("/roles/:key", rbaccontrol.DeleteRoleHandler(rbacSvc), authed()...)
 	rbacGroup.GET("/bindings", rbaccontrol.ListBindingsHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
-	rbacGroup.POST("/bindings", rbaccontrol.CreateBindingHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
-	rbacGroup.DELETE("/bindings/:id", rbaccontrol.DeleteBindingHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.POST("/bindings", rbaccontrol.CreateBindingHandler(rbacSvc), authed()...)
+	rbacGroup.DELETE("/bindings/:id", rbaccontrol.DeleteBindingHandler(rbacSvc), authed()...)
 	rbacGroup.GET("/config", rbaccontrol.GetConfigHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
-	rbacGroup.PUT("/config", rbaccontrol.UpdateConfigHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
-	rbacGroup.POST("/config/reset", rbaccontrol.ResetConfigHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	rbacGroup.PUT("/config", rbaccontrol.UpdateConfigHandler(rbacSvc), authed()...)
+	rbacGroup.POST("/config/reset", rbaccontrol.ResetConfigHandler(rbacSvc), authed()...)
 
 	owner := api.Group("/owner")
-	owner.POST("/transfer", rbaccontrol.TransferOwnerHandler(rbacSvc), authed(rbacecho.Require(authz, rbac.PermRoleManage))...)
+	owner.POST("/transfer", rbaccontrol.TransferOwnerHandler(rbacSvc), authed()...)
 
 	admin := api.Group("/admin")
 	admin.POST("/activate", auth.ActivateHandler(a.activate), auth.IPRateLimit(a.cfg.LoginRateLimit))

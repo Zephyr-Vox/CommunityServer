@@ -83,7 +83,7 @@ func (q *Queries) GetActivationIdempotency(ctx context.Context, arg GetActivatio
 }
 
 const getCommandIdempotency = `-- name: GetCommandIdempotency :one
-SELECT principal_id, idempotency_key, endpoint, request_hmac, command_id, status, result_body, etag, location, cache_control, "pragma", stream_epoch, geid, state_cursor, created_at, expires_at FROM command_idempotency
+SELECT principal_id, idempotency_key, endpoint, request_hmac, command_id, status, result_body, etag, parent_etag, location, cache_control, "pragma", stream_epoch, geid, state_cursor, created_at, expires_at FROM command_idempotency
 WHERE principal_id = ? AND idempotency_key = ? AND expires_at > ?
 `
 
@@ -105,6 +105,7 @@ func (q *Queries) GetCommandIdempotency(ctx context.Context, arg GetCommandIdemp
 		&i.Status,
 		&i.ResultBody,
 		&i.Etag,
+		&i.ParentEtag,
 		&i.Location,
 		&i.CacheControl,
 		&i.Pragma,
@@ -163,9 +164,9 @@ func (q *Queries) InsertActivationIdempotency(ctx context.Context, arg InsertAct
 const insertCommandIdempotency = `-- name: InsertCommandIdempotency :exec
 INSERT INTO command_idempotency (
     principal_id, idempotency_key, endpoint, request_hmac, command_id, status,
-    result_body, etag, location, cache_control, pragma, stream_epoch, geid,
-    state_cursor, created_at, expires_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    result_body, etag, parent_etag, location, cache_control, pragma, stream_epoch,
+    geid, state_cursor, created_at, expires_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 type InsertCommandIdempotencyParams struct {
@@ -177,6 +178,7 @@ type InsertCommandIdempotencyParams struct {
 	Status         int64          `json:"status"`
 	ResultBody     string         `json:"result_body"`
 	Etag           sql.NullString `json:"etag"`
+	ParentEtag     sql.NullString `json:"parent_etag"`
 	Location       sql.NullString `json:"location"`
 	CacheControl   sql.NullString `json:"cache_control"`
 	Pragma         sql.NullString `json:"pragma"`
@@ -197,6 +199,7 @@ func (q *Queries) InsertCommandIdempotency(ctx context.Context, arg InsertComman
 		arg.Status,
 		arg.ResultBody,
 		arg.Etag,
+		arg.ParentEtag,
 		arg.Location,
 		arg.CacheControl,
 		arg.Pragma,

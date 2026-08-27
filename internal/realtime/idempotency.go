@@ -161,6 +161,16 @@ type DurableReplay struct {
 	SyncRequired bool
 }
 
+// IdempotencyMismatchReplay returns the fixed API error emitted when an
+// in-flight retry discovers that another request completed the same key with a
+// different canonical identity.
+func IdempotencyMismatchReplay() DurableReplay {
+	return DurableReplay{
+		Status: 409,
+		Body:   json.RawMessage(`{"code":9,"message":"idempotency key reused with different request","data":null}`),
+	}
+}
+
 // CanonicalCommandResult is the completed response stored or replayed by both
 // durable and runtime idempotency layers. Body is normalized JSON; Headers only
 // contains the resource headers permitted by the protocol retry contract.
@@ -539,6 +549,12 @@ func canonicalJSONValue(raw json.RawMessage) (json.RawMessage, error) {
 	return json.RawMessage(encoded), nil
 }
 
+// CanonicalJSON normalizes one JSON value with stable object key order for an
+// HTTP response that must match its durable replay byte-for-byte.
+func CanonicalJSON(raw json.RawMessage) (json.RawMessage, error) {
+	return canonicalJSONValue(raw)
+}
+
 // commandEndpoint is the human-inspectable durable endpoint field. The HMAC
 // includes all remaining identity inputs, while this cleartext value permits a
 // fast mismatch diagnosis without exposing request bodies.
@@ -561,7 +577,7 @@ func equalHexDigest(left, right string) bool {
 // invalidResourceHeaders detects forbidden line breaks in persisted replay
 // headers, preventing command results from becoming header injection sources.
 func invalidResourceHeaders(headers store.IdempotencyHeaders) bool {
-	return hasControlCharacters(headers.ETag) || hasControlCharacters(headers.Location) || hasControlCharacters(headers.CacheControl) || hasControlCharacters(headers.Pragma)
+	return hasControlCharacters(headers.ETag) || hasControlCharacters(headers.ParentETag) || hasControlCharacters(headers.Location) || hasControlCharacters(headers.CacheControl) || hasControlCharacters(headers.Pragma)
 }
 
 // hasControlCharacters rejects CR and LF, which are invalid in canonical

@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -8,8 +9,10 @@ import (
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/api"
+	"zephyr.vox/server/ce/internal/commandhttp"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
+	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/store"
 )
 
@@ -34,12 +37,13 @@ func ListRolesHandler(svc *Service) echo.HandlerFunc {
 }
 
 // CreateRoleHandler handles POST /api/v0/rbac/roles. The route must be mounted
-// behind AuthN and Require(role.manage).
+// behind AuthN; Service rechecks role.manage in its sequenced transaction.
 //
 // Errors:
 //   - 1 invalid role key: key is reserved or violates the role-key grammar
 //   - 2 rank protected: actor cannot create a peer or higher role
 //   - 3 role exists: another role already has the requested key
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -52,11 +56,29 @@ func CreateRoleHandler(svc *Service) echo.HandlerFunc {
 		codeExists     = 3
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req createRoleRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		role, err := svc.CreateRole(c.Request().Context(), principal.UserID, req.Key, req.DisplayName, req.Rank)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/rbac/roles", nil, nil, req)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		role, state, err := svc.CreateRole(ctx, principal.UserID, req.Key, req.DisplayName, req.Rank)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrInvalidRoleKey):
 			return api.NewError(codeInvalidKey, http.StatusBadRequest, "invalid role key")
@@ -69,17 +91,19 @@ func CreateRoleHandler(svc *Service) echo.HandlerFunc {
 		case err != nil:
 			return err
 		}
-		return api.OK(c, http.StatusCreated, newRoleResponse(role))
+		setStateHeaders(c, state)
+		return commandhttp.OK(c, http.StatusCreated, newRoleResponse(role))
 	})
 }
 
 // UpdateRoleHandler handles PATCH /api/v0/rbac/roles/:key. The route must be
-// mounted behind AuthN and Require(role.manage).
+// mounted behind AuthN; Service rechecks role.manage in its sequenced transaction.
 //
 // Errors:
 //   - 1 empty patch: no mutable field was supplied
 //   - 2 role not found
 //   - 3 role protected: owner is immutable or rank policy rejects the change
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -92,6 +116,10 @@ func UpdateRoleHandler(svc *Service) echo.HandlerFunc {
 		codeProtected  = 3
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req updateRoleRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
@@ -99,7 +127,22 @@ func UpdateRoleHandler(svc *Service) echo.HandlerFunc {
 		if req.DisplayName == nil && req.Rank == nil {
 			return api.NewError(codeEmptyPatch, http.StatusBadRequest, "at least one field is required")
 		}
-		role, err := svc.UpdateRole(c.Request().Context(), principal.UserID, c.Param("key"), req.DisplayName, req.Rank)
+		roleKey := c.Param("key")
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPatch, "/api/v0/rbac/roles/:key", []realtime.CanonicalField{{Name: "key", Value: roleKey}}, nil, req)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		role, state, err := svc.UpdateRole(ctx, principal.UserID, roleKey, req.DisplayName, req.Rank)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "role not found")
@@ -110,17 +153,19 @@ func UpdateRoleHandler(svc *Service) echo.HandlerFunc {
 		case err != nil:
 			return err
 		}
-		return api.OK(c, http.StatusOK, newRoleResponse(role))
+		setStateHeaders(c, state)
+		return commandhttp.OK(c, http.StatusOK, newRoleResponse(role))
 	})
 }
 
 // DeleteRoleHandler handles DELETE /api/v0/rbac/roles/:key. The route must be
-// mounted behind AuthN and Require(role.manage).
+// mounted behind AuthN; Service rechecks role.manage in its sequenced transaction.
 //
 // Errors:
 //   - 1 role not found
 //   - 2 role protected: built-in or peer/higher role cannot be deleted
 //   - 3 role referenced: role still has a binding, ACL, config or invite reference
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing role.manage permission
 //   - 1009 internal: unexpected server error
@@ -131,7 +176,26 @@ func DeleteRoleHandler(svc *Service) echo.HandlerFunc {
 		codeReferenced = 3
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
-		err := svc.DeleteRole(c.Request().Context(), principal.UserID, c.Param("key"))
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
+		roleKey := c.Param("key")
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/rbac/roles/:key", []realtime.CanonicalField{{Name: "key", Value: roleKey}}, nil, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		state, err := svc.DeleteRole(ctx, principal.UserID, roleKey)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "role not found")
@@ -144,12 +208,13 @@ func DeleteRoleHandler(svc *Service) echo.HandlerFunc {
 		case err != nil:
 			return err
 		}
-		return api.NoContent(c, http.StatusNoContent)
+		setStateHeaders(c, state)
+		return commandhttp.NoContent(c, http.StatusNoContent)
 	})
 }
 
 // ListBindingsHandler handles GET /api/v0/rbac/bindings. The route must be
-// mounted behind AuthN and Require(role.manage).
+// mounted behind AuthN; Service rechecks role.manage in its sequenced transaction.
 //
 // Errors:
 //   - 1 invalid pagination: limit must be 1-100 and offset non-negative
@@ -176,13 +241,14 @@ func ListBindingsHandler(svc *Service) echo.HandlerFunc {
 }
 
 // CreateBindingHandler handles POST /api/v0/rbac/bindings. The route must be
-// mounted behind AuthN and Require(role.manage).
+// mounted behind AuthN; Service rechecks role.manage in its sequenced transaction.
 //
 // Errors:
 //   - 1 invalid scope: scope and scope ID do not match
 //   - 2 owner protected: owner can only change through owner transfer
 //   - 3 target not found: user, role or scope resource is absent
 //   - 4 rank protected: actor cannot manage the target user or requested role
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -196,16 +262,35 @@ func CreateBindingHandler(svc *Service) echo.HandlerFunc {
 		codeRank         = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req createBindingRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		binding, created, err := svc.CreateBinding(c.Request().Context(), principal.UserID, BindingInput{
+		input := BindingInput{
 			UserID:    req.UserID,
 			RoleKey:   req.RoleKey,
 			ScopeType: req.Scope.Type,
 			ScopeID:   req.Scope.ID,
-		})
+		}
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/rbac/bindings", nil, nil, input)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		binding, created, state, err := svc.CreateBinding(ctx, principal.UserID, input)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrInvalidScope):
 			return api.NewError(codeInvalidScope, http.StatusBadRequest, "invalid binding scope")
@@ -224,18 +309,20 @@ func CreateBindingHandler(svc *Service) echo.HandlerFunc {
 		if created {
 			status = http.StatusCreated
 		}
-		return api.OK(c, status, newBindingResponse(binding))
+		setStateHeaders(c, state)
+		return commandhttp.OK(c, status, newBindingResponse(binding))
 	})
 }
 
 // DeleteBindingHandler handles DELETE /api/v0/rbac/bindings/:id. The route
-// must be mounted behind AuthN and Require(role.manage).
+// must be mounted behind AuthN; Service rechecks role.manage in its sequenced transaction.
 //
 // Errors:
 //   - 1 invalid binding ID
 //   - 2 binding not found
 //   - 3 owner protected: owner can only change through owner transfer
 //   - 4 rank protected: actor cannot manage the binding target
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing role.manage permission
 //   - 1009 internal: unexpected server error
@@ -247,11 +334,29 @@ func DeleteBindingHandler(svc *Service) echo.HandlerFunc {
 		codeRank      = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		bindingID, err := parsePositiveID(c.Param("id"))
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid binding id")
 		}
-		err = svc.DeleteBinding(c.Request().Context(), principal.UserID, bindingID)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/rbac/bindings/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(bindingID, 10)}}, nil, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		state, err := svc.DeleteBinding(ctx, principal.UserID, bindingID)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			return api.NewError(codeNotFound, http.StatusNotFound, "binding not found")
@@ -264,19 +369,20 @@ func DeleteBindingHandler(svc *Service) echo.HandlerFunc {
 		case err != nil:
 			return err
 		}
-		return api.NoContent(c, http.StatusNoContent)
+		setStateHeaders(c, state)
+		return commandhttp.NoContent(c, http.StatusNoContent)
 	})
 }
 
 // TransferOwnerHandler handles POST /api/v0/owner/transfer. The route must be
-// mounted behind AuthN and Require(role.manage); the service additionally
-// verifies the caller is the current owner.
+// mounted behind AuthN; the service verifies the caller is the current owner.
 //
 // Errors:
 //   - 1 current owner required: actor is not the current owner
 //   - 2 invalid transfer target: target is self or banned
 //   - 3 target user not found
 //   - 4 owner invariant: installation state is inconsistent
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -290,11 +396,29 @@ func TransferOwnerHandler(svc *Service) echo.HandlerFunc {
 		codeInvariant    = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req ownerTransferRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		err := svc.TransferOwner(c.Request().Context(), principal.UserID, req.TargetUserID)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/owner/transfer", nil, nil, req)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		state, err := svc.TransferOwner(ctx, principal.UserID, req.TargetUserID)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, store.ErrOwnerTransferForbidden):
 			return api.NewError(codeCurrentOwner, http.StatusForbidden, "current owner required")
@@ -307,7 +431,8 @@ func TransferOwnerHandler(svc *Service) echo.HandlerFunc {
 		case err != nil:
 			return err
 		}
-		return api.OK(c, http.StatusOK, ownerTransferResponse{
+		setStateHeaders(c, state)
+		return commandhttp.OK(c, http.StatusOK, ownerTransferResponse{
 			PreviousOwnerID: principal.UserID,
 			NewOwnerID:      req.TargetUserID,
 		})
@@ -352,7 +477,7 @@ func GetConfigHandler(svc *Service) echo.HandlerFunc {
 }
 
 // UpdateConfigHandler handles PUT /api/v0/rbac/config. The route must be
-// mounted behind AuthN and Require(role.manage).
+// mounted behind AuthN; Service rechecks role.manage in its sequenced transaction.
 //
 // Errors:
 //   - 1 invalid scope: scope and scope ID do not match
@@ -360,6 +485,7 @@ func GetConfigHandler(svc *Service) echo.HandlerFunc {
 //   - 3 permission protected: request grants a permission the actor lacks
 //   - 4 scope not found
 //   - 5 invalid config: roles or permissions violate config constraints
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -374,6 +500,10 @@ func UpdateConfigHandler(svc *Service) echo.HandlerFunc {
 		codeInvalid      = 5
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req updateConfigRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
@@ -382,7 +512,23 @@ func UpdateConfigHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.NewError(codeInvalidScope, http.StatusBadRequest, "invalid permission config scope")
 		}
-		config, etag, err := svc.UpdateConfig(c.Request().Context(), principal.UserID, exactIfMatch(c), ConfigInput{Scope: scope, Config: req.Config})
+		expectedETag := exactIfMatch(c)
+		input := ConfigInput{Scope: scope, Config: req.Config}
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPut, "/api/v0/rbac/config", nil, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, input)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		config, etag, state, err := svc.UpdateConfig(ctx, principal.UserID, expectedETag, input)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrPreconditionFailed):
 			return api.NewError(codePrecondition, http.StatusPreconditionFailed, "precondition failed")
@@ -402,18 +548,20 @@ func UpdateConfigHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		c.Response().Header().Set("ETag", etag)
-		return api.OK(c, http.StatusOK, response)
+		setStateHeaders(c, state)
+		return commandhttp.OK(c, http.StatusOK, response)
 	})
 }
 
 // ResetConfigHandler handles POST /api/v0/rbac/config/reset. The route must
-// be mounted behind AuthN and Require(role.manage).
+// be mounted behind AuthN; Service rechecks role.manage in its sequenced transaction.
 //
 // Errors:
 //   - 1 invalid scope: scope and scope ID do not match
 //   - 2 precondition failed: If-Match is missing or does not match effective config
 //   - 3 permission protected: reset would grant a permission the actor lacks
 //   - 4 scope not found
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -427,6 +575,10 @@ func ResetConfigHandler(svc *Service) echo.HandlerFunc {
 		codeNotFound     = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, principal *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req resetConfigRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
@@ -435,7 +587,22 @@ func ResetConfigHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.NewError(codeInvalidScope, http.StatusBadRequest, "invalid permission config scope")
 		}
-		config, etag, err := svc.ResetConfig(c.Request().Context(), principal.UserID, exactIfMatch(c), scope)
+		expectedETag := exactIfMatch(c)
+		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/rbac/config/reset", nil, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, scope)
+		if err != nil {
+			return err
+		}
+		ctx, replayed, err := prepareHTTPMutation(c, svc, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		config, etag, state, err := svc.ResetConfig(ctx, principal.UserID, expectedETag, scope)
+		if state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		switch {
 		case errors.Is(err, ErrPreconditionFailed):
 			return api.NewError(codePrecondition, http.StatusPreconditionFailed, "precondition failed")
@@ -453,7 +620,8 @@ func ResetConfigHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		c.Response().Header().Set("ETag", etag)
-		return api.OK(c, http.StatusOK, response)
+		setStateHeaders(c, state)
+		return commandhttp.OK(c, http.StatusOK, response)
 	})
 }
 
@@ -492,6 +660,41 @@ func exactIfMatch(c *echo.Context) string {
 		return ""
 	}
 	return values[0]
+}
+
+// idempotencyKey validates the one required retry key field for an RBAC
+// control-plane mutation. Repeated fields are deliberately rejected.
+func idempotencyKey(c *echo.Context) (string, error) {
+	values := c.Request().Header.Values("Idempotency-Key")
+	if len(values) != 1 || !realtime.IdempotencyKeyValid(values[0]) {
+		return "", api.InvalidField("header.Idempotency-Key", "must be 16-64 characters using letters, digits, underscore, or hyphen")
+	}
+	return values[0], nil
+}
+
+// prepareHTTPMutation checks durable completion before a new control command
+// performs its transaction-local role authorization.
+func prepareHTTPMutation(c *echo.Context, svc *Service, key string, identity realtime.HTTPCommandIdentity) (context.Context, bool, error) {
+	command, err := realtime.NewHTTPMutationCommand(identity, key)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, replay, found, err := svc.PrepareHTTPMutation(c.Request().Context(), command)
+	if errors.Is(err, realtime.ErrIdempotencyMismatch) {
+		return nil, false, api.NewError(9, http.StatusConflict, "idempotency key reused with different request")
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if found {
+		return nil, true, commandhttp.ReplayDurable(c, replay)
+	}
+	return ctx, false, nil
+}
+
+// setStateHeaders writes one completed RBAC command's exact replay checkpoint.
+func setStateHeaders(c *echo.Context, state StateCommand) {
+	commandhttp.SetStateCommandHeaders(c, state.CommandID, state.Checkpoint, state.Cursor)
 }
 
 // configScopeFromQuery parses the exact permission-config scope query shape.

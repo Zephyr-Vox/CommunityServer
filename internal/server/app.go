@@ -63,6 +63,7 @@ type App struct {
 	mutationGate    *realtime.MutationGate
 	deadlines       *realtime.DeadlineScheduler
 	commands        *requestAdmission
+	durableCommands *realtime.DurableIdempotency
 
 	lifecycleMu sync.Mutex
 	running     *appRun
@@ -136,6 +137,16 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		conn.Close()
 		return nil, fmt.Errorf("server: activation manager: %w", err)
 	}
+	requestSigner, err := realtime.NewRequestIdentitySigner(secret)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("server: durable command signer: %w", err)
+	}
+	durableCommands, err := realtime.NewDurableIdempotency(stores, requestSigner)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("server: durable command idempotency: %w", err)
+	}
 	channels := channel.NewService(stores, principals)
 	moderationSvc := moderation.NewService(stores, principals)
 
@@ -153,29 +164,30 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		return nil, fmt.Errorf("server: realtime metadata: %w", err)
 	}
 	app := &App{
-		cfg:            cfg,
-		conn:           conn,
-		stores:         stores,
-		principals:     principals,
-		authSvc:        authSvc,
-		register:       register,
-		users:          users,
-		invites:        invites,
-		activate:       activate,
-		channels:       channels,
-		moderation:     moderationSvc,
-		presence:       pres,
-		objects:        objects,
-		avatar:         avatarSvc,
-		connections:    connections,
-		voice:          voice,
-		connectionAuth: connectionAuth,
-		upgrades:       upgrades,
-		metadata:       metadata,
-		mutationGate:   realtime.NewMutationGate(),
-		commands:       newRequestAdmission(),
-		echo:           e,
-		logger:         logger,
+		cfg:             cfg,
+		conn:            conn,
+		stores:          stores,
+		principals:      principals,
+		authSvc:         authSvc,
+		register:        register,
+		users:           users,
+		invites:         invites,
+		activate:        activate,
+		channels:        channels,
+		moderation:      moderationSvc,
+		presence:        pres,
+		objects:         objects,
+		avatar:          avatarSvc,
+		connections:     connections,
+		voice:           voice,
+		connectionAuth:  connectionAuth,
+		upgrades:        upgrades,
+		metadata:        metadata,
+		mutationGate:    realtime.NewMutationGate(),
+		commands:        newRequestAdmission(),
+		durableCommands: durableCommands,
+		echo:            e,
+		logger:          logger,
 	}
 	app.realtimeFatal = func(fatal error) {
 		logger.Error("realtime sequencer failed before server run", "module", "realtime", "err", fatal)
@@ -206,9 +218,11 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	authSvc.SetStateMutationGate(app.mutationGate)
 	avatarSvc.SetStateMutationGate(app.mutationGate)
 	channels.SetStateMutationGate(app.mutationGate)
+	channels.SetDurableIdempotency(durableCommands)
 	channels.SetStateCommandRuntime(app.state, app.sequencer)
 	channels.SetDeadlineScheduler(app.deadlines)
 	moderationSvc.SetStateMutationGate(app.mutationGate)
+	moderationSvc.SetDurableIdempotency(durableCommands)
 	moderationSvc.SetStateCommandRuntime(app.state, app.sequencer)
 	moderationSvc.SetDeadlineScheduler(app.deadlines)
 	if cursors, ok := app.syncStrategy.(realtime.StateCursorIssuer); ok {

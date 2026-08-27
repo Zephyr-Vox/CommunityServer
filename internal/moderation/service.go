@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strconv"
 
 	"zephyr.vox/server/ce/internal/rbac"
@@ -73,8 +74,10 @@ type UpdateInput struct {
 // StateCommand identifies the exact StatePublication completed for one mute
 // mutation. Cursor is empty only in focused service tests without a signer.
 type StateCommand struct {
+	CommandID  int64
 	Cursor     string
 	Checkpoint realtime.Checkpoint
+	Replay     *realtime.DurableReplay
 }
 
 // Service owns scope-aware moderation mutations and immutable read views.
@@ -88,6 +91,7 @@ type Service struct {
 	authorizer *rbacscope.Authorizer
 	cursors    realtime.StateCursorIssuer
 	scheduler  *realtime.DeadlineScheduler
+	durable    *realtime.DurableIdempotency
 }
 
 // NewService creates a moderation service. Server assembly installs its command
@@ -112,6 +116,28 @@ func (s *Service) SetStateMutationGate(gate MutationGate) { s.gate = gate }
 
 // SetStateCursorIssuer installs the process-local state cursor signer.
 func (s *Service) SetStateCursorIssuer(cursors realtime.StateCursorIssuer) { s.cursors = cursors }
+
+// SetDurableIdempotency installs restart-safe completed HTTP command storage.
+func (s *Service) SetDurableIdempotency(durable *realtime.DurableIdempotency) {
+	s.durable = durable
+}
+
+// PrepareHTTPMutation checks durable completion before sequenced scope and rank
+// authorization begins for a new HTTP command.
+func (s *Service) PrepareHTTPMutation(ctx context.Context, command realtime.HTTPMutationCommand) (context.Context, realtime.DurableReplay, bool, error) {
+	if s == nil || s.durable == nil {
+		return nil, realtime.DurableReplay{}, false, ErrRealtimeUnavailable
+	}
+	version, err := s.currentState()
+	if err != nil {
+		return nil, realtime.DurableReplay{}, false, err
+	}
+	replay, found, err := s.durable.Lookup(ctx, command.Identity, command.IdempotencyKey, version.Checkpoint().StreamEpoch)
+	if err != nil || found {
+		return nil, replay, found, err
+	}
+	return realtime.WithHTTPMutationCommand(ctx, command), realtime.DurableReplay{}, false, nil
+}
 
 // SetDeadlineScheduler installs the server-owned deadline scheduler.
 func (s *Service) SetDeadlineScheduler(scheduler *realtime.DeadlineScheduler) {
@@ -155,7 +181,9 @@ func (s *Service) Create(ctx context.Context, actorID int64, input CreateInput) 
 	if err != nil || input.UserID <= 0 || !validKind(input.Kind) {
 		return muteResponse{}, StateCommand{}, ErrInvalidMute
 	}
-	result, err := s.runMutation(ctx, actorID, input.UserID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, input.UserID, func(value mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusCreated, value.mute, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentState()
 		if err != nil {
 			return mutationValue{}, err
@@ -239,7 +267,9 @@ func (s *Service) Update(ctx context.Context, actorID, muteID int64, expectedETa
 	if err != nil {
 		return muteResponse{}, StateCommand{}, err
 	}
-	result, err := s.runMutation(ctx, actorID, targetID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, targetID, func(value mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusOK, value.mute, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentState()
 		if err != nil {
 			return mutationValue{}, err
@@ -322,7 +352,9 @@ func (s *Service) Delete(ctx context.Context, actorID, muteID int64, expectedETa
 	if err != nil {
 		return StateCommand{}, err
 	}
-	result, err := s.runMutation(ctx, actorID, targetID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, targetID, func(mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusNoContent, nil, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentState()
 		if err != nil {
 			return mutationValue{}, err
@@ -388,11 +420,18 @@ type mutationResult struct {
 // mutationCallback performs one rollbackable mutation in a transaction-bound store.
 type mutationCallback func(context.Context, *store.Stores, *realtime.CommandExecution) (mutationValue, error)
 
+// mutationResponse builds one successful HTTP result for durable persistence.
+type mutationResponse func(mutationValue) (int, any, store.IdempotencyHeaders)
+
 // runMutation holds actor/target barriers and the shared publication gate from
 // sequencer dequeue through StatePublication. The target is included for create
 // while update/delete re-read the mute target from immutable state.
-func (s *Service) runMutation(ctx context.Context, actorID, targetID int64, mutate mutationCallback) (mutationResult, error) {
+func (s *Service) runMutation(ctx context.Context, actorID, targetID int64, response mutationResponse, mutate mutationCallback) (mutationResult, error) {
 	if s == nil || s.stores == nil || s.principals == nil || s.gate == nil || s.state == nil || s.sequencer == nil || mutate == nil || actorID <= 0 {
+		return mutationResult{}, ErrRealtimeUnavailable
+	}
+	command, durableCommand := realtime.HTTPMutationCommandFromContext(ctx)
+	if durableCommand && (s.durable == nil || response == nil || command.Identity.PrincipalID != actorID) {
 		return mutationResult{}, ErrRealtimeUnavailable
 	}
 	completion, err := s.sequencer.Submit(ctx, realtime.PostCommitCommand{
@@ -409,38 +448,132 @@ func (s *Service) runMutation(ctx context.Context, actorID, targetID int64, muta
 				unlock()
 			}, nil
 		},
-		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+		Execute: func(commandCtx context.Context, commandID int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+			if durableCommand {
+				version, err := s.currentState()
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				replay, found, err := s.durable.Lookup(commandCtx, command.Identity, command.IdempotencyKey, version.Checkpoint().StreamEpoch)
+				if err != nil {
+					if errors.Is(err, realtime.ErrIdempotencyMismatch) {
+						if markErr := execution.MarkNoop(); markErr != nil {
+							return realtime.CommandOutput{}, markErr
+						}
+						mismatch := realtime.IdempotencyMismatchReplay()
+						return realtime.CommandOutput{Value: mutationResult{state: StateCommand{Replay: &mismatch}}}, nil
+					}
+					return realtime.CommandOutput{}, err
+				}
+				if found {
+					if err := execution.MarkNoop(); err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					return realtime.CommandOutput{Value: mutationResult{state: StateCommand{Replay: &replay}}}, nil
+				}
+			}
 			tx, err := s.stores.BeginTx(commandCtx)
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
 			defer tx.Rollback()
 			txStores := s.stores.WithTx(tx)
+			if durableCommand {
+				if err := s.durable.Admit(commandCtx, txStores); err != nil {
+					return realtime.CommandOutput{}, err
+				}
+			}
 			result, err := mutate(commandCtx, txStores, execution)
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
 			if result.noop {
+				if durableCommand {
+					version, err := s.currentState()
+					if err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					if s.cursors == nil {
+						return realtime.CommandOutput{}, ErrRealtimeUnavailable
+					}
+					state := StateCommand{CommandID: commandID, Checkpoint: version.Checkpoint()}
+					state.Cursor, err = s.cursors.IssueStateCursor(actorID, version)
+					if err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					status, data, headers := response(result)
+					body, err := durableBody(status, data)
+					if err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					if err := s.durable.Save(commandCtx, txStores, command.Identity, command.IdempotencyKey, realtime.CanonicalCommandResult{
+						CommandID:   commandID,
+						Status:      status,
+						Body:        body,
+						Headers:     headers,
+						Checkpoint:  state.Checkpoint,
+						StateCursor: state.Cursor,
+					}); err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					if err := execution.CommitNoop(tx); err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					return realtime.CommandOutput{Value: mutationResult{value: result, state: state}}, nil
+				}
 				if err := execution.MarkNoop(); err != nil {
 					return realtime.CommandOutput{}, err
 				}
-				return realtime.CommandOutput{Value: result}, nil
+				return realtime.CommandOutput{Value: mutationResult{value: result, state: StateCommand{CommandID: commandID}}}, nil
+			}
+			state := StateCommand{CommandID: commandID}
+			if durableCommand {
+				reserved, err := execution.ReservedResult()
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				if s.cursors == nil || reserved.Version == nil {
+					return realtime.CommandOutput{}, ErrRealtimeUnavailable
+				}
+				state.Checkpoint = reserved.Checkpoint
+				state.Cursor, err = s.cursors.IssueStateCursor(actorID, reserved.Version)
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				status, data, headers := response(result)
+				body, err := durableBody(status, data)
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				if err := s.durable.Save(commandCtx, txStores, command.Identity, command.IdempotencyKey, realtime.CanonicalCommandResult{
+					CommandID:   commandID,
+					Status:      status,
+					Body:        body,
+					Headers:     headers,
+					Checkpoint:  state.Checkpoint,
+					StateCursor: state.Cursor,
+				}); err != nil {
+					return realtime.CommandOutput{}, err
+				}
 			}
 			if _, err := execution.Commit(tx); err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			return realtime.CommandOutput{Value: result}, nil
+			return realtime.CommandOutput{Value: mutationResult{value: result, state: state}}, nil
 		},
 	})
 	if err != nil {
 		return mutationResult{}, err
 	}
-	value, ok := completion.Value.(mutationValue)
+	result, ok := completion.Value.(mutationResult)
 	if !ok {
 		return mutationResult{}, ErrRealtimeUnavailable
 	}
-	result := mutationResult{value: value, state: StateCommand{Checkpoint: completion.Publication.Checkpoint}}
-	if s.cursors == nil || completion.Publication.Version == nil {
+	if result.state.Checkpoint.StreamEpoch != "" || completion.Publication.Version == nil {
+		return result, nil
+	}
+	result.state.Checkpoint = completion.Publication.Checkpoint
+	if s.cursors == nil {
 		return result, nil
 	}
 	cursor, err := s.cursors.IssueStateCursor(actorID, completion.Publication.Version)
@@ -449,6 +582,15 @@ func (s *Service) runMutation(ctx context.Context, actorID, targetID int64, muta
 	}
 	result.state.Cursor = cursor
 	return result, nil
+}
+
+// durableBody preserves the empty HTTP 204 response while encoding every other
+// successful result in the standard API envelope.
+func durableBody(status int, data any) ([]byte, error) {
+	if status == http.StatusNoContent {
+		return nil, nil
+	}
+	return realtime.CanonicalSuccessBody(data)
 }
 
 // currentState returns the current immutable version or an assembly error.

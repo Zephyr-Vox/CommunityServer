@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strconv"
 
 	"zephyr.vox/server/ce/internal/rbac"
@@ -87,6 +88,7 @@ type Service struct {
 	visibility *realtime.VisibilityResolver
 	cursors    realtime.StateCursorIssuer
 	scheduler  *realtime.DeadlineScheduler
+	durable    *realtime.DurableIdempotency
 }
 
 // CreateGroupInput contains validated group fields for a creation command.
@@ -181,6 +183,13 @@ func (s *Service) SetStateCursorIssuer(cursors realtime.StateCursorIssuer) {
 	s.cursors = cursors
 }
 
+// SetDurableIdempotency installs the restart-safe HTTP command store used by
+// the assembled server. Direct service callers remain outside the HTTP retry
+// contract unless they attach a validated HTTPMutationCommand to their context.
+func (s *Service) SetDurableIdempotency(durable *realtime.DurableIdempotency) {
+	s.durable = durable
+}
+
 // SetDeadlineScheduler installs the server-owned runtime deadline scheduler.
 func (s *Service) SetDeadlineScheduler(scheduler *realtime.DeadlineScheduler) {
 	s.scheduler = scheduler
@@ -190,8 +199,27 @@ func (s *Service) SetDeadlineScheduler(scheduler *realtime.DeadlineScheduler) {
 // channel mutation. Cursor is empty only in focused service setups that do not
 // install a process cursor signer.
 type StateCommand struct {
+	CommandID  int64
 	Cursor     string
 	Checkpoint realtime.Checkpoint
+	Replay     *realtime.DurableReplay
+}
+
+// PrepareHTTPMutation looks up a completed durable command before the caller
+// enters this service's sequenced authorization and mutation path.
+func (s *Service) PrepareHTTPMutation(ctx context.Context, command realtime.HTTPMutationCommand) (context.Context, realtime.DurableReplay, bool, error) {
+	if s == nil || s.durable == nil {
+		return nil, realtime.DurableReplay{}, false, ErrRealtimeUnavailable
+	}
+	version, err := s.currentVersion()
+	if err != nil {
+		return nil, realtime.DurableReplay{}, false, err
+	}
+	replay, found, err := s.durable.Lookup(ctx, command.Identity, command.IdempotencyKey, version.Checkpoint().StreamEpoch)
+	if err != nil || found {
+		return nil, replay, found, err
+	}
+	return realtime.WithHTTPMutationCommand(ctx, command), realtime.DurableReplay{}, false, nil
 }
 
 // ListGroups returns the actor-visible groups from one immutable StateVersion.
@@ -350,7 +378,13 @@ func (s *Service) AddGroupAccess(ctx context.Context, actorID, groupID int64, ex
 	if err := validateAccessPrincipal(principal); err != nil {
 		return AccessMutation{}, err
 	}
-	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, func(value mutationValue) (int, any, store.IdempotencyHeaders) {
+		status := http.StatusOK
+		if value.created {
+			status = http.StatusCreated
+		}
+		return status, snapshotAccessResponse(value.access), store.IdempotencyHeaders{ETag: value.etag}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentVersion()
 		if err != nil {
 			return mutationValue{}, err
@@ -423,7 +457,9 @@ func (s *Service) AddGroupAccess(ctx context.Context, actorID, groupID int64, ex
 // reauthorization and ETag comparison inside the sequencer. A mismatched ACL
 // ID is not distinguished from an absent one.
 func (s *Service) DeleteGroupAccess(ctx context.Context, actorID, groupID, accessID int64, expectedETag string) (AccessMutation, error) {
-	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, func(value mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusNoContent, nil, store.IdempotencyHeaders{ETag: value.etag}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentVersion()
 		if err != nil {
 			return mutationValue{}, err
@@ -482,7 +518,13 @@ func (s *Service) AddChannelAccess(ctx context.Context, actorID, channelID int64
 	if err := validateAccessPrincipal(input.Principal); err != nil {
 		return AccessMutation{}, err
 	}
-	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, func(value mutationValue) (int, any, store.IdempotencyHeaders) {
+		status := http.StatusOK
+		if value.created {
+			status = http.StatusCreated
+		}
+		return status, snapshotAccessResponse(value.access), store.IdempotencyHeaders{ETag: value.etag, ParentETag: value.parentETag}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentVersion()
 		if err != nil {
 			return mutationValue{}, err
@@ -640,7 +682,9 @@ func (s *Service) AddChannelAccess(ctx context.Context, actorID, channelID int64
 // reauthorization and ETag comparison inside the sequencer. A mismatched ACL
 // ID is not distinguished from an absent one.
 func (s *Service) DeleteChannelAccess(ctx context.Context, actorID, channelID, accessID int64, expectedETag string) (AccessMutation, error) {
-	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, func(value mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusNoContent, nil, store.IdempotencyHeaders{ETag: value.etag}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentVersion()
 		if err != nil {
 			return mutationValue{}, err
@@ -695,7 +739,9 @@ func (s *Service) DeleteChannelAccess(ctx context.Context, actorID, channelID, a
 // ETag comparison inside the sequencer. An unchanged patch is a successful
 // no-op that does not advance state.
 func (s *Service) UpdateGroup(ctx context.Context, actorID, groupID int64, expectedETag string, input UpdateGroupInput) (realtime.SnapshotGroup, StateCommand, error) {
-	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, func(value mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusOK, value.group, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentVersion()
 		if err != nil {
 			return mutationValue{}, err
@@ -757,7 +803,9 @@ func (s *Service) UpdateGroup(ctx context.Context, actorID, groupID int64, expec
 // comparison inside the sequencer. A group with children is rejected before any
 // persistent delete is attempted.
 func (s *Service) DeleteGroup(ctx context.Context, actorID, groupID int64, expectedETag string) (StateCommand, error) {
-	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, func(mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusNoContent, nil, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentVersion()
 		if err != nil {
 			return mutationValue{}, err
@@ -802,7 +850,9 @@ func (s *Service) DeleteGroup(ctx context.Context, actorID, groupID int64, expec
 // authorization and ETag comparison inside the sequencer. Moving an inherited
 // channel freezes its prior effective configuration before changing parents.
 func (s *Service) UpdateChannel(ctx context.Context, actorID, channelID int64, expectedETag string, input UpdateChannelInput) (realtime.SnapshotChannel, StateCommand, error) {
-	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, func(value mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusOK, value.channel, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentVersion()
 		if err != nil {
 			return mutationValue{}, err
@@ -938,7 +988,9 @@ func (s *Service) UpdateChannel(ctx context.Context, actorID, channelID int64, e
 // comparison. Active runtime voice authorities are rejected until the voice
 // lifecycle can stage their conditional teardown with this publication.
 func (s *Service) DeleteChannel(ctx context.Context, actorID, channelID int64, expectedETag string) (StateCommand, error) {
-	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, func(mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusNoContent, nil, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentVersion()
 		if err != nil {
 			return mutationValue{}, err
@@ -983,7 +1035,9 @@ func (s *Service) DeleteChannel(ctx context.Context, actorID, channelID int64, e
 // in the sequencer. Private groups grant their non-owner creator access in the
 // same transaction so the newly published resource remains reachable.
 func (s *Service) CreateGroup(ctx context.Context, actorID int64, input CreateGroupInput) (realtime.SnapshotGroup, StateCommand, error) {
-	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, func(value mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusCreated, value.group, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentVersion()
 		if err != nil {
 			return mutationValue{}, err
@@ -1042,7 +1096,9 @@ func (s *Service) CreateChannel(ctx context.Context, actorID int64, input Create
 	if input.Capacity < 1 || input.Capacity > defaultChannelCapacity || (input.Temporary && input.Mode != "voice") {
 		return realtime.SnapshotChannel{}, StateCommand{}, ErrTemporaryMode
 	}
-	result, err := s.runMutation(ctx, actorID, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
+	result, err := s.runMutation(ctx, actorID, func(value mutationValue) (int, any, store.IdempotencyHeaders) {
+		return http.StatusCreated, value.channel, store.IdempotencyHeaders{}
+	}, func(commandCtx context.Context, txStores *store.Stores, execution *realtime.CommandExecution) (mutationValue, error) {
 		version, err := s.currentVersion()
 		if err != nil {
 			return mutationValue{}, err
@@ -1177,11 +1233,19 @@ type mutationResult struct {
 // transaction-bound stores.
 type mutationCallback func(context.Context, *store.Stores, *realtime.CommandExecution) (mutationValue, error)
 
+// mutationResponse builds the successful HTTP result stored alongside a
+// completed durable command.
+type mutationResponse func(mutationValue) (int, any, store.IdempotencyHeaders)
+
 // runMutation acquires the actor write barrier and global gate at dequeue,
 // holds both through publication, and commits only after Reserve has captured
 // the candidate built from the transaction's own database view.
-func (s *Service) runMutation(ctx context.Context, actorID int64, mutate mutationCallback) (mutationResult, error) {
+func (s *Service) runMutation(ctx context.Context, actorID int64, response mutationResponse, mutate mutationCallback) (mutationResult, error) {
 	if s == nil || s.stores == nil || s.principals == nil || s.gate == nil || s.state == nil || s.sequencer == nil || mutate == nil || actorID <= 0 {
+		return mutationResult{}, ErrRealtimeUnavailable
+	}
+	command, durableCommand := realtime.HTTPMutationCommandFromContext(ctx)
+	if durableCommand && (s.durable == nil || response == nil || command.Identity.PrincipalID != actorID) {
 		return mutationResult{}, ErrRealtimeUnavailable
 	}
 	completion, err := s.sequencer.Submit(ctx, realtime.PostCommitCommand{
@@ -1198,37 +1262,131 @@ func (s *Service) runMutation(ctx context.Context, actorID int64, mutate mutatio
 				unlock()
 			}, nil
 		},
-		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+		Execute: func(commandCtx context.Context, commandID int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+			if durableCommand {
+				version, err := s.currentVersion()
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				replay, found, err := s.durable.Lookup(commandCtx, command.Identity, command.IdempotencyKey, version.Checkpoint().StreamEpoch)
+				if err != nil {
+					if errors.Is(err, realtime.ErrIdempotencyMismatch) {
+						if markErr := execution.MarkNoop(); markErr != nil {
+							return realtime.CommandOutput{}, markErr
+						}
+						mismatch := realtime.IdempotencyMismatchReplay()
+						return realtime.CommandOutput{Value: mutationResult{state: StateCommand{Replay: &mismatch}}}, nil
+					}
+					return realtime.CommandOutput{}, err
+				}
+				if found {
+					if err := execution.MarkNoop(); err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					return realtime.CommandOutput{Value: mutationResult{state: StateCommand{Replay: &replay}}}, nil
+				}
+			}
 			tx, err := s.stores.BeginTx(commandCtx)
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
 			defer tx.Rollback()
 			txStores := s.stores.WithTx(tx)
+			if durableCommand {
+				if err := s.durable.Admit(commandCtx, txStores); err != nil {
+					return realtime.CommandOutput{}, err
+				}
+			}
 			result, err := mutate(commandCtx, txStores, execution)
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
 			if result.noop {
+				if durableCommand {
+					version, err := s.currentVersion()
+					if err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					if s.cursors == nil {
+						return realtime.CommandOutput{}, ErrRealtimeUnavailable
+					}
+					state := StateCommand{CommandID: commandID, Checkpoint: version.Checkpoint()}
+					state.Cursor, err = s.cursors.IssueStateCursor(actorID, version)
+					if err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					status, data, headers := response(result)
+					body, err := durableBody(status, data)
+					if err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					if err := s.durable.Save(commandCtx, txStores, command.Identity, command.IdempotencyKey, realtime.CanonicalCommandResult{
+						CommandID:   commandID,
+						Status:      status,
+						Body:        body,
+						Headers:     headers,
+						Checkpoint:  state.Checkpoint,
+						StateCursor: state.Cursor,
+					}); err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					if err := execution.CommitNoop(tx); err != nil {
+						return realtime.CommandOutput{}, err
+					}
+					return realtime.CommandOutput{Value: mutationResult{value: result, state: state}}, nil
+				}
 				if err := execution.MarkNoop(); err != nil {
 					return realtime.CommandOutput{}, err
 				}
-				return realtime.CommandOutput{Value: result}, nil
+				return realtime.CommandOutput{Value: mutationResult{value: result, state: StateCommand{CommandID: commandID}}}, nil
+			}
+			state := StateCommand{CommandID: commandID}
+			if durableCommand {
+				reserved, err := execution.ReservedResult()
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				if s.cursors == nil || reserved.Version == nil {
+					return realtime.CommandOutput{}, ErrRealtimeUnavailable
+				}
+				state.Checkpoint = reserved.Checkpoint
+				state.Cursor, err = s.cursors.IssueStateCursor(actorID, reserved.Version)
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				status, data, headers := response(result)
+				body, err := durableBody(status, data)
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				if err := s.durable.Save(commandCtx, txStores, command.Identity, command.IdempotencyKey, realtime.CanonicalCommandResult{
+					CommandID:   commandID,
+					Status:      status,
+					Body:        body,
+					Headers:     headers,
+					Checkpoint:  state.Checkpoint,
+					StateCursor: state.Cursor,
+				}); err != nil {
+					return realtime.CommandOutput{}, err
+				}
 			}
 			if _, err := execution.Commit(tx); err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			return realtime.CommandOutput{Value: result}, nil
+			return realtime.CommandOutput{Value: mutationResult{value: result, state: state}}, nil
 		},
 	})
 	if err != nil {
 		return mutationResult{}, err
 	}
-	value, ok := completion.Value.(mutationValue)
+	result, ok := completion.Value.(mutationResult)
 	if !ok {
 		return mutationResult{}, ErrRealtimeUnavailable
 	}
-	result := mutationResult{value: value, state: StateCommand{Checkpoint: completion.Publication.Checkpoint}}
+	if result.state.Checkpoint.StreamEpoch != "" || completion.Publication.Version == nil {
+		return result, nil
+	}
+	result.state.Checkpoint = completion.Publication.Checkpoint
 	if s.cursors == nil {
 		return result, nil
 	}
@@ -1238,6 +1396,15 @@ func (s *Service) runMutation(ctx context.Context, actorID int64, mutate mutatio
 	}
 	result.state.Cursor = cursor
 	return result, nil
+}
+
+// durableBody preserves the empty HTTP 204 response while encoding every other
+// successful result in the standard API envelope.
+func durableBody(status int, data any) ([]byte, error) {
+	if status == http.StatusNoContent {
+		return nil, nil
+	}
+	return realtime.CanonicalSuccessBody(data)
 }
 
 // authorize applies one scope-aware decision from the supplied immutable state
