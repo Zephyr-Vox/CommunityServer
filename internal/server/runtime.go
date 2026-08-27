@@ -274,6 +274,7 @@ func (a *App) stopRealtime(ctx context.Context) error {
 	sequencer := a.sequencer
 	eventBus := a.eventBus
 	connectionState := a.connectionState
+	deadlines := a.deadlines
 	a.syncStrategy = nil
 	a.runtimeMu.Unlock()
 	if a.connections != nil {
@@ -282,6 +283,11 @@ func (a *App) stopRealtime(ctx context.Context) error {
 	}
 	if connectionState != nil {
 		if err := connectionState.Close(ctx); err != nil {
+			return err
+		}
+	}
+	if deadlines != nil {
+		if err := deadlines.Close(ctx); err != nil {
 			return err
 		}
 	}

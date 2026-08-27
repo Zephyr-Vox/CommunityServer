@@ -15,6 +15,10 @@ type ChannelStore struct {
 	now   func() int64
 }
 
+// Now returns the store's injected Unix-millisecond clock for runtime schedule
+// creation that must agree with persistent channel mutations in tests.
+func (s *ChannelStore) Now() int64 { return s.now() }
+
 // CreateGroup creates a version-one channel group.
 func (s *ChannelStore) CreateGroup(ctx context.Context, name string, position int64, visibility string) (*db.ChannelGroup, error) {
 	id, err := s.idGen.Next()

@@ -185,6 +185,16 @@ type runtimeState struct {
 	moderationEpoch  uint64
 	presences        map[int64]Presence
 	voiceAuthorities map[int64]VoiceAuthority
+	temporaryExpiry  map[int64]ExpirySchedule
+	muteExpiry       map[int64]ExpirySchedule
+}
+
+// ExpirySchedule is a generation-guarded runtime deadline. Deadline zero
+// represents a cancelled timer while retaining a higher generation for stale
+// callback rejection.
+type ExpirySchedule struct {
+	Generation uint64
+	Deadline   int64
 }
 
 // StateVersion is an immutable server-state projection. Its accessors return
@@ -336,6 +346,18 @@ func (v *StateVersion) ModerationEpoch() uint64 {
 	return v.runtime.moderationEpoch
 }
 
+// TemporaryExpiry returns one temporary channel's current empty-delete schedule.
+func (v *StateVersion) TemporaryExpiry(channelID int64) (ExpirySchedule, bool) {
+	schedule, ok := v.runtime.temporaryExpiry[channelID]
+	return schedule, ok
+}
+
+// MuteExpiry returns one moderation mute's current expiry cleanup schedule.
+func (v *StateVersion) MuteExpiry(muteID int64) (ExpirySchedule, bool) {
+	schedule, ok := v.runtime.muteExpiry[muteID]
+	return schedule, ok
+}
+
 // Presence returns userID's runtime presence. Users without an explicit
 // runtime entry are offline, which is also the post-restart default.
 func (v *StateVersion) Presence(userID int64) Presence {
@@ -422,6 +444,8 @@ func NewStateStoreWithEpoch(ctx context.Context, loader ProjectionLoader, stream
 			visibilityEpochs: make(map[int64]uint64),
 			presences:        make(map[int64]Presence),
 			voiceAuthorities: make(map[int64]VoiceAuthority),
+			temporaryExpiry:  make(map[int64]ExpirySchedule),
+			muteExpiry:       make(map[int64]ExpirySchedule),
 		},
 	})
 	return state, nil
@@ -477,13 +501,28 @@ func (s *StateStore) BuildPersistentCandidateFrom(ctx context.Context, loader Pr
 	if err != nil {
 		return nil, err
 	}
+	runtime := base.runtime.clone()
+	// Persistent cascades (owner transfer, account deletion, channel deletion)
+	// may remove scheduled entities outside their owning runtime service. Prune
+	// only absent IDs here; deadline/value changes remain generation-guarded by
+	// the corresponding sequenced command.
+	for channelID := range runtime.temporaryExpiry {
+		if _, exists := persistent.channels[channelID]; !exists {
+			delete(runtime.temporaryExpiry, channelID)
+		}
+	}
+	for muteID := range runtime.muteExpiry {
+		if _, exists := persistent.mutes[muteID]; !exists {
+			delete(runtime.muteExpiry, muteID)
+		}
+	}
 	return &StateCandidate{
 		base: base,
 		version: &StateVersion{
 			number:     base.number + 1,
 			checkpoint: base.checkpoint,
 			persistent: persistent,
-			runtime:    base.runtime.clone(),
+			runtime:    runtime,
 		},
 	}, nil
 }
@@ -528,6 +567,49 @@ func (c *StateCandidate) IncrementModerationEpoch() error {
 	}
 	c.version.runtime.moderationEpoch++
 	return nil
+}
+
+// ScheduleTemporaryExpiry records a new empty-channel delete deadline and
+// increments generation so stale callbacks cannot delete a rejoined channel.
+func (c *StateCandidate) ScheduleTemporaryExpiry(channelID, deadline int64) (ExpirySchedule, error) {
+	if c == nil || c.version == nil || deadline <= 0 {
+		return ExpirySchedule{}, ErrInvalidProjection
+	}
+	channel, exists := c.version.persistent.channels[channelID]
+	if !exists || !channel.Temporary {
+		return ExpirySchedule{}, ErrInvalidProjection
+	}
+	previous := c.version.runtime.temporaryExpiry[channelID]
+	schedule := ExpirySchedule{Generation: previous.Generation + 1, Deadline: deadline}
+	c.version.runtime.temporaryExpiry[channelID] = schedule
+	return schedule, nil
+}
+
+// ClearTemporaryExpiry invalidates an active empty-channel timer.
+func (c *StateCandidate) ClearTemporaryExpiry(channelID int64) {
+	previous := c.version.runtime.temporaryExpiry[channelID]
+	c.version.runtime.temporaryExpiry[channelID] = ExpirySchedule{Generation: previous.Generation + 1}
+}
+
+// ScheduleMuteExpiry records an exact timed mute cleanup deadline.
+func (c *StateCandidate) ScheduleMuteExpiry(muteID, deadline int64) (ExpirySchedule, error) {
+	if c == nil || c.version == nil || deadline <= 0 {
+		return ExpirySchedule{}, ErrInvalidProjection
+	}
+	mute, exists := c.version.persistent.mutes[muteID]
+	if !exists || mute.ExpiresAt == nil || *mute.ExpiresAt != deadline {
+		return ExpirySchedule{}, ErrInvalidProjection
+	}
+	previous := c.version.runtime.muteExpiry[muteID]
+	schedule := ExpirySchedule{Generation: previous.Generation + 1, Deadline: deadline}
+	c.version.runtime.muteExpiry[muteID] = schedule
+	return schedule, nil
+}
+
+// ClearMuteExpiry invalidates an active mute cleanup timer.
+func (c *StateCandidate) ClearMuteExpiry(muteID int64) {
+	previous := c.version.runtime.muteExpiry[muteID]
+	c.version.runtime.muteExpiry[muteID] = ExpirySchedule{Generation: previous.Generation + 1}
 }
 
 // SetVoiceAuthority conditionally stores authority as the candidate's runtime
@@ -848,6 +930,8 @@ func (r runtimeState) clone() runtimeState {
 		moderationEpoch:  r.moderationEpoch,
 		presences:        make(map[int64]Presence, len(r.presences)),
 		voiceAuthorities: make(map[int64]VoiceAuthority, len(r.voiceAuthorities)),
+		temporaryExpiry:  make(map[int64]ExpirySchedule, len(r.temporaryExpiry)),
+		muteExpiry:       make(map[int64]ExpirySchedule, len(r.muteExpiry)),
 	}
 	for userID, epoch := range r.visibilityEpochs {
 		cloned.visibilityEpochs[userID] = epoch
@@ -857,6 +941,12 @@ func (r runtimeState) clone() runtimeState {
 	}
 	for userID, authority := range r.voiceAuthorities {
 		cloned.voiceAuthorities[userID] = authority
+	}
+	for channelID, schedule := range r.temporaryExpiry {
+		cloned.temporaryExpiry[channelID] = schedule
+	}
+	for muteID, schedule := range r.muteExpiry {
+		cloned.muteExpiry[muteID] = schedule
 	}
 	return cloned
 }

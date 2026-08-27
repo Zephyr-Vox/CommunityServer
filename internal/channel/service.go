@@ -86,6 +86,7 @@ type Service struct {
 	authorizer *scope.Authorizer
 	visibility *realtime.VisibilityResolver
 	cursors    realtime.StateCursorIssuer
+	scheduler  *realtime.DeadlineScheduler
 }
 
 // CreateGroupInput contains validated group fields for a creation command.
@@ -178,6 +179,11 @@ func (s *Service) SetStateMutationGate(gate MutationGate) {
 // exact cursor for a completed sequenced HTTP mutation.
 func (s *Service) SetStateCursorIssuer(cursors realtime.StateCursorIssuer) {
 	s.cursors = cursors
+}
+
+// SetDeadlineScheduler installs the server-owned runtime deadline scheduler.
+func (s *Service) SetDeadlineScheduler(scheduler *realtime.DeadlineScheduler) {
+	s.scheduler = scheduler
 }
 
 // StateCommand identifies the exact published checkpoint for one successful
@@ -1117,6 +1123,14 @@ func (s *Service) CreateChannel(ctx context.Context, actorID int64, input Create
 		if !ok {
 			return mutationValue{}, ErrRealtimeUnavailable
 		}
+		var temporarySchedule *realtime.ExpirySchedule
+		if input.Temporary {
+			schedule, err := candidate.ScheduleTemporaryExpiry(channel.ID, txStores.Channels.Now()+30_000)
+			if err != nil {
+				return mutationValue{}, err
+			}
+			temporarySchedule = &schedule
+		}
 		events, err := channelCreatedEvents(snapshot)
 		if err != nil {
 			return mutationValue{}, err
@@ -1124,10 +1138,17 @@ func (s *Service) CreateChannel(ctx context.Context, actorID int64, input Create
 		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
-		return mutationValue{channel: snapshotChannel(snapshot)}, nil
+		return mutationValue{channel: snapshotChannel(snapshot), temporarySchedule: temporarySchedule}, nil
 	})
 	if err != nil {
 		return realtime.SnapshotChannel{}, StateCommand{}, err
+	}
+	if result.value.temporarySchedule != nil {
+		channelID, parseErr := strconv.ParseInt(result.value.channel.ID, 10, 64)
+		if parseErr != nil {
+			return realtime.SnapshotChannel{}, StateCommand{}, ErrRealtimeUnavailable
+		}
+		s.scheduleTemporary(channelID, result.value.temporarySchedule)
 	}
 	return result.value.channel, result.state, nil
 }
@@ -1135,13 +1156,14 @@ func (s *Service) CreateChannel(ctx context.Context, actorID int64, input Create
 // mutationValue is the HTTP result retained while the sequencer publishes the
 // exact candidate constructed in the transaction callback.
 type mutationValue struct {
-	group      realtime.SnapshotGroup
-	channel    realtime.SnapshotChannel
-	access     realtime.AccessEntry
-	etag       string
-	parentETag string
-	created    bool
-	noop       bool
+	group             realtime.SnapshotGroup
+	channel           realtime.SnapshotChannel
+	access            realtime.AccessEntry
+	etag              string
+	parentETag        string
+	created           bool
+	temporarySchedule *realtime.ExpirySchedule
+	noop              bool
 }
 
 // mutationResult combines one command-owned API result with its final
@@ -1474,6 +1496,111 @@ func (s *Service) currentVersion() (*realtime.StateVersion, error) {
 		return nil, ErrRealtimeUnavailable
 	}
 	return version, nil
+}
+
+// scheduleTemporary arms one deadline only after its runtime schedule was
+// published. A nil scheduler is permitted in focused service tests.
+func (s *Service) scheduleTemporary(channelID int64, schedule *realtime.ExpirySchedule) {
+	if s.scheduler == nil || schedule == nil {
+		return
+	}
+	s.scheduler.Schedule(realtime.DeadlineTask{Kind: "temporary", ID: channelID, Generation: schedule.Generation, Deadline: schedule.Deadline})
+}
+
+// RestoreTemporarySchedules reconstructs generation-guarded initial-empty
+// timers for persisted temporary channels after process startup.
+func (s *Service) RestoreTemporarySchedules(ctx context.Context) error {
+	version, err := s.currentVersion()
+	if err != nil {
+		return err
+	}
+	for _, channel := range version.Channels() {
+		if !channel.Temporary {
+			continue
+		}
+		completion, err := s.sequencer.Submit(ctx, realtime.PostCommitCommand{
+			QueueBytes: 1,
+			Acquire:    func(commandCtx context.Context) (func(), error) { return s.gate.Acquire(commandCtx) },
+			Execute: func(_ context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+				candidate, err := s.state.BuildRuntimeCandidate()
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				schedule, err := candidate.ScheduleTemporaryExpiry(channel.ID, s.stores.Channels.Now()+30_000)
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				if _, err := execution.Reserve(realtime.PublicationRequest{Candidate: candidate}); err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				if err := execution.MarkRuntimeReady(); err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				return realtime.CommandOutput{Value: schedule}, nil
+			},
+		})
+		if err != nil {
+			return err
+		}
+		schedule, ok := completion.Value.(realtime.ExpirySchedule)
+		if !ok {
+			return ErrRealtimeUnavailable
+		}
+		s.scheduleTemporary(channel.ID, &schedule)
+	}
+	return nil
+}
+
+// ExpireTemporary deletes an initial-empty temporary channel only when its
+// expected runtime generation/deadline still matches and no voice authority has
+// joined it. Timer callers use the control reserve so normal command load cannot
+// strand temporary resources past their grace period.
+func (s *Service) ExpireTemporary(ctx context.Context, channelID int64, generation uint64, deadline int64) error {
+	_, err := s.sequencer.SubmitControl(ctx, realtime.PostCommitCommand{
+		QueueBytes: 1,
+		Acquire:    func(commandCtx context.Context) (func(), error) { return s.gate.Acquire(commandCtx) },
+		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+			version, err := s.currentVersion()
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			schedule, scheduled := version.TemporaryExpiry(channelID)
+			channel, exists := version.Channel(channelID)
+			if !scheduled || !exists || !channel.Temporary || schedule.Generation != generation || schedule.Deadline != deadline || activeChannelMembers(channelID, version) != 0 {
+				return realtime.CommandOutput{}, execution.MarkNoop()
+			}
+			if s.stores.Channels.Now() < deadline {
+				return realtime.CommandOutput{}, execution.MarkNoop()
+			}
+			tx, err := s.stores.BeginTx(commandCtx)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			defer tx.Rollback()
+			txStores := s.stores.WithTx(tx)
+			beforeUsers := visibleChannelUsers(channelID, version, s.visibility)
+			if err := txStores.Channels.Delete(commandCtx, channelID); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			candidate, err := s.state.BuildPersistentCandidateFrom(commandCtx, txStores)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			candidate.ClearTemporaryExpiry(channelID)
+			events, err := channelDeletedEvents(channel, beforeUsers)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			if _, err := execution.Commit(tx); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			return realtime.CommandOutput{}, nil
+		},
+	})
+	return err
 }
 
 // executionReserveAllUsers reserves the candidate, canonical mutation events,

@@ -32,6 +32,8 @@ var (
 	ErrInvalidMute = errors.New("moderation: invalid mute")
 	// ErrResourceLimit reports exhaustion of the fixed active mute hard cap.
 	ErrResourceLimit = errors.New("moderation: active mute limit reached")
+	// ErrStaleExpiry reports a timer that no longer matches runtime mute state.
+	ErrStaleExpiry = errors.New("moderation: stale mute expiry")
 )
 
 // PrincipalMutations supplies the per-user mutation barrier used for actor and
@@ -85,6 +87,7 @@ type Service struct {
 	visibility *realtime.VisibilityResolver
 	authorizer *rbacscope.Authorizer
 	cursors    realtime.StateCursorIssuer
+	scheduler  *realtime.DeadlineScheduler
 }
 
 // NewService creates a moderation service. Server assembly installs its command
@@ -109,6 +112,11 @@ func (s *Service) SetStateMutationGate(gate MutationGate) { s.gate = gate }
 
 // SetStateCursorIssuer installs the process-local state cursor signer.
 func (s *Service) SetStateCursorIssuer(cursors realtime.StateCursorIssuer) { s.cursors = cursors }
+
+// SetDeadlineScheduler installs the server-owned deadline scheduler.
+func (s *Service) SetDeadlineScheduler(scheduler *realtime.DeadlineScheduler) {
+	s.scheduler = scheduler
+}
 
 // List returns the actor-manageable active mutes at one exact scope from a
 // single immutable StateVersion. Expired persistent rows are excluded because
@@ -193,6 +201,14 @@ func (s *Service) Create(ctx context.Context, actorID int64, input CreateInput) 
 		if err := candidate.IncrementModerationEpoch(); err != nil {
 			return mutationValue{}, err
 		}
+		var schedule *realtime.ExpirySchedule
+		if input.ExpiresAt != nil {
+			created, err := candidate.ScheduleMuteExpiry(mute.ID, *input.ExpiresAt)
+			if err != nil {
+				return mutationValue{}, err
+			}
+			schedule = &created
+		}
 		updated, exists := candidate.Version().Mute(mute.ID)
 		if !exists {
 			return mutationValue{}, ErrRealtimeUnavailable
@@ -204,11 +220,12 @@ func (s *Service) Create(ctx context.Context, actorID int64, input CreateInput) 
 		if _, err := reserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
-		return mutationValue{mute: muteResponseFromState(updated)}, nil
+		return mutationValue{mute: muteResponseFromState(updated), muteID: mute.ID, schedule: schedule}, nil
 	})
 	if err != nil {
 		return muteResponse{}, StateCommand{}, err
 	}
+	s.scheduleResult(result.value.muteID, result.value.schedule)
 	return result.value.mute, result.state, nil
 }
 
@@ -266,6 +283,16 @@ func (s *Service) Update(ctx context.Context, actorID, muteID int64, expectedETa
 		if err := candidate.IncrementModerationEpoch(); err != nil {
 			return mutationValue{}, err
 		}
+		var schedule *realtime.ExpirySchedule
+		if expiresAt != nil {
+			next, err := candidate.ScheduleMuteExpiry(muteID, *expiresAt)
+			if err != nil {
+				return mutationValue{}, err
+			}
+			schedule = &next
+		} else {
+			candidate.ClearMuteExpiry(muteID)
+		}
 		updated, exists := candidate.Version().Mute(updatedRow.ID)
 		if !exists {
 			return mutationValue{}, ErrRealtimeUnavailable
@@ -277,11 +304,15 @@ func (s *Service) Update(ctx context.Context, actorID, muteID int64, expectedETa
 		if _, err := reserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
-		return mutationValue{mute: muteResponseFromState(updated)}, nil
+		return mutationValue{mute: muteResponseFromState(updated), muteID: muteID, schedule: schedule, cancelSchedule: expiresAt == nil}, nil
 	})
 	if err != nil {
 		return muteResponse{}, StateCommand{}, err
 	}
+	if result.value.cancelSchedule {
+		s.cancelSchedule(result.value.muteID)
+	}
+	s.scheduleResult(result.value.muteID, result.value.schedule)
 	return result.value.mute, result.state, nil
 }
 
@@ -320,6 +351,7 @@ func (s *Service) Delete(ctx context.Context, actorID, muteID int64, expectedETa
 		if err := candidate.IncrementModerationEpoch(); err != nil {
 			return mutationValue{}, err
 		}
+		candidate.ClearMuteExpiry(muteID)
 		events, err := muteRemovedEvents(mute.Scope, candidate.Version())
 		if err != nil {
 			return mutationValue{}, err
@@ -327,18 +359,24 @@ func (s *Service) Delete(ctx context.Context, actorID, muteID int64, expectedETa
 		if _, err := reserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
-		return mutationValue{}, nil
+		return mutationValue{cancelSchedule: true}, nil
 	})
 	if err != nil {
 		return StateCommand{}, err
+	}
+	if result.value.cancelSchedule {
+		s.cancelSchedule(muteID)
 	}
 	return result.state, nil
 }
 
 // mutationValue carries one command-owned mute DTO or no-op marker.
 type mutationValue struct {
-	mute muteResponse
-	noop bool
+	mute           muteResponse
+	muteID         int64
+	schedule       *realtime.ExpirySchedule
+	cancelSchedule bool
+	noop           bool
 }
 
 // mutationResult combines the command result with its final published state.
@@ -438,6 +476,137 @@ func (s *Service) muteTargetID(muteID int64) (int64, error) {
 		return 0, ErrTargetNotFound
 	}
 	return mute.UserID, nil
+}
+
+// scheduleResult installs one successfully published mute deadline.
+func (s *Service) scheduleResult(muteID int64, schedule *realtime.ExpirySchedule) {
+	if s.scheduler == nil || schedule == nil {
+		return
+	}
+	s.scheduler.Schedule(realtime.DeadlineTask{Kind: "mute", ID: muteID, Generation: schedule.Generation, Deadline: schedule.Deadline})
+}
+
+// cancelSchedule stops one pending mute timer after a published cancellation.
+func (s *Service) cancelSchedule(muteID int64) {
+	if s.scheduler != nil {
+		s.scheduler.Cancel("mute", muteID)
+	}
+}
+
+// RestoreExpiries reconstructs runtime expiry generations for every persisted
+// timed mute after process startup. Each schedule is a runtime-only publication
+// before the wall-clock timer is armed.
+func (s *Service) RestoreExpiries(ctx context.Context) error {
+	version, err := s.currentState()
+	if err != nil {
+		return err
+	}
+	for _, mute := range version.Mutes() {
+		if mute.ExpiresAt == nil {
+			continue
+		}
+		completion, err := s.sequencer.Submit(ctx, realtime.PostCommitCommand{
+			QueueBytes: 1,
+			Acquire:    func(commandCtx context.Context) (func(), error) { return s.gate.Acquire(commandCtx) },
+			Execute: func(_ context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+				candidate, err := s.state.BuildRuntimeCandidate()
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				schedule, err := candidate.ScheduleMuteExpiry(mute.ID, *mute.ExpiresAt)
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				if _, err := execution.Reserve(realtime.PublicationRequest{Candidate: candidate}); err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				if err := execution.MarkRuntimeReady(); err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				return realtime.CommandOutput{Value: schedule}, nil
+			},
+		})
+		if err != nil {
+			return err
+		}
+		schedule, ok := completion.Value.(realtime.ExpirySchedule)
+		if !ok {
+			return ErrRealtimeUnavailable
+		}
+		s.scheduleResult(mute.ID, &schedule)
+	}
+	return nil
+}
+
+// Expire removes one timed mute only when its expected generation, deadline,
+// persisted expiry, and wall clock all still agree. Timer callbacks use the
+// control reserve so ordinary command load cannot strand expired enforcement.
+func (s *Service) Expire(ctx context.Context, muteID int64, generation uint64, deadline int64) error {
+	targetID, err := s.muteTargetID(muteID)
+	if err != nil {
+		if errors.Is(err, ErrTargetNotFound) {
+			return nil
+		}
+		return err
+	}
+	_, err = s.sequencer.SubmitControl(ctx, realtime.PostCommitCommand{
+		QueueBytes: 1,
+		Acquire: func(commandCtx context.Context) (func(), error) {
+			unlock := s.principals.LockMutation(targetID)
+			release, err := s.gate.Acquire(commandCtx)
+			if err != nil {
+				unlock()
+				return nil, err
+			}
+			return func() { release(); unlock() }, nil
+		},
+		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+			version, err := s.currentState()
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			schedule, exists := version.MuteExpiry(muteID)
+			mute, muteExists := version.Mute(muteID)
+			if !exists || !muteExists || schedule.Generation != generation || schedule.Deadline != deadline || mute.ExpiresAt == nil || *mute.ExpiresAt != deadline {
+				return realtime.CommandOutput{}, execution.MarkNoop()
+			}
+			if txNow := s.stores.Mutes.Now(); txNow < deadline {
+				return realtime.CommandOutput{}, ErrStaleExpiry
+			}
+			tx, err := s.stores.BeginTx(commandCtx)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			defer tx.Rollback()
+			txStores := s.stores.WithTx(tx)
+			if err := txStores.Mutes.Delete(commandCtx, muteID); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			candidate, err := s.state.BuildPersistentCandidateFrom(commandCtx, txStores)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			candidate.ClearMuteExpiry(muteID)
+			if err := candidate.IncrementModerationEpoch(); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			events, err := muteRemovedEvents(mute.Scope, candidate.Version())
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			if _, err := reserveAllUsers(execution, candidate, events); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			if _, err := execution.Commit(tx); err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			return realtime.CommandOutput{}, nil
+		},
+	})
+	if errors.Is(err, ErrStaleExpiry) {
+		return nil
+	}
+	return err
 }
 
 // authorize checks member.mute at target while converting missing or private

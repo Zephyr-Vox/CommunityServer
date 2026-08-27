@@ -96,6 +96,33 @@ func TestMuteScopeVisibilityAndActiveList(t *testing.T) {
 	}
 }
 
+func TestMuteExpiryUsesPublishedGeneration(t *testing.T) {
+	fixture := newFixture(t)
+	ctx := context.Background()
+	expiresAt := int64(2_000)
+	created, _, err := fixture.service.Create(ctx, fixture.adminID, moderation.CreateInput{
+		Scope:     moderation.Scope{Type: "server"},
+		UserID:    fixture.memberID,
+		Kind:      "text",
+		ExpiresAt: &expiresAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	muteID := fixture.muteID(t, created.ID)
+	schedule, exists := fixture.state.Current().MuteExpiry(muteID)
+	if !exists || schedule.Generation != 1 || schedule.Deadline != expiresAt {
+		t.Fatalf("mute expiry schedule = %+v, exists=%t", schedule, exists)
+	}
+	*fixture.now = expiresAt
+	if err := fixture.service.Expire(ctx, muteID, schedule.Generation, schedule.Deadline); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := fixture.state.Current().Mute(muteID); exists || fixture.state.Current().ModerationEpoch() != 2 {
+		t.Fatalf("expired mute state exists=%t epoch=%d", exists, fixture.state.Current().ModerationEpoch())
+	}
+}
+
 type fixture struct {
 	stores      *store.Stores
 	service     *moderation.Service
@@ -104,6 +131,7 @@ type fixture struct {
 	ownerID     int64
 	adminID     int64
 	memberID    int64
+	now         *int64
 }
 
 func newFixture(t *testing.T) fixture {
@@ -121,7 +149,8 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stores := store.New(conn, idGen, func() int64 { return 1_000 })
+	now := int64(1_000)
+	stores := store.New(conn, idGen, func() int64 { return now })
 	if err := stores.SeedAndVerify(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +203,7 @@ func newFixture(t *testing.T) fixture {
 	service := moderation.NewService(stores, &principalMutations{})
 	service.SetStateMutationGate(realtime.NewMutationGate())
 	service.SetStateCommandRuntime(state, sequencer)
-	return fixture{stores: stores, service: service, state: state, publication: publication, ownerID: owner.ID, adminID: admin.ID, memberID: member.ID}
+	return fixture{stores: stores, service: service, state: state, publication: publication, ownerID: owner.ID, adminID: admin.ID, memberID: member.ID, now: &now}
 }
 
 func (f fixture) muteID(t *testing.T, raw string) int64 {

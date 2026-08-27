@@ -98,8 +98,9 @@ func TestTemporaryCreateUsesDistinctPermissionAndCreatorLimit(t *testing.T) {
 	if !errors.Is(err, channel.ErrTemporaryMode) {
 		t.Fatalf("non-voice temporary create error = %v", err)
 	}
+	var firstTemporaryID int64
 	for index := 0; index < 5; index++ {
-		_, _, err := fixture.service.CreateChannel(ctx, fixture.memberID, channel.CreateChannelInput{
+		created, _, err := fixture.service.CreateChannel(ctx, fixture.memberID, channel.CreateChannelInput{
 			Name:       "Temporary " + strconv.Itoa(index),
 			Mode:       "voice",
 			Temporary:  true,
@@ -110,6 +111,13 @@ func TestTemporaryCreateUsesDistinctPermissionAndCreatorLimit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("temporary create %d: %v", index, err)
 		}
+		if index == 0 {
+			firstTemporaryID = mustID(t, created.ID)
+		}
+	}
+	schedule, exists := fixture.state.Current().TemporaryExpiry(firstTemporaryID)
+	if !exists || schedule.Generation != 1 || schedule.Deadline != 31_000 {
+		t.Fatalf("temporary schedule = %+v, exists=%t", schedule, exists)
 	}
 	_, _, err = fixture.service.CreateChannel(ctx, fixture.memberID, channel.CreateChannelInput{
 		Name:       "Sixth temporary",

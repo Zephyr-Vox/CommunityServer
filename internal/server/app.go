@@ -61,6 +61,7 @@ type App struct {
 	syncStrategy    realtime.StateSyncStrategy
 	connectionState *realtime.ConnectionStatePublisher
 	mutationGate    *realtime.MutationGate
+	deadlines       *realtime.DeadlineScheduler
 	commands        *requestAdmission
 
 	lifecycleMu sync.Mutex
@@ -179,6 +180,22 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	app.realtimeFatal = func(fatal error) {
 		logger.Error("realtime sequencer failed before server run", "module", "realtime", "err", fatal)
 	}
+	app.deadlines = realtime.NewDeadlineScheduler(func(task realtime.DeadlineTask) {
+		var err error
+		switch task.Kind {
+		case "mute":
+			if app.moderation != nil {
+				err = app.moderation.Expire(context.Background(), task.ID, task.Generation, task.Deadline)
+			}
+		case "temporary":
+			if app.channels != nil {
+				err = app.channels.ExpireTemporary(context.Background(), task.ID, task.Generation, task.Deadline)
+			}
+		}
+		if err != nil {
+			app.reportRealtimeFatal(fmt.Errorf("deadline callback: %w", err))
+		}
+	})
 	if err := app.startRealtime(context.Background()); err != nil {
 		conn.Close()
 		return nil, err
@@ -190,11 +207,23 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	avatarSvc.SetStateMutationGate(app.mutationGate)
 	channels.SetStateMutationGate(app.mutationGate)
 	channels.SetStateCommandRuntime(app.state, app.sequencer)
+	channels.SetDeadlineScheduler(app.deadlines)
 	moderationSvc.SetStateMutationGate(app.mutationGate)
 	moderationSvc.SetStateCommandRuntime(app.state, app.sequencer)
+	moderationSvc.SetDeadlineScheduler(app.deadlines)
 	if cursors, ok := app.syncStrategy.(realtime.StateCursorIssuer); ok {
 		channels.SetStateCursorIssuer(cursors)
 		moderationSvc.SetStateCursorIssuer(cursors)
+	}
+	if err := moderationSvc.RestoreExpiries(context.Background()); err != nil {
+		_ = app.stopRealtime(context.Background())
+		conn.Close()
+		return nil, fmt.Errorf("server: restore moderation expiries: %w", err)
+	}
+	if err := channels.RestoreTemporarySchedules(context.Background()); err != nil {
+		_ = app.stopRealtime(context.Background())
+		conn.Close()
+		return nil, fmt.Errorf("server: restore temporary channel schedules: %w", err)
 	}
 	register.SetStateChangePublisher(app.publishAccountChange)
 	activate.SetStateChangePublisher(app.publishAccountChange)
