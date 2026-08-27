@@ -11,7 +11,7 @@ import (
 // endpoints alongside empty-path routes such as PATCH /api/v0/me.
 func TestRouteTable(t *testing.T) {
 	app := newTestApp(t)
-	got := make([]string, 0, 53)
+	got := make([]string, 0, 57)
 	for _, r := range app.Echo().Router().Routes() {
 		got = append(got, r.Method+" "+r.Path)
 	}
@@ -24,6 +24,7 @@ func TestRouteTable(t *testing.T) {
 		"DELETE /api/v0/groups/:id",
 		"DELETE /api/v0/groups/:id/access/:access_id",
 		"DELETE /api/v0/me/avatar",
+		"DELETE /api/v0/mutes/:id",
 		"DELETE /api/v0/rbac/bindings/:id",
 		"DELETE /api/v0/rbac/roles/:key",
 		"DELETE /api/v0/users/:id",
@@ -37,6 +38,7 @@ func TestRouteTable(t *testing.T) {
 		"GET /api/v0/groups/:id",
 		"GET /api/v0/groups/:id/access",
 		"GET /api/v0/metadata",
+		"GET /api/v0/mutes",
 		"GET /api/v0/rbac/bindings",
 		"GET /api/v0/rbac/config",
 		"GET /api/v0/rbac/roles",
@@ -48,6 +50,7 @@ func TestRouteTable(t *testing.T) {
 		"PATCH /api/v0/channels/:id",
 		"PATCH /api/v0/groups/:id",
 		"PATCH /api/v0/me",
+		"PATCH /api/v0/mutes/:id",
 		"PATCH /api/v0/rbac/roles/:key",
 		"PATCH /api/v0/users/:id",
 		"POST /api/v0/admin/activate",
@@ -62,6 +65,7 @@ func TestRouteTable(t *testing.T) {
 		"POST /api/v0/groups/:id/access",
 		"POST /api/v0/me/avatar",
 		"POST /api/v0/me/password",
+		"POST /api/v0/mutes",
 		"POST /api/v0/owner/transfer",
 		"POST /api/v0/rbac/bindings",
 		"POST /api/v0/rbac/config/reset",

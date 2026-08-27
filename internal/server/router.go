@@ -10,6 +10,7 @@ import (
 	"zephyr.vox/server/ce/internal/auth"
 	"zephyr.vox/server/ce/internal/channel"
 	"zephyr.vox/server/ce/internal/image"
+	"zephyr.vox/server/ce/internal/moderation"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbaccontrol "zephyr.vox/server/ce/internal/rbac/control"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
@@ -73,6 +74,10 @@ func (a *App) routes(e *echo.Echo) error {
 	api.GET("/channels/:id", channel.GetChannelHandler(a.channels), authed()...)
 	api.PATCH("/channels/:id", channel.UpdateChannelHandler(a.channels), authed()...)
 	api.DELETE("/channels/:id", channel.DeleteChannelHandler(a.channels), authed()...)
+	api.GET("/mutes", moderation.ListHandler(a.moderation), authed()...)
+	api.POST("/mutes", moderation.CreateHandler(a.moderation), authed()...)
+	api.PATCH("/mutes/:id", moderation.UpdateHandler(a.moderation), authed()...)
+	api.DELETE("/mutes/:id", moderation.DeleteHandler(a.moderation), authed()...)
 	authGroup := api.Group("/auth")
 	authGroup.GET("/status", auth.StatusHandler(a.stores, auth.RegistrationMode(a.cfg.RegistrationMode)))
 	authGroup.POST("/register", auth.RegisterHandler(a.register), auth.IPRateLimit(a.cfg.LoginRateLimit))

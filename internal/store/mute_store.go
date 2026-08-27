@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/snowflake"
@@ -52,6 +53,10 @@ func (s *MuteStore) Create(ctx context.Context, input MuteInput) (*db.Moderation
 	return &mute, nil
 }
 
+// Now returns the store's injected Unix-millisecond clock. Sequenced moderation
+// commands use it for expiry validation so tests and persisted rows agree.
+func (s *MuteStore) Now() int64 { return s.now() }
+
 // Get returns one mute by ID, or ErrNotFound.
 func (s *MuteStore) Get(ctx context.Context, id int64) (*db.ModerationMute, error) {
 	mute, err := s.q.GetMute(ctx, id)
@@ -65,6 +70,27 @@ func (s *MuteStore) Get(ctx context.Context, id int64) (*db.ModerationMute, erro
 func (s *MuteStore) Delete(ctx context.Context, id int64) error {
 	_, err := s.q.DeleteMute(ctx, id)
 	return mapError(err)
+}
+
+// Update replaces a mute's expiry and reason, incrementing its entity version.
+// Callers compare the previous version in their sequenced transaction.
+func (s *MuteStore) Update(ctx context.Context, id int64, expiresAt *int64, reason string) (*db.ModerationMute, error) {
+	mute, err := s.q.UpdateMute(ctx, db.UpdateMuteParams{
+		ExpiresAt: nullInt64(expiresAt),
+		Reason:    reason,
+		ID:        id,
+	})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &mute, nil
+}
+
+// CountActive returns the number of currently enforced mutes. Expired rows are
+// excluded because delayed timer cleanup must never consume the active hard cap.
+func (s *MuteStore) CountActive(ctx context.Context) (int64, error) {
+	count, err := s.q.CountActiveMutes(ctx, sql.NullInt64{Int64: s.now(), Valid: true})
+	return count, mapError(err)
 }
 
 // ListForUser returns all mutes targeting a user.

@@ -10,6 +10,18 @@ import (
 	"database/sql"
 )
 
+const countActiveMutes = `-- name: CountActiveMutes :one
+SELECT COUNT(*) FROM moderation_mutes
+WHERE expires_at IS NULL OR expires_at > ?
+`
+
+func (q *Queries) CountActiveMutes(ctx context.Context, expiresAt sql.NullInt64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countActiveMutes, expiresAt)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteMute = `-- name: DeleteMute :one
 DELETE FROM moderation_mutes WHERE id = ? RETURNING id
 `
@@ -180,4 +192,38 @@ func (q *Queries) ListMutesForUser(ctx context.Context, userID int64) ([]Moderat
 		return nil, err
 	}
 	return items, nil
+}
+
+const updateMute = `-- name: UpdateMute :one
+UPDATE moderation_mutes
+SET expires_at = ?,
+    reason = ?,
+    version = version + 1
+WHERE id = ?
+RETURNING id, scope_type, group_id, channel_id, user_id, kind, expires_at, created_by, reason, created_at, version
+`
+
+type UpdateMuteParams struct {
+	ExpiresAt sql.NullInt64 `json:"expires_at"`
+	Reason    string        `json:"reason"`
+	ID        int64         `json:"id"`
+}
+
+func (q *Queries) UpdateMute(ctx context.Context, arg UpdateMuteParams) (ModerationMute, error) {
+	row := q.db.QueryRowContext(ctx, updateMute, arg.ExpiresAt, arg.Reason, arg.ID)
+	var i ModerationMute
+	err := row.Scan(
+		&i.ID,
+		&i.ScopeType,
+		&i.GroupID,
+		&i.ChannelID,
+		&i.UserID,
+		&i.Kind,
+		&i.ExpiresAt,
+		&i.CreatedBy,
+		&i.Reason,
+		&i.CreatedAt,
+		&i.Version,
+	)
+	return i, err
 }

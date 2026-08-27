@@ -11,6 +11,18 @@ SELECT * FROM moderation_mutes WHERE id = ?;
 -- name: DeleteMute :one
 DELETE FROM moderation_mutes WHERE id = ? RETURNING id;
 
+-- name: UpdateMute :one
+UPDATE moderation_mutes
+SET expires_at = ?,
+    reason = ?,
+    version = version + 1
+WHERE id = ?
+RETURNING *;
+
+-- name: CountActiveMutes :one
+SELECT COUNT(*) FROM moderation_mutes
+WHERE expires_at IS NULL OR expires_at > ?;
+
 -- name: DeleteMutesForUser :exec
 DELETE FROM moderation_mutes WHERE user_id = ?;
 

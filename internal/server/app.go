@@ -20,6 +20,7 @@ import (
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/image"
+	"zephyr.vox/server/ce/internal/moderation"
 	"zephyr.vox/server/ce/internal/oss"
 	"zephyr.vox/server/ce/internal/presence"
 	"zephyr.vox/server/ce/internal/realtime"
@@ -41,6 +42,7 @@ type App struct {
 	invites        *auth.InviteService
 	activate       *auth.ActivationManager
 	channels       *channel.Service
+	moderation     *moderation.Service
 	presence       *presence.Presence
 	objects        *oss.LocalObjectStorage
 	avatar         *image.AvatarService
@@ -134,6 +136,7 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		return nil, fmt.Errorf("server: activation manager: %w", err)
 	}
 	channels := channel.NewService(stores, principals)
+	moderationSvc := moderation.NewService(stores, principals)
 
 	// Do not let groups claim unmatched paths: an unknown route must surface
 	// as a plain 404, not run the group's JWT middleware and return 401.
@@ -159,6 +162,7 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		invites:        invites,
 		activate:       activate,
 		channels:       channels,
+		moderation:     moderationSvc,
 		presence:       pres,
 		objects:        objects,
 		avatar:         avatarSvc,
@@ -186,8 +190,11 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	avatarSvc.SetStateMutationGate(app.mutationGate)
 	channels.SetStateMutationGate(app.mutationGate)
 	channels.SetStateCommandRuntime(app.state, app.sequencer)
+	moderationSvc.SetStateMutationGate(app.mutationGate)
+	moderationSvc.SetStateCommandRuntime(app.state, app.sequencer)
 	if cursors, ok := app.syncStrategy.(realtime.StateCursorIssuer); ok {
 		channels.SetStateCursorIssuer(cursors)
+		moderationSvc.SetStateCursorIssuer(cursors)
 	}
 	register.SetStateChangePublisher(app.publishAccountChange)
 	activate.SetStateChangePublisher(app.publishAccountChange)

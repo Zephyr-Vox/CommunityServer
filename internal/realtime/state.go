@@ -312,6 +312,19 @@ func (v *StateVersion) Mute(id int64) (Mute, bool) {
 	return cloneMute(mute), ok
 }
 
+// Mutes returns every persisted moderation mute in ascending ID order.
+func (v *StateVersion) Mutes() []Mute {
+	if v == nil {
+		return nil
+	}
+	ids := sortedIntKeys(v.persistent.mutes)
+	mutes := make([]Mute, 0, len(ids))
+	for _, id := range ids {
+		mutes = append(mutes, cloneMute(v.persistent.mutes[id]))
+	}
+	return mutes
+}
+
 // VisibilityEpoch returns userID's monotonic visible-scope-set epoch. It is
 // zero until a later StatePublication records that user's first transition.
 func (v *StateVersion) VisibilityEpoch(userID int64) uint64 {
@@ -503,6 +516,17 @@ func (c *StateCandidate) SetPresence(userID int64, presence Presence) error {
 		return ErrInvalidProjection
 	}
 	c.version.runtime.presences[userID] = clonePresence(presence)
+	return nil
+}
+
+// IncrementModerationEpoch advances the server-global mute enforcement epoch
+// for a persistent moderation mutation. Relay workers use this value to reject
+// queued media validated before the new mute state was published.
+func (c *StateCandidate) IncrementModerationEpoch() error {
+	if c == nil || c.version == nil {
+		return ErrInvalidProjection
+	}
+	c.version.runtime.moderationEpoch++
 	return nil
 }
 

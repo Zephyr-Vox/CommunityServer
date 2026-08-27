@@ -12,6 +12,7 @@ import (
 type Querier interface {
 	BumpUserAuthVersion(ctx context.Context, arg BumpUserAuthVersionParams) error
 	ConsumeInvite(ctx context.Context, arg ConsumeInviteParams) (Invite, error)
+	CountActiveMutes(ctx context.Context, expiresAt sql.NullInt64) (int64, error)
 	CountChannelAccess(ctx context.Context, channelID int64) (int64, error)
 	CountChannelGroups(ctx context.Context) (int64, error)
 	CountChannels(ctx context.Context) (int64, error)
@@ -104,6 +105,7 @@ type Querier interface {
 	TouchUserLastLogin(ctx context.Context, arg TouchUserLastLoginParams) error
 	UpdateChannel(ctx context.Context, arg UpdateChannelParams) (Channel, error)
 	UpdateChannelGroup(ctx context.Context, arg UpdateChannelGroupParams) (ChannelGroup, error)
+	UpdateMute(ctx context.Context, arg UpdateMuteParams) (ModerationMute, error)
 	UpdateRole(ctx context.Context, arg UpdateRoleParams) (Role, error)
 	UpdateServerPermissionConfig(ctx context.Context, arg UpdateServerPermissionConfigParams) (ScopePermissionConfig, error)
 	UpdateUserNickname(ctx context.Context, arg UpdateUserNicknameParams) (User, error)
