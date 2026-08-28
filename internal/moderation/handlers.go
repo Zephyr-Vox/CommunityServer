@@ -140,11 +140,11 @@ func CreateHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 mute or scope not found: resource is absent or inaccessible
-//   - 2 precondition failed: If-Match is missing or does not match the mute
+//   - 2 precondition failed: If-Match does not match the mute
 //   - 3 invalid mute state: patch is empty or expiry is not in the future
 //   - 6 protected target: self, owner, peer, or higher-rank users cannot be changed
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: id or request fields are invalid
+//   - 1000 invalid request parameters: id, If-Match, or request fields are invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: member.mute is not granted at the mute scope
@@ -170,7 +170,10 @@ func UpdateHandler(svc *Service) echo.HandlerFunc {
 			return err
 		}
 		input := UpdateInput{ExpiresAtSet: req.ExpiresAt.Set, ExpiresAt: req.ExpiresAt.Value, Reason: req.Reason}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPatch, "/api/v0/mutes/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(muteID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, input)
 		if err != nil {
 			return err
@@ -210,10 +213,10 @@ func UpdateHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 mute or scope not found: resource is absent or inaccessible
-//   - 2 precondition failed: If-Match is missing or does not match the mute
+//   - 2 precondition failed: If-Match does not match the mute
 //   - 6 protected target: self, owner, peer, or higher-rank users cannot be changed
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: id is invalid
+//   - 1000 invalid request parameters: id or If-Match is invalid
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: member.mute is not granted at the mute scope
 //   - 1009 internal: persistent command or publication failed
@@ -232,7 +235,10 @@ func DeleteHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
 		}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/mutes/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(muteID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, struct{}{})
 		if err != nil {
 			return err
@@ -337,13 +343,14 @@ func optionalString(value string) *string {
 	return &value
 }
 
-// exactIfMatch returns one exact mute ETag field value.
-func exactIfMatch(c *echo.Context) string {
+// exactIfMatch returns one exact mute ETag field value. Missing or repeated
+// fields are request validation errors rather than resource conflicts.
+func exactIfMatch(c *echo.Context) (string, error) {
 	values := c.Request().Header.Values("If-Match")
-	if len(values) != 1 {
-		return ""
+	if len(values) != 1 || !realtime.StrongETagValid(values[0]) {
+		return "", api.InvalidField("header.If-Match", "must contain exactly one strong ETag")
 	}
-	return values[0]
+	return values[0], nil
 }
 
 // setStateHeaders exposes one completed StatePublication checkpoint.

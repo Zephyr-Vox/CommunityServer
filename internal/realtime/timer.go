@@ -21,9 +21,16 @@ type DeadlineTask struct {
 type DeadlineScheduler struct {
 	mu       sync.Mutex
 	closed   bool
-	timers   map[string]*time.Timer
+	timers   map[string]scheduledTimer
 	callback func(DeadlineTask)
 	wg       sync.WaitGroup
+}
+
+// scheduledTimer keeps the task associated with a timer so a callback can
+// prove that it still owns the active slot before removing that slot.
+type scheduledTimer struct {
+	task  DeadlineTask
+	timer *time.Timer
 }
 
 // NewDeadlineScheduler creates a scheduler that invokes callback in tracked
@@ -32,12 +39,16 @@ func NewDeadlineScheduler(callback func(DeadlineTask)) *DeadlineScheduler {
 	if callback == nil {
 		return nil
 	}
-	return &DeadlineScheduler{timers: make(map[string]*time.Timer), callback: callback}
+	return &DeadlineScheduler{
+		timers:   make(map[string]scheduledTimer),
+		callback: callback,
+	}
 }
 
-// Schedule replaces the timer for task's kind and ID. Generation validation
-// belongs to the callback command because an already-running old timer cannot
-// be synchronously cancelled without blocking publication or shutdown.
+// Schedule replaces the active timer for task's kind and ID when task is newer
+// than the currently active task. Generation validation still belongs to the
+// callback command because an already-running old timer cannot be synchronously
+// cancelled without blocking publication or shutdown.
 func (s *DeadlineScheduler) Schedule(task DeadlineTask) {
 	if s == nil || task.Kind == "" || task.ID <= 0 || task.Generation == 0 || task.Deadline <= 0 {
 		return
@@ -52,12 +63,17 @@ func (s *DeadlineScheduler) Schedule(task DeadlineTask) {
 		s.mu.Unlock()
 		return
 	}
-	if timer := s.timers[key]; timer != nil {
-		timer.Stop()
+	if active, ok := s.timers[key]; ok {
+		if task.Generation <= active.task.Generation {
+			s.mu.Unlock()
+			return
+		}
+		active.timer.Stop()
 	}
-	s.timers[key] = time.AfterFunc(delay, func() {
+	timer := time.AfterFunc(delay, func() {
 		s.mu.Lock()
-		if s.closed {
+		active, ok := s.timers[key]
+		if s.closed || !ok || active.task != task {
 			s.mu.Unlock()
 			return
 		}
@@ -67,19 +83,21 @@ func (s *DeadlineScheduler) Schedule(task DeadlineTask) {
 		defer s.wg.Done()
 		s.callback(task)
 	})
+	s.timers[key] = scheduledTimer{task: task, timer: timer}
 	s.mu.Unlock()
 }
 
-// Cancel stops the pending timer for kind and ID. An in-flight callback remains
-// harmless because its expected generation cannot match a replacement state.
-func (s *DeadlineScheduler) Cancel(kind string, id int64) {
-	if s == nil || kind == "" || id <= 0 {
+// Cancel stops the pending timer for kind and ID when its generation is not
+// newer than generation. An in-flight callback remains harmless because its
+// expected generation cannot match the replacement state.
+func (s *DeadlineScheduler) Cancel(kind string, id int64, generation uint64) {
+	if s == nil || kind == "" || id <= 0 || generation == 0 {
 		return
 	}
 	key := deadlineTaskKey(kind, id)
 	s.mu.Lock()
-	if timer := s.timers[key]; timer != nil {
-		timer.Stop()
+	if active, ok := s.timers[key]; ok && active.task.Generation <= generation {
+		active.timer.Stop()
 		delete(s.timers, key)
 	}
 	s.mu.Unlock()
@@ -94,8 +112,8 @@ func (s *DeadlineScheduler) Close(ctx context.Context) error {
 	s.mu.Lock()
 	if !s.closed {
 		s.closed = true
-		for key, timer := range s.timers {
-			timer.Stop()
+		for key, active := range s.timers {
+			active.timer.Stop()
 			delete(s.timers, key)
 		}
 	}

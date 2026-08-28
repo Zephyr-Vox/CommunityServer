@@ -54,6 +54,48 @@ func StateEventTemplates(change StateChange, version *realtime.StateVersion) ([]
 			return nil, err
 		}
 		events = append(events, realtime.StateEventTemplate{EventType: change.EventType, Scope: scope, Data: data})
+	case "owner.transferred":
+		if change.PreviousOwnerID <= 0 || change.NewOwnerID <= 0 {
+			return nil, errors.New("rbac control: invalid owner transfer event")
+		}
+		transferData, err := json.Marshal(struct {
+			PreviousOwnerID string `json:"previous_owner_id"`
+			NewOwnerID      string `json:"new_owner_id"`
+		}{
+			PreviousOwnerID: strconv.FormatInt(change.PreviousOwnerID, 10),
+			NewOwnerID:      strconv.FormatInt(change.NewOwnerID, 10),
+		})
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, realtime.StateEventTemplate{
+			EventType: "owner.transferred",
+			Scope:     realtime.Scope{Type: "server"},
+			Data:      transferData,
+		})
+		bindingData, err := json.Marshal(struct {
+			Scope         stateScope `json:"scope"`
+			EntityVersion string     `json:"entity_version"`
+		}{Scope: stateScopeFrom(realtime.Scope{Type: "server"}), EntityVersion: strconv.FormatUint(version.Number(), 10)})
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, realtime.StateEventTemplate{
+			EventType: "rbac.binding.updated",
+			Scope:     realtime.Scope{Type: "server"},
+			Data:      bindingData,
+		})
+		for _, moderationScope := range uniqueScopes(change.ModerationScopes) {
+			data, err := moderationMuteRemovedData(moderationScope, version.ModerationEpoch())
+			if err != nil {
+				return nil, err
+			}
+			events = append(events, realtime.StateEventTemplate{
+				EventType: "moderation.mute.removed",
+				Scope:     moderationScope,
+				Data:      data,
+			})
+		}
 	default:
 		return nil, errors.New("rbac control: invalid state change")
 	}
@@ -76,6 +118,33 @@ func StateEventTemplates(change StateChange, version *realtime.StateVersion) ([]
 		})
 	}
 	return events, nil
+}
+
+// uniqueScopes removes duplicate moderation invalidation scopes while
+// preserving the deterministic order supplied by the mutation command.
+func uniqueScopes(scopes []realtime.Scope) []realtime.Scope {
+	seen := make(map[realtime.Scope]struct{}, len(scopes))
+	unique := make([]realtime.Scope, 0, len(scopes))
+	for _, scope := range scopes {
+		if _, exists := seen[scope]; exists {
+			continue
+		}
+		seen[scope] = struct{}{}
+		unique = append(unique, scope)
+	}
+	return unique
+}
+
+// moderationMuteRemovedData builds the compact cache invalidation payload used
+// when an owner transfer removes all mutes for one scope.
+func moderationMuteRemovedData(scope realtime.Scope, epoch uint64) ([]byte, error) {
+	return json.Marshal(struct {
+		Scope           stateScope `json:"scope"`
+		ModerationEpoch string     `json:"moderation_epoch"`
+	}{
+		Scope:           stateScopeFrom(scope),
+		ModerationEpoch: strconv.FormatUint(epoch, 10),
+	})
 }
 
 // stateScope is the JSON-safe scope representation used inside RBAC cache

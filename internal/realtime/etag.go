@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 var (
@@ -50,6 +51,22 @@ func NumericEntityETag(kind string, id, version int64) (string, error) {
 		return "", ErrInvalidEntityETag
 	}
 	return EntityETag(kind, strconv.FormatInt(id, 10), version)
+}
+
+// StrongETagValid reports whether value is one quoted strong ETag. It rejects
+// wildcards, weak tags, comma-joined tag lists, and quoted-string escapes so
+// HTTP precondition handlers can distinguish malformed input from a stale
+// resource version before entering a mutation command.
+func StrongETagValid(value string) bool {
+	if len(value) < 3 || value[0] != '"' || value[len(value)-1] != '"' || strings.Contains(value, ",") {
+		return false
+	}
+	for _, character := range value[1 : len(value)-1] {
+		if character == '"' || character == '\\' || character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // EffectiveConfigETagInput identifies the complete fact represented by one

@@ -335,6 +335,23 @@ func TestETagAndCursorContracts(t *testing.T) {
 	}
 }
 
+func TestStrongETagValidation(t *testing.T) {
+	tests := map[string]bool{
+		`"group:42:7"`:     true,
+		`"config-digest"`:  true,
+		`group:42:7`:       false,
+		`W/"group:42:7"`:   false,
+		`*`:                false,
+		`"group:42:7","x"`: false,
+		`"group:42:\\7"`:   false,
+	}
+	for value, want := range tests {
+		if got := realtime.StrongETagValid(value); got != want {
+			t.Errorf("StrongETagValid(%q) = %t, want %t", value, got, want)
+		}
+	}
+}
+
 func newStores(t *testing.T) *store.Stores {
 	t.Helper()
 	conn, err := store.Open(filepath.Join(t.TempDir(), "realtime.db"))

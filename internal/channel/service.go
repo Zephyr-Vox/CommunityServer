@@ -835,6 +835,10 @@ func (s *Service) DeleteGroup(ctx context.Context, actorID, groupID int64, expec
 		if err != nil {
 			return mutationValue{}, err
 		}
+		events, err = appendModerationMuteRemovedEvent(events, realtime.Scope{Type: "group", ID: group.ID}, version, candidate, beforeUsers)
+		if err != nil {
+			return mutationValue{}, err
+		}
 		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
@@ -1017,6 +1021,10 @@ func (s *Service) DeleteChannel(ctx context.Context, actorID, channelID int64, e
 			return mutationValue{}, err
 		}
 		events, err := channelDeletedEvents(channel, beforeUsers)
+		if err != nil {
+			return mutationValue{}, err
+		}
+		events, err = appendModerationMuteRemovedEvent(events, realtime.Scope{Type: "channel", ID: channel.ID}, version, candidate, beforeUsers)
 		if err != nil {
 			return mutationValue{}, err
 		}
@@ -1758,6 +1766,10 @@ func (s *Service) ExpireTemporary(ctx context.Context, channelID int64, generati
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
+			events, err = appendModerationMuteRemovedEvent(events, realtime.Scope{Type: "channel", ID: channel.ID}, version, candidate, beforeUsers)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
 			if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
 				return realtime.CommandOutput{}, err
 			}
@@ -1938,6 +1950,53 @@ func channelDeletedEvents(channel realtime.Channel, visibleBeforeUserIDs []int64
 		DeliveryPolicy:       realtime.StateDeliveryVisibleBefore,
 		VisibleBeforeUserIDs: visibleBeforeUserIDs,
 	}}, nil
+}
+
+// appendModerationMuteRemovedEvent adds one visible-before moderation
+// invalidation when deleting a resource cascades at least one mute. The
+// resource and moderation tombstones share the same publication candidate, so
+// consumers observe the final moderation epoch together with the deletion.
+func appendModerationMuteRemovedEvent(events []realtime.StateEventTemplate, scope realtime.Scope, before *realtime.StateVersion, candidate *realtime.StateCandidate, visibleBeforeUserIDs []int64) ([]realtime.StateEventTemplate, error) {
+	if before == nil || candidate == nil || candidate.Version() == nil {
+		return nil, realtime.ErrInvalidPublication
+	}
+	for _, mute := range before.Mutes() {
+		if mute.Scope != scope {
+			continue
+		}
+		if err := candidate.IncrementModerationEpoch(); err != nil {
+			return nil, err
+		}
+		var id *string
+		if scope.Type != "server" {
+			value := strconv.FormatInt(scope.ID, 10)
+			id = &value
+		}
+		data, err := json.Marshal(struct {
+			Scope struct {
+				Type string  `json:"type"`
+				ID   *string `json:"id,omitempty"`
+			} `json:"scope"`
+			ModerationEpoch string `json:"moderation_epoch"`
+		}{
+			Scope: struct {
+				Type string  `json:"type"`
+				ID   *string `json:"id,omitempty"`
+			}{Type: scope.Type, ID: id},
+			ModerationEpoch: strconv.FormatUint(candidate.Version().ModerationEpoch(), 10),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return append(events, realtime.StateEventTemplate{
+			EventType:            "moderation.mute.removed",
+			Scope:                scope,
+			Data:                 data,
+			DeliveryPolicy:       realtime.StateDeliveryVisibleBefore,
+			VisibleBeforeUserIDs: append([]int64(nil), visibleBeforeUserIDs...),
+		}), nil
+	}
+	return events, nil
 }
 
 // snapshotGroup converts one immutable group into the canonical wire payload.

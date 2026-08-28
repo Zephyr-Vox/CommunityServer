@@ -333,7 +333,7 @@ func normalizeStateEvent(event StateEvent) (StateEvent, error) {
 		return StateEvent{}, ErrInvalidStateEvent
 	}
 	if event.DeliveryPolicy == StateDeliveryVisibleBefore {
-		if event.EventType != "group.deleted" && event.EventType != "channel.deleted" {
+		if event.EventType != "group.deleted" && event.EventType != "channel.deleted" && event.EventType != "moderation.mute.removed" {
 			return StateEvent{}, ErrInvalidStateEvent
 		}
 		for index, userID := range event.VisibleBeforeUserIDs {

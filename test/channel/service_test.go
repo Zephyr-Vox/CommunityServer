@@ -437,10 +437,21 @@ func TestResourceHandlersVerifyETagsAndCheckpointHeaders(t *testing.T) {
 	missing.Header.Set("Idempotency-Key", "handler-missing-0001")
 	missingRec := httptest.NewRecorder()
 	app.ServeHTTP(missingRec, missing)
-	if missingRec.Code != http.StatusPreconditionFailed {
+	if missingRec.Code != http.StatusBadRequest {
 		t.Fatalf("missing If-Match status = %d, body = %s", missingRec.Code, missingRec.Body.String())
 	}
-	assertEnvelopeCode(t, missingRec, 2)
+	assertEnvelopeCode(t, missingRec, 1000)
+
+	combined := httptest.NewRequest(http.MethodPatch, "/api/v0/groups/"+strconv.FormatInt(groupID, 10), strings.NewReader(`{"name":"Combined"}`))
+	combined.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	combined.Header.Set("If-Match", etag+`, "group:other:1"`)
+	combined.Header.Set("Idempotency-Key", "handler-combined-0001")
+	combinedRec := httptest.NewRecorder()
+	app.ServeHTTP(combinedRec, combined)
+	if combinedRec.Code != http.StatusBadRequest {
+		t.Fatalf("combined If-Match status = %d, body = %s", combinedRec.Code, combinedRec.Body.String())
+	}
+	assertEnvelopeCode(t, combinedRec, 1000)
 
 	patch := httptest.NewRequest(http.MethodPatch, "/api/v0/groups/"+strconv.FormatInt(groupID, 10), strings.NewReader(`{"name":"Renamed"}`))
 	patch.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
@@ -454,6 +465,79 @@ func TestResourceHandlersVerifyETagsAndCheckpointHeaders(t *testing.T) {
 	if patchRec.Header().Get("X-Zephyr-Stream-Epoch") != testEpoch || patchRec.Header().Get("X-Zephyr-Geid") == "" {
 		t.Fatalf("checkpoint headers = %+v", patchRec.Header())
 	}
+}
+
+// TestChannelDeletePublishesCascadedMuteInvalidation verifies a database
+// cascade is represented in the same immutable publication as its tombstone.
+func TestChannelDeletePublishesCascadedMuteInvalidation(t *testing.T) {
+	fixture := newFixture(t)
+	ctx := context.Background()
+
+	group, _, err := fixture.service.CreateGroup(ctx, fixture.adminID, channel.CreateGroupInput{Name: "Moderated", Position: 1, Visibility: "public"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupID := mustID(t, group.ID)
+	channelSnapshot, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		GroupID:    &groupID,
+		Name:       "Voice",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channelID := mustID(t, channelSnapshot.ID)
+	if _, err := fixture.stores.Mutes.Create(ctx, store.MuteInput{
+		ScopeType: "channel",
+		ChannelID: &channelID,
+		UserID:    fixture.memberID,
+		Kind:      "voice",
+		CreatedBy: &fixture.adminID,
+		Reason:    "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := fixture.state.BuildPersistentCandidate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.publication.Commit(realtime.PublicationRequest{Candidate: candidate}); err != nil {
+		t.Fatal(err)
+	}
+
+	etag, err := realtime.NumericEntityETag("channel", channelID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.service.DeleteChannel(ctx, fixture.adminID, channelID, etag); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.state.Current().ModerationEpoch() != 1 {
+		t.Fatalf("moderation epoch = %d, want 1", fixture.state.Current().ModerationEpoch())
+	}
+
+	for _, event := range fixture.publication.Capture().Events {
+		if event.EventType != "moderation.mute.removed" || event.Scope != (realtime.Scope{Type: "channel", ID: channelID}) {
+			continue
+		}
+		if event.DeliveryPolicy != realtime.StateDeliveryVisibleBefore {
+			t.Fatalf("mute removal policy = %d, want visible-before", event.DeliveryPolicy)
+		}
+		var data struct {
+			ModerationEpoch string `json:"moderation_epoch"`
+		}
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		if data.ModerationEpoch != "1" {
+			t.Fatalf("mute removal data = %s", event.Data)
+		}
+		return
+	}
+	t.Fatal("cascaded moderation.mute.removed event missing")
 }
 
 // newChannelEcho mounts the resource routes behind a deterministic test AuthN
@@ -599,6 +683,7 @@ func contains(values []string, want string) bool {
 // fixture owns an isolated sequenced channel service and its seeded users.
 type fixture struct {
 	service     *channel.Service
+	stores      *store.Stores
 	state       *realtime.StateStore
 	publication *realtime.StatePublication
 	visibility  *realtime.VisibilityResolver
@@ -678,6 +763,7 @@ func newFixture(t *testing.T) fixture {
 	service.SetStateCursorIssuer(testCursorIssuer{signer: cursorSigner})
 	return fixture{
 		service:     service,
+		stores:      stores,
 		state:       state,
 		publication: publication,
 		visibility:  visibility,

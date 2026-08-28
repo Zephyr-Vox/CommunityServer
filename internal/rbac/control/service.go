@@ -72,10 +72,13 @@ type Service struct {
 // realtime projection refresh. UserIDs receive targeted self.updated events
 // when their effective roles or permissions may have changed.
 type StateChange struct {
-	EventType string
-	RoleKey   string
-	UserIDs   []int64
-	Scope     realtime.Scope
+	EventType        string
+	RoleKey          string
+	UserIDs          []int64
+	Scope            realtime.Scope
+	PreviousOwnerID  int64
+	NewOwnerID       int64
+	ModerationScopes []realtime.Scope
 }
 
 // MutationGate serializes one persistent RBAC transaction with its following
@@ -439,15 +442,49 @@ func (s *Service) TransferOwner(ctx context.Context, currentUserID, targetUserID
 	completion, err := s.runMutation(ctx, []int64{currentUserID, targetUserID}, func(any) (int, any, store.IdempotencyHeaders) {
 		return http.StatusOK, ownerTransferResponse{PreviousOwnerID: currentUserID, NewOwnerID: targetUserID}, store.IdempotencyHeaders{}
 	}, func(commandCtx context.Context, txStores *store.Stores) (mutationResult, error) {
+		version, err := s.currentState()
+		if err != nil {
+			return mutationResult{}, err
+		}
+		moderationScopes := muteScopesForUser(version, targetUserID)
 		if err := txStores.TransferOwnerInTx(commandCtx, currentUserID, targetUserID); err != nil {
 			return mutationResult{}, err
 		}
-		return mutationResult{change: StateChange{EventType: "rbac.binding.updated", UserIDs: []int64{currentUserID, targetUserID}, Scope: realtime.Scope{Type: "server"}}}, nil
+		return mutationResult{change: StateChange{
+			EventType:        "owner.transferred",
+			UserIDs:          []int64{currentUserID, targetUserID},
+			Scope:            realtime.Scope{Type: "server"},
+			PreviousOwnerID:  currentUserID,
+			NewOwnerID:       targetUserID,
+			ModerationScopes: moderationScopes,
+		}}, nil
 	})
 	if err != nil {
 		return StateCommand{}, err
 	}
 	return completion.state, nil
+}
+
+// muteScopesForUser returns the distinct moderation scopes whose mutes will be
+// removed when userID becomes the new owner. StateVersion.Mutes is ID ordered,
+// so preserving first occurrence also gives deterministic event ordering.
+func muteScopesForUser(version *realtime.StateVersion, userID int64) []realtime.Scope {
+	if version == nil || userID <= 0 {
+		return nil
+	}
+	seen := make(map[realtime.Scope]struct{})
+	scopes := make([]realtime.Scope, 0)
+	for _, mute := range version.Mutes() {
+		if mute.UserID != userID {
+			continue
+		}
+		if _, exists := seen[mute.Scope]; exists {
+			continue
+		}
+		seen[mute.Scope] = struct{}{}
+		scopes = append(scopes, mute.Scope)
+	}
+	return scopes
 }
 
 // GetConfig returns the requested visible scope's local snapshot, effective

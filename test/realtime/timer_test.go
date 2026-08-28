@@ -34,3 +34,34 @@ func TestDeadlineSchedulerReplacesGenerationAndCloses(t *testing.T) {
 	default:
 	}
 }
+
+func TestDeadlineSchedulerRejectsStaleSchedulesAndCancellations(t *testing.T) {
+	called := make(chan realtime.DeadlineTask, 1)
+	scheduler := realtime.NewDeadlineScheduler(func(task realtime.DeadlineTask) { called <- task })
+	if scheduler == nil {
+		t.Fatal("nil scheduler")
+	}
+	defer func() {
+		if err := scheduler.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	scheduler.Schedule(realtime.DeadlineTask{Kind: "mute", ID: 8, Generation: 2, Deadline: time.Now().Add(20 * time.Millisecond).UnixMilli()})
+	scheduler.Schedule(realtime.DeadlineTask{Kind: "mute", ID: 8, Generation: 1, Deadline: time.Now().Add(-time.Millisecond).UnixMilli()})
+	select {
+	case task := <-called:
+		t.Fatalf("stale schedule invoked callback: %+v", task)
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	scheduler.Cancel("mute", 8, 1)
+	select {
+	case task := <-called:
+		if task.Generation != 2 {
+			t.Fatalf("callback generation = %d, want 2", task.Generation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active schedule was cancelled by an older cancellation")
+	}
+}

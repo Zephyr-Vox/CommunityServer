@@ -152,6 +152,11 @@ func (s *Service) runMutation(ctx context.Context, userIDs []int64, response mut
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
+			if result.change.EventType == "owner.transferred" && len(result.change.ModerationScopes) > 0 {
+				if err := candidate.IncrementModerationEpoch(); err != nil {
+					return realtime.CommandOutput{}, err
+				}
+			}
 			events, err := StateEventTemplates(result.change, candidate.Version())
 			if err != nil {
 				return realtime.CommandOutput{}, err

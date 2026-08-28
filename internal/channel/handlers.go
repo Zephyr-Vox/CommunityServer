@@ -133,9 +133,9 @@ func GetGroupHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 group not found: the group is absent or inaccessible to the actor
-//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 2 precondition failed: If-Match does not exactly match
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: id is invalid or the patch is empty/invalid
+//   - 1000 invalid request parameters: id, If-Match, or patch fields are invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: group.manage is not currently granted at group scope
@@ -166,7 +166,10 @@ func UpdateGroupHandler(svc *Service) echo.HandlerFunc {
 			Position:   req.Position,
 			Visibility: req.Visibility,
 		}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPatch, "/api/v0/groups/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(groupID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, input)
 		if err != nil {
 			return err
@@ -203,10 +206,10 @@ func UpdateGroupHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 group not found: the group is absent or inaccessible to the actor
-//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 2 precondition failed: If-Match does not exactly match
 //   - 3 group not empty: a channel still belongs to the group
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: id is not a positive decimal snowflake ID
+//   - 1000 invalid request parameters: id or If-Match is invalid
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: group.manage is not currently granted at group scope
 //   - 1009 internal: persistent command or publication failed
@@ -225,7 +228,10 @@ func DeleteGroupHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
 		}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/groups/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(groupID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, struct{}{})
 		if err != nil {
 			return err
@@ -402,10 +408,10 @@ func GetChannelHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 channel or destination group not found: target is absent or inaccessible
-//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 2 precondition failed: If-Match does not exactly match
 //   - 3 invalid channel state: capacity would fall below active membership
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: id is invalid or the patch is empty/invalid
+//   - 1000 invalid request parameters: id, If-Match, or patch fields are invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: required scoped authority is not currently granted
@@ -448,7 +454,10 @@ func UpdateChannelHandler(svc *Service) echo.HandlerFunc {
 			Position:   req.Position,
 			Pinned:     req.Pinned,
 		}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPatch, "/api/v0/channels/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(channelID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, input)
 		if err != nil {
 			return err
@@ -487,10 +496,10 @@ func UpdateChannelHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 channel not found: the channel is absent or inaccessible to the actor
-//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 2 precondition failed: If-Match does not exactly match
 //   - 3 channel active: active voice authority cannot be orphaned by deletion
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: id is not a positive decimal snowflake ID
+//   - 1000 invalid request parameters: id or If-Match is invalid
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: channel.manage is not currently granted at channel scope
 //   - 1009 internal: persistent command or publication failed
@@ -509,7 +518,10 @@ func DeleteChannelHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("path.id", "must be a positive decimal snowflake ID")
 		}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/channels/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(channelID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, struct{}{})
 		if err != nil {
 			return err
@@ -583,10 +595,10 @@ func ListGroupAccessHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 group or access principal not found: a referenced resource is absent or inaccessible
-//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 2 precondition failed: If-Match does not exactly match
 //   - 4 resource limit reached: the group already has 1024 ACL entries
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: id or principal shape is invalid
+//   - 1000 invalid request parameters: id, If-Match, or principal shape is invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: group.manage is not currently granted at group scope
@@ -617,7 +629,10 @@ func AddGroupAccessHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("body.principal", "must contain exactly one valid principal matching principal_type")
 		}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/groups/:id/access", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(groupID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, accessPrincipal)
 		if err != nil {
 			return err
@@ -662,9 +677,9 @@ func AddGroupAccessHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 group or access entry not found: a referenced resource is absent or inaccessible
-//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 2 precondition failed: If-Match does not exactly match
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: id or access_id is invalid
+//   - 1000 invalid request parameters: id, access_id, or If-Match is invalid
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: group.manage is not currently granted at group scope
 //   - 1009 internal: persistent command or publication failed
@@ -686,7 +701,10 @@ func DeleteGroupAccessHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("path.access_id", "must be a positive decimal snowflake ID")
 		}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/groups/:id/access/:access_id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(groupID, 10)}, {Name: "access_id", Value: strconv.FormatInt(accessID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, struct{}{})
 		if err != nil {
 			return err
@@ -762,7 +780,7 @@ func ListChannelAccessHandler(svc *Service) echo.HandlerFunc {
 //   - 4 resource limit reached: a group or channel already has 1024 ACL entries
 //   - 5 private parent access required: the principal lacks an ACL entry for the private parent
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: id or principal shape is invalid
+//   - 1000 invalid request parameters: id, If-Match, parent If-Match, or principal shape is invalid
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: channel.invite or required parent group.manage is not currently granted
@@ -791,8 +809,17 @@ func AddChannelAccessHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("body.principal", "must contain exactly one valid principal matching principal_type")
 		}
-		expectedETag := exactIfMatch(c)
-		expectedParentETag := exactParentIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
+		expectedParentETag := ""
+		if req.GrantParent {
+			expectedParentETag, err = exactParentIfMatch(c)
+			if err != nil {
+				return err
+			}
+		}
 		input := ChannelAccessInput{
 			Principal:   accessPrincipal,
 			GrantParent: req.GrantParent,
@@ -843,9 +870,9 @@ func AddChannelAccessHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 channel or access entry not found: a referenced resource is absent or inaccessible
-//   - 2 precondition failed: If-Match is missing or does not exactly match
+//   - 2 precondition failed: If-Match does not exactly match
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: id or access_id is invalid
+//   - 1000 invalid request parameters: id, access_id, or If-Match is invalid
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: channel.invite is not currently granted at channel scope
 //   - 1009 internal: persistent command or publication failed
@@ -867,7 +894,10 @@ func DeleteChannelAccessHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.InvalidField("path.access_id", "must be a positive decimal snowflake ID")
 		}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodDelete, "/api/v0/channels/:id/access/:access_id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(channelID, 10)}, {Name: "access_id", Value: strconv.FormatInt(accessID, 10)}}, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, struct{}{})
 		if err != nil {
 			return err
@@ -951,24 +981,24 @@ func pathID(raw string) (int64, error) {
 }
 
 // exactIfMatch returns one exact If-Match field value. Missing or repeated
-// fields deliberately fail the service's strict strong-ETag comparison.
-func exactIfMatch(c *echo.Context) string {
+// fields are request validation errors rather than resource conflicts.
+func exactIfMatch(c *echo.Context) (string, error) {
 	values := c.Request().Header.Values("If-Match")
-	if len(values) != 1 {
-		return ""
+	if len(values) != 1 || !realtime.StrongETagValid(values[0]) {
+		return "", api.InvalidField("header.If-Match", "must contain exactly one strong ETag")
 	}
-	return values[0]
+	return values[0], nil
 }
 
 // exactParentIfMatch returns one exact parent group precondition supplied for a
-// channel grant_parent mutation. It intentionally rejects repeated values just
-// like the ordinary resource If-Match helper.
-func exactParentIfMatch(c *echo.Context) string {
+// channel grant_parent mutation. Missing or repeated fields are request
+// validation errors rather than resource conflicts.
+func exactParentIfMatch(c *echo.Context) (string, error) {
 	values := c.Request().Header.Values("X-Zephyr-Parent-If-Match")
-	if len(values) != 1 {
-		return ""
+	if len(values) != 1 || !realtime.StrongETagValid(values[0]) {
+		return "", api.InvalidField("header.X-Zephyr-Parent-If-Match", "must contain exactly one strong ETag")
 	}
-	return values[0]
+	return values[0], nil
 }
 
 // accessPrincipalFromRequest parses a JSON ACL request into the exact-one

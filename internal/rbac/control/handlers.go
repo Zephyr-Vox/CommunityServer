@@ -481,12 +481,12 @@ func GetConfigHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 invalid scope: scope and scope ID do not match
-//   - 2 precondition failed: If-Match is missing or does not match effective config
+//   - 2 precondition failed: If-Match does not match effective config
 //   - 3 permission protected: request grants a permission the actor lacks
 //   - 4 scope not found
 //   - 5 invalid config: roles or permissions violate config constraints
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: field validation failed
+//   - 1000 invalid request parameters: field validation or If-Match failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing role.manage permission
@@ -512,7 +512,10 @@ func UpdateConfigHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.NewError(codeInvalidScope, http.StatusBadRequest, "invalid permission config scope")
 		}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		input := ConfigInput{Scope: scope, Config: req.Config}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPut, "/api/v0/rbac/config", nil, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, input)
 		if err != nil {
@@ -558,11 +561,11 @@ func UpdateConfigHandler(svc *Service) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 invalid scope: scope and scope ID do not match
-//   - 2 precondition failed: If-Match is missing or does not match effective config
+//   - 2 precondition failed: If-Match does not match effective config
 //   - 3 permission protected: reset would grant a permission the actor lacks
 //   - 4 scope not found
 //   - 9 idempotency mismatch: the retry key belongs to another request
-//   - 1000 invalid request parameters: field validation failed
+//   - 1000 invalid request parameters: field validation or If-Match failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing role.manage permission
@@ -587,7 +590,10 @@ func ResetConfigHandler(svc *Service) echo.HandlerFunc {
 		if err != nil {
 			return api.NewError(codeInvalidScope, http.StatusBadRequest, "invalid permission config scope")
 		}
-		expectedETag := exactIfMatch(c)
+		expectedETag, err := exactIfMatch(c)
+		if err != nil {
+			return err
+		}
 		identity, err := realtime.NewHTTPCommandIdentity(principal.UserID, http.MethodPost, "/api/v0/rbac/config/reset", nil, []realtime.CanonicalField{{Name: "If-Match", Value: expectedETag}}, scope)
 		if err != nil {
 			return err
@@ -653,13 +659,13 @@ func parsePositiveID(raw string) (int64, error) {
 }
 
 // exactIfMatch returns one exact If-Match field value. Missing or repeated
-// field values deliberately fail the strong precondition inside Service.
-func exactIfMatch(c *echo.Context) string {
+// fields are request validation errors rather than resource conflicts.
+func exactIfMatch(c *echo.Context) (string, error) {
 	values := c.Request().Header.Values("If-Match")
-	if len(values) != 1 {
-		return ""
+	if len(values) != 1 || !realtime.StrongETagValid(values[0]) {
+		return "", api.InvalidField("header.If-Match", "must contain exactly one strong ETag")
 	}
-	return values[0]
+	return values[0], nil
 }
 
 // idempotencyKey validates the one required retry key field for an RBAC

@@ -314,6 +314,7 @@ func (s *Service) Update(ctx context.Context, actorID, muteID int64, expectedETa
 			return mutationValue{}, err
 		}
 		var schedule *realtime.ExpirySchedule
+		var cancelGeneration uint64
 		if expiresAt != nil {
 			next, err := candidate.ScheduleMuteExpiry(muteID, *expiresAt)
 			if err != nil {
@@ -322,6 +323,8 @@ func (s *Service) Update(ctx context.Context, actorID, muteID int64, expectedETa
 			schedule = &next
 		} else {
 			candidate.ClearMuteExpiry(muteID)
+			cleared, _ := candidate.Version().MuteExpiry(muteID)
+			cancelGeneration = cleared.Generation
 		}
 		updated, exists := candidate.Version().Mute(updatedRow.ID)
 		if !exists {
@@ -334,13 +337,19 @@ func (s *Service) Update(ctx context.Context, actorID, muteID int64, expectedETa
 		if _, err := reserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
-		return mutationValue{mute: muteResponseFromState(updated), muteID: muteID, schedule: schedule, cancelSchedule: expiresAt == nil}, nil
+		return mutationValue{
+			mute:             muteResponseFromState(updated),
+			muteID:           muteID,
+			schedule:         schedule,
+			cancelSchedule:   expiresAt == nil,
+			cancelGeneration: cancelGeneration,
+		}, nil
 	})
 	if err != nil {
 		return muteResponse{}, StateCommand{}, err
 	}
 	if result.value.cancelSchedule {
-		s.cancelSchedule(result.value.muteID)
+		s.cancelSchedule(result.value.muteID, result.value.cancelGeneration)
 	}
 	s.scheduleResult(result.value.muteID, result.value.schedule)
 	return result.value.mute, result.state, nil
@@ -384,6 +393,7 @@ func (s *Service) Delete(ctx context.Context, actorID, muteID int64, expectedETa
 			return mutationValue{}, err
 		}
 		candidate.ClearMuteExpiry(muteID)
+		cleared, _ := candidate.Version().MuteExpiry(muteID)
 		events, err := muteRemovedEvents(mute.Scope, candidate.Version())
 		if err != nil {
 			return mutationValue{}, err
@@ -391,24 +401,25 @@ func (s *Service) Delete(ctx context.Context, actorID, muteID int64, expectedETa
 		if _, err := reserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
-		return mutationValue{cancelSchedule: true}, nil
+		return mutationValue{cancelSchedule: true, cancelGeneration: cleared.Generation}, nil
 	})
 	if err != nil {
 		return StateCommand{}, err
 	}
 	if result.value.cancelSchedule {
-		s.cancelSchedule(muteID)
+		s.cancelSchedule(muteID, result.value.cancelGeneration)
 	}
 	return result.state, nil
 }
 
 // mutationValue carries one command-owned mute DTO or no-op marker.
 type mutationValue struct {
-	mute           muteResponse
-	muteID         int64
-	schedule       *realtime.ExpirySchedule
-	cancelSchedule bool
-	noop           bool
+	mute             muteResponse
+	muteID           int64
+	schedule         *realtime.ExpirySchedule
+	cancelSchedule   bool
+	cancelGeneration uint64
+	noop             bool
 }
 
 // mutationResult combines the command result with its final published state.
@@ -629,9 +640,9 @@ func (s *Service) scheduleResult(muteID int64, schedule *realtime.ExpirySchedule
 }
 
 // cancelSchedule stops one pending mute timer after a published cancellation.
-func (s *Service) cancelSchedule(muteID int64) {
+func (s *Service) cancelSchedule(muteID int64, generation uint64) {
 	if s.scheduler != nil {
-		s.scheduler.Cancel("mute", muteID)
+		s.scheduler.Cancel("mute", muteID, generation)
 	}
 }
 
