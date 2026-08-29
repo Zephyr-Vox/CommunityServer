@@ -212,10 +212,20 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		conn.Close()
 		return nil, err
 	}
+	accountRuntime, err := auth.NewStateMutationRuntime(stores, principals, app.state, app.sequencer, app.mutationGate)
+	if err != nil {
+		_ = app.stopRealtime(context.Background())
+		conn.Close()
+		return nil, fmt.Errorf("server: account mutation runtime: %w", err)
+	}
 	register.SetStateMutationGate(app.mutationGate)
+	register.SetStateCommandRuntime(accountRuntime)
 	activate.SetStateMutationGate(app.mutationGate)
+	activate.SetStateCommandRuntime(accountRuntime)
 	users.SetStateMutationGate(app.mutationGate)
+	users.SetStateCommandRuntime(accountRuntime)
 	authSvc.SetStateMutationGate(app.mutationGate)
+	authSvc.SetStateCommandRuntime(accountRuntime)
 	avatarSvc.SetStateMutationGate(app.mutationGate)
 	channels.SetStateMutationGate(app.mutationGate)
 	channels.SetDurableIdempotency(durableCommands)

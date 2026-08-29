@@ -38,6 +38,7 @@ type ActivationManager struct {
 	durable   *realtime.DurableActivationIdempotency
 	publisher StateChangePublisher
 	gate      MutationGate
+	runtime   *StateMutationRuntime
 }
 
 // SetStateChangePublisher installs the post-commit realtime projection bridge
@@ -49,6 +50,12 @@ func (m *ActivationManager) SetStateChangePublisher(publisher StateChangePublish
 
 // SetStateMutationGate installs the process-wide persistent mutation gate.
 func (m *ActivationManager) SetStateMutationGate(gate MutationGate) { m.gate = gate }
+
+// SetStateCommandRuntime installs the ordered account mutation runtime. It is
+// configured once during server assembly before activation is exposed.
+func (m *ActivationManager) SetStateCommandRuntime(runtime *StateMutationRuntime) {
+	m.runtime = runtime
+}
 
 // NewActivationManager returns an ActivationManager bound to stores. identityKey
 // must be stable across restarts and contain at least 256 bits; it protects the

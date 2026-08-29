@@ -54,6 +54,7 @@ type UserService struct {
 	connections   ConnectionRevoker
 	publisher     StateChangePublisher
 	gate          MutationGate
+	runtime       *StateMutationRuntime
 }
 
 // SetStateChangePublisher installs the post-commit realtime projection bridge
@@ -65,6 +66,12 @@ func (s *UserService) SetStateChangePublisher(publisher StateChangePublisher) {
 
 // SetStateMutationGate installs the process-wide persistent mutation gate.
 func (s *UserService) SetStateMutationGate(gate MutationGate) { s.gate = gate }
+
+// SetStateCommandRuntime installs the ordered account mutation runtime. It is
+// configured once during server assembly before user mutations are exposed.
+func (s *UserService) SetStateCommandRuntime(runtime *StateMutationRuntime) {
+	s.runtime = runtime
+}
 
 // SetConnectionRevoker installs the lifecycle owner notified after kick, ban,
 // and account deletion. Server assembly calls it before routes accept requests.

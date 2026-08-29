@@ -34,6 +34,7 @@ type RegisterService struct {
 	mode      RegistrationMode
 	publisher StateChangePublisher
 	gate      MutationGate
+	runtime   *StateMutationRuntime
 }
 
 // SetStateChangePublisher installs the post-commit realtime projection bridge.
@@ -45,6 +46,12 @@ func (s *RegisterService) SetStateChangePublisher(publisher StateChangePublisher
 
 // SetStateMutationGate installs the process-wide persistent mutation gate.
 func (s *RegisterService) SetStateMutationGate(gate MutationGate) { s.gate = gate }
+
+// SetStateCommandRuntime installs the ordered account mutation runtime. It is
+// configured once during server assembly before registration is exposed.
+func (s *RegisterService) SetStateCommandRuntime(runtime *StateMutationRuntime) {
+	s.runtime = runtime
+}
 
 // NewRegisterService returns a RegisterService.
 func NewRegisterService(stores *store.Stores, mode RegistrationMode) *RegisterService {

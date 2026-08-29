@@ -50,6 +50,7 @@ type AuthService struct {
 	connections ConnectionRevoker
 	publisher   StateChangePublisher
 	gate        MutationGate
+	runtime     *StateMutationRuntime
 }
 
 // SetConnectionRevoker installs the lifecycle owner notified by session and
@@ -67,6 +68,12 @@ func (s *AuthService) SetStateChangePublisher(publisher StateChangePublisher) {
 
 // SetStateMutationGate installs the process-wide persistent mutation gate.
 func (s *AuthService) SetStateMutationGate(gate MutationGate) { s.gate = gate }
+
+// SetStateCommandRuntime installs the ordered account mutation runtime. It is
+// configured once during server assembly before password mutations are exposed.
+func (s *AuthService) SetStateCommandRuntime(runtime *StateMutationRuntime) {
+	s.runtime = runtime
+}
 
 // NewAuthService returns an AuthService. The now function supplies Unix
 // milliseconds and is injectable for deterministic tests.
