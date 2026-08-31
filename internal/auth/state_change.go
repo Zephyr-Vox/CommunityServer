@@ -20,10 +20,20 @@ type StateChange struct {
 	CommandID int64
 }
 
+// AccountMutationResult is the rollbackable result of one account-domain
+// transaction. BeforeCommit is called after the final state checkpoint has
+// been reserved but before the database transaction commits; it is used for
+// durable response records that must share the same commit.
+type AccountMutationResult struct {
+	Value        any
+	Change       StateChange
+	BeforeCommit func(context.Context, *store.Stores, int64, realtime.PublicationResult) error
+}
+
 // AccountMutation is one account-domain transaction executed by the ordered
 // realtime writer. The callback must perform only rollbackable persistence and
 // return the public state change that belongs to the same transaction.
-type AccountMutation func(context.Context, *store.Stores) (any, StateChange, error)
+type AccountMutation func(context.Context, *store.Stores) (AccountMutationResult, error)
 
 // StateMutationRuntime serializes account persistence with the immutable
 // StateStore publication. It is shared by account services so every user
@@ -80,16 +90,16 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 				return realtime.CommandOutput{}, err
 			}
 			defer tx.Rollback()
-			value, change, err := mutate(commandCtx, r.stores.WithTx(tx))
+			result, err := mutate(commandCtx, r.stores.WithTx(tx))
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			change.CommandID = commandID
+			result.Change.CommandID = commandID
 			candidate, err := r.state.BuildPersistentCandidateFrom(commandCtx, r.stores.WithTx(tx))
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			events, err := accountStateEvents(change, candidate.Version())
+			events, err := accountStateEvents(result.Change, candidate.Version())
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
@@ -98,12 +108,18 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 				visibilityUserIDs = append(visibilityUserIDs, user.ID)
 			}
 			visibilityUserIDs = append(visibilityUserIDs, userIDs...)
-			if _, err := execution.Reserve(realtime.PublicationRequest{
+			reserved, err := execution.Reserve(realtime.PublicationRequest{
 				Candidate:         candidate,
 				Events:            events,
 				VisibilityUserIDs: visibilityUserIDs,
-			}); err != nil {
+			})
+			if err != nil {
 				return realtime.CommandOutput{}, err
+			}
+			if result.BeforeCommit != nil {
+				if err := result.BeforeCommit(commandCtx, r.stores.WithTx(tx), commandID, reserved); err != nil {
+					return realtime.CommandOutput{}, err
+				}
 			}
 			if _, err := execution.Commit(tx); err != nil {
 				return realtime.CommandOutput{}, err
@@ -113,7 +129,7 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 					r.principals.Invalidate(userID)
 				}
 			}
-			return realtime.CommandOutput{Value: value}, nil
+			return realtime.CommandOutput{Value: result.Value}, nil
 		},
 	})
 	if err != nil {

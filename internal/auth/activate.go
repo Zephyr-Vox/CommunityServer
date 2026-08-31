@@ -191,6 +191,47 @@ func (m *ActivationManager) activate(ctx context.Context, idempotencyKey, code, 
 	if err != nil {
 		return ActivationResult{}, err
 	}
+	if m.runtime != nil {
+		var activation ActivationResult
+		value, err := m.runtime.Run(ctx, nil, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+			if err := m.durable.Admit(commandCtx, txStores); err != nil {
+				return AccountMutationResult{}, err
+			}
+			user, err := txStores.Users.CreateUser(commandCtx, username, hash, nickname, nil)
+			if err != nil {
+				return AccountMutationResult{}, err
+			}
+			if err := txStores.ActivateFirstOwner(commandCtx, user.ID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			body, err := json.Marshal(userEnvelope{User: newUserResponse(user)})
+			if err != nil {
+				return AccountMutationResult{}, err
+			}
+			activation.User = user
+			return AccountMutationResult{
+				Value:  &activation,
+				Change: StateChange{EventType: "user.created", UserID: user.ID},
+				BeforeCommit: func(commitCtx context.Context, commitStores *store.Stores, commandID int64, _ realtime.PublicationResult) error {
+					activation.CommandID = commandID
+					return m.durable.Save(commitCtx, commitStores, identity, idempotencyKey, realtime.ActivationCommandResult{
+						CommandID: commandID,
+						Status:    200,
+						Body:      body,
+					})
+				},
+			}, nil
+		})
+		if err != nil {
+			return ActivationResult{}, err
+		}
+		result, ok := value.(*ActivationResult)
+		if !ok || result == nil || result.User == nil || result.CommandID <= 0 {
+			return ActivationResult{}, errors.New("auth: activation runtime returned invalid result")
+		}
+		m.codeHash = ""
+		return *result, nil
+	}
 	release, err := acquireMutation(ctx, m.gate)
 	if err != nil {
 		return ActivationResult{}, err

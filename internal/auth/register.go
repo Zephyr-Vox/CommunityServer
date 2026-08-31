@@ -101,28 +101,31 @@ func (s *RegisterService) Register(ctx context.Context, username, password, nick
 		return nil, err
 	}
 	if s.runtime != nil {
-		value, err := s.runtime.Run(ctx, nil, func(commandCtx context.Context, txStores *store.Stores) (any, StateChange, error) {
+		value, err := s.runtime.Run(ctx, nil, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
 			// The user row, its initial server binding and invite consumption are
 			// one rollbackable unit. Consume remains last so a failed account or
 			// binding write never spends the invite.
 			user, err := txStores.Users.CreateUser(commandCtx, username, hash, nickname, nil)
 			if errors.Is(err, store.ErrConflict) {
-				return nil, StateChange{}, ErrUsernameTaken
+				return AccountMutationResult{}, ErrUsernameTaken
 			}
 			if err != nil {
-				return nil, StateChange{}, err
+				return AccountMutationResult{}, err
 			}
 			if _, err := txStores.Roles.InsertBinding(commandCtx, user.ID, roleKey, "server", nil, nil); err != nil {
-				return nil, StateChange{}, err
+				return AccountMutationResult{}, err
 			}
 			if invite != nil {
 				if _, err := txStores.Invites.Consume(commandCtx, invite.ID); errors.Is(err, store.ErrNotFound) {
-					return nil, StateChange{}, ErrInvalidInvite
+					return AccountMutationResult{}, ErrInvalidInvite
 				} else if err != nil {
-					return nil, StateChange{}, err
+					return AccountMutationResult{}, err
 				}
 			}
-			return user, StateChange{EventType: "user.created", UserID: user.ID}, nil
+			return AccountMutationResult{
+				Value:  user,
+				Change: StateChange{EventType: "user.created", UserID: user.ID},
+			}, nil
 		})
 		if err != nil {
 			return nil, err
