@@ -128,13 +128,29 @@ func (s *UserService) Get(ctx context.Context, userID int64) (*UserWithRoles, er
 // endpoints in the image domain, so arbitrary strings can never enter the
 // avatar column here.
 func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname string) (*db.User, error) {
-	user, err := s.users.GetUserByID(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
 	if nickname == "" {
 		// An omitted patch field is not a write. Reusing the value read above
 		// would overwrite a nickname committed concurrently by another request.
+		return s.users.GetUserByID(ctx, userID)
+	}
+	if s.runtime != nil {
+		value, err := s.runtime.Run(ctx, []int64{userID}, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+			user, err := txStores.Users.UpdateNickname(commandCtx, userID, nickname)
+			if err != nil {
+				return AccountMutationResult{}, err
+			}
+			return AccountMutationResult{
+				Value:  user,
+				Change: StateChange{EventType: "user.updated", UserID: userID},
+			}, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		user, ok := value.(*db.User)
+		if !ok {
+			return nil, errors.New("auth: profile runtime returned invalid user")
+		}
 		return user, nil
 	}
 	release, err := acquireMutation(ctx, s.gate)
@@ -159,6 +175,32 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 func (s *UserService) UpdateManagedProfile(ctx context.Context, actorID, userID int64, nickname string) (*db.User, error) {
 	if nickname == "" {
 		return s.users.GetUserByID(ctx, userID)
+	}
+	if s.runtime != nil {
+		value, err := s.runtime.Run(ctx, []int64{actorID, userID}, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+			if err := requireServerPermission(commandCtx, txStores, actorID, rbac.PermUserUpdate); err != nil {
+				return AccountMutationResult{}, err
+			}
+			if _, err := txStores.Users.GetUserByID(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			user, err := txStores.Users.UpdateNickname(commandCtx, userID, nickname)
+			if err != nil {
+				return AccountMutationResult{}, err
+			}
+			return AccountMutationResult{
+				Value:  user,
+				Change: StateChange{EventType: "user.updated", UserID: userID},
+			}, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		user, ok := value.(*db.User)
+		if !ok {
+			return nil, errors.New("auth: managed profile runtime returned invalid user")
+		}
+		return user, nil
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
@@ -225,6 +267,38 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
 	}
+	if s.runtime != nil {
+		_, err := s.runtime.Run(ctx, []int64{actorID, userID}, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+			if err := requireServerPermission(commandCtx, txStores, actorID, rbac.PermUserKick); err != nil {
+				return AccountMutationResult{}, err
+			}
+			if _, err := txStores.Users.GetUserByID(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			owner, err := isOwner(commandCtx, txStores.Roles, userID)
+			if err != nil {
+				return AccountMutationResult{}, err
+			}
+			if owner {
+				return AccountMutationResult{}, ErrOwnerProtected
+			}
+			if err := txStores.Users.BumpAuthVersion(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			if err := txStores.Sessions.DeleteUserSessions(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			return AccountMutationResult{Change: StateChange{EventType: "user.updated", UserID: userID}}, nil
+		})
+		if err != nil {
+			return err
+		}
+		s.disconnectUser(userID, "kicked")
+		if s.presence != nil {
+			s.presence.Remove(userID)
+		}
+		return nil
+	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
 	release, err := acquireMutation(ctx, s.gate)
@@ -271,6 +345,35 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
 	}
+	if s.runtime != nil {
+		_, err := s.runtime.Run(ctx, []int64{actorID, userID}, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+			if err := requireServerPermission(commandCtx, txStores, actorID, rbac.PermUserUpdate); err != nil {
+				return AccountMutationResult{}, err
+			}
+			if _, err := txStores.Users.GetUserByID(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			owner, err := isOwner(commandCtx, txStores.Roles, userID)
+			if err != nil {
+				return AccountMutationResult{}, err
+			}
+			if owner {
+				return AccountMutationResult{}, ErrOwnerProtected
+			}
+			if err := txStores.Users.Ban(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			return AccountMutationResult{Change: StateChange{EventType: "user.updated", UserID: userID}}, nil
+		})
+		if err != nil {
+			return err
+		}
+		s.disconnectUser(userID, "banned")
+		if s.presence != nil {
+			s.presence.Remove(userID)
+		}
+		return nil
+	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
 	release, err := acquireMutation(ctx, s.gate)
@@ -309,6 +412,21 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 // Unban lifts the ban after confirming actorID still has user:update, then
 // clears the target's principal cache.
 func (s *UserService) Unban(ctx context.Context, actorID, userID int64) error {
+	if s.runtime != nil {
+		_, err := s.runtime.Run(ctx, []int64{actorID, userID}, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+			if err := requireServerPermission(commandCtx, txStores, actorID, rbac.PermUserUpdate); err != nil {
+				return AccountMutationResult{}, err
+			}
+			if _, err := txStores.Users.GetUserByID(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			if err := txStores.Users.Unban(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			return AccountMutationResult{Change: StateChange{EventType: "user.updated", UserID: userID}}, nil
+		})
+		return err
+	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
 	release, err := acquireMutation(ctx, s.gate)
@@ -348,6 +466,47 @@ func (s *UserService) disconnectUser(userID int64, reason string) {
 func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
+	}
+	if s.runtime != nil {
+		value, err := s.runtime.Run(ctx, []int64{actorID, userID}, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+			if err := requireServerPermission(commandCtx, txStores, actorID, rbac.PermUserDelete); err != nil {
+				return AccountMutationResult{}, err
+			}
+			user, err := txStores.Users.GetUserByID(commandCtx, userID)
+			if err != nil {
+				return AccountMutationResult{}, err
+			}
+			owner, err := isOwner(commandCtx, txStores.Roles, userID)
+			if err != nil {
+				return AccountMutationResult{}, err
+			}
+			if owner {
+				return AccountMutationResult{}, ErrOwnerProtected
+			}
+			if err := txStores.Users.Delete(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			var avatarName string
+			if user.Avatar.Valid {
+				avatarName = user.Avatar.String
+			}
+			return AccountMutationResult{Value: avatarName, Change: StateChange{EventType: "user.deleted", UserID: userID}}, nil
+		})
+		if err != nil {
+			return err
+		}
+		s.disconnectUser(userID, "account_deleted")
+		if s.presence != nil {
+			s.presence.Remove(userID)
+		}
+		avatarName, ok := value.(string)
+		if !ok {
+			return errors.New("auth: delete runtime returned invalid avatar")
+		}
+		if s.avatarCleaner != nil && avatarName != "" {
+			_ = s.avatarCleaner.DeleteAvatar(ctx, avatarName)
+		}
+		return nil
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()

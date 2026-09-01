@@ -216,6 +216,22 @@ func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 // auth_version, and revokes all sessions before invalidating the principal
 // cache. Administrative resets use ResetPassword, which rechecks actor rights.
 func (s *AuthService) ChangePassword(ctx context.Context, userID int64, newPasswordHash string) error {
+	if s.runtime != nil {
+		_, err := s.runtime.Run(ctx, []int64{userID}, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+			if err := txStores.Users.SetPasswordHash(commandCtx, userID, newPasswordHash); err != nil {
+				return AccountMutationResult{}, err
+			}
+			if err := txStores.Sessions.DeleteUserSessions(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			return AccountMutationResult{Change: StateChange{EventType: "user.updated", UserID: userID}}, nil
+		})
+		if err != nil {
+			return err
+		}
+		s.disconnectUser(userID, "password_changed")
+		return nil
+	}
 	unlock := s.principals.LockMutation(userID)
 	defer unlock()
 	release, err := acquireMutation(ctx, s.gate)
@@ -247,6 +263,32 @@ func (s *AuthService) ResetPassword(ctx context.Context, actorID, userID int64, 
 	hash, err := HashPassword(newPassword)
 	if err != nil {
 		return err
+	}
+	if s.runtime != nil {
+		_, err := s.runtime.Run(ctx, []int64{actorID, userID}, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+			if err := requireServerPermission(commandCtx, txStores, actorID, rbac.PermUserUpdate); err != nil {
+				return AccountMutationResult{}, err
+			}
+			owner, err := isOwner(commandCtx, txStores.Roles, userID)
+			if err != nil {
+				return AccountMutationResult{}, err
+			}
+			if owner {
+				return AccountMutationResult{}, ErrOwnerProtected
+			}
+			if err := txStores.Users.SetPasswordHash(commandCtx, userID, hash); err != nil {
+				return AccountMutationResult{}, err
+			}
+			if err := txStores.Sessions.DeleteUserSessions(commandCtx, userID); err != nil {
+				return AccountMutationResult{}, err
+			}
+			return AccountMutationResult{Change: StateChange{EventType: "user.updated", UserID: userID}}, nil
+		})
+		if err != nil {
+			return err
+		}
+		s.disconnectUser(userID, "password_reset")
+		return nil
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
 	defer unlock()
