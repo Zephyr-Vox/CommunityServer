@@ -36,6 +36,7 @@ type AvatarService struct {
 	afterMetadata  func()
 	publishState   func(context.Context, int64) error
 	gate           MutationGate
+	executeState   StateMutationExecutor
 }
 
 // SetStatePublisher installs the application callback invoked after avatar
@@ -53,6 +54,21 @@ type MutationGate interface {
 
 // SetStateMutationGate installs the process-wide persistent mutation gate.
 func (s *AvatarService) SetStateMutationGate(gate MutationGate) { s.gate = gate }
+
+// StateMutationFunc applies one avatar metadata update to a transaction-bound
+// store. It must not commit or perform object-storage cleanup.
+type StateMutationFunc func(context.Context, *store.Stores) error
+
+// StateMutationExecutor commits one avatar metadata update together with its
+// account state projection. The object bytes are already durable when this
+// callback runs, while the user-row update remains rollbackable.
+type StateMutationExecutor func(context.Context, int64, StateMutationFunc) error
+
+// SetStateMutationExecutor installs the application-owned ordered account
+// mutation callback. It is configured before avatar routes are exposed.
+func (s *AvatarService) SetStateMutationExecutor(executor StateMutationExecutor) {
+	s.executeState = executor
+}
 
 var ErrTranscodeBusy = errors.New("image: transcode capacity exhausted")
 
@@ -167,18 +183,28 @@ func (s *AvatarService) upload(ctx context.Context, userID int64, src io.Reader,
 		return "", err
 	}
 
-	release, err := acquireMutation(ctx, s.gate)
-	if err != nil {
-		return "", err
-	}
-	defer release()
-	if _, err := s.users.SetAvatar(ctx, userID, &name); err != nil {
-		_ = s.objects.Delete(ctx, AvatarBucket, name) // best-effort: no orphan objects
-		return "", err
-	}
-	if s.publishState != nil {
-		if err := s.publishState(ctx, userID); err != nil {
+	if s.executeState != nil {
+		if err := s.executeState(ctx, userID, func(commandCtx context.Context, txStores *store.Stores) error {
+			_, err := txStores.Users.SetAvatar(commandCtx, userID, &name)
+			return err
+		}); err != nil {
+			_ = s.objects.Delete(ctx, AvatarBucket, name) // best-effort: no orphan objects
 			return "", err
+		}
+	} else {
+		release, err := acquireMutation(ctx, s.gate)
+		if err != nil {
+			return "", err
+		}
+		defer release()
+		if _, err := s.users.SetAvatar(ctx, userID, &name); err != nil {
+			_ = s.objects.Delete(ctx, AvatarBucket, name) // best-effort: no orphan objects
+			return "", err
+		}
+		if s.publishState != nil {
+			if err := s.publishState(ctx, userID); err != nil {
+				return "", err
+			}
 		}
 	}
 	if s.afterMetadata != nil {
@@ -203,17 +229,26 @@ func (s *AvatarService) Reset(ctx context.Context, userID int64) error {
 		return err
 	}
 
-	release, err := acquireMutation(ctx, s.gate)
-	if err != nil {
-		return err
-	}
-	defer release()
-	if _, err := s.users.SetAvatar(ctx, userID, nil); err != nil {
-		return err
-	}
-	if s.publishState != nil {
-		if err := s.publishState(ctx, userID); err != nil {
+	if s.executeState != nil {
+		if err := s.executeState(ctx, userID, func(commandCtx context.Context, txStores *store.Stores) error {
+			_, err := txStores.Users.SetAvatar(commandCtx, userID, nil)
 			return err
+		}); err != nil {
+			return err
+		}
+	} else {
+		release, err := acquireMutation(ctx, s.gate)
+		if err != nil {
+			return err
+		}
+		defer release()
+		if _, err := s.users.SetAvatar(ctx, userID, nil); err != nil {
+			return err
+		}
+		if s.publishState != nil {
+			if err := s.publishState(ctx, userID); err != nil {
+				return err
+			}
 		}
 	}
 	if user.Avatar.Valid {

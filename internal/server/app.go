@@ -227,6 +227,17 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	authSvc.SetStateMutationGate(app.mutationGate)
 	authSvc.SetStateCommandRuntime(accountRuntime)
 	avatarSvc.SetStateMutationGate(app.mutationGate)
+	avatarSvc.SetStateMutationExecutor(func(ctx context.Context, userID int64, mutate image.StateMutationFunc) error {
+		_, err := accountRuntime.Run(ctx, []int64{userID}, func(commandCtx context.Context, txStores *store.Stores) (auth.AccountMutationResult, error) {
+			if err := mutate(commandCtx, txStores); err != nil {
+				return auth.AccountMutationResult{}, err
+			}
+			return auth.AccountMutationResult{
+				Change: auth.StateChange{EventType: "user.updated", UserID: userID},
+			}, nil
+		})
+		return err
+	})
 	channels.SetStateMutationGate(app.mutationGate)
 	channels.SetDurableIdempotency(durableCommands)
 	channels.SetStateCommandRuntime(app.state, app.sequencer)
