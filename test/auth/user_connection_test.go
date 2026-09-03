@@ -35,7 +35,7 @@ func TestUserServiceOnlyRevokesConnectionsForDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	revoker := &connectionRevoker{}
-	users, _ := newUserService(t, e)
+	users := newUserService(t, e)
 	users.SetConnectionRevoker(revoker)
 	if err := users.Unban(ctx, actor.ID, unbanTarget.ID); err != nil {
 		t.Fatal(err)

@@ -22,7 +22,6 @@ import (
 	"zephyr.vox/server/ce/internal/image"
 	"zephyr.vox/server/ce/internal/moderation"
 	"zephyr.vox/server/ce/internal/oss"
-	"zephyr.vox/server/ce/internal/presence"
 	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/store"
@@ -43,7 +42,6 @@ type App struct {
 	activate       *auth.ActivationManager
 	channels       *channel.Service
 	moderation     *moderation.Service
-	presence       *presence.Presence
 	objects        *oss.LocalObjectStorage
 	avatar         *image.AvatarService
 	connections    *realtime.ConnectionCoordinator
@@ -113,14 +111,13 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	secret := []byte(cfg.JWTSecret)
 	authSvc := auth.NewAuthService(stores, principals, secret, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, now)
 	register := auth.NewRegisterService(stores, auth.RegistrationMode(cfg.RegistrationMode))
-	pres := presence.New(time.Now)
 	objects, err := oss.NewLocalObjectStorage(cfg.Storage.BaseDir, conn, now)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("server: object storage: %w", err)
 	}
 	avatarSvc := image.NewAvatarService(stores.Users, objects, idGen, cfg.Avatar)
-	users := auth.NewUserService(stores, principals, pres, avatarSvc)
+	users := auth.NewUserService(stores, principals, avatarSvc)
 	connections := realtime.NewConnectionCoordinator()
 	voice, err := newVoiceRuntime(cfg.Voice, connections, now)
 	if err != nil {
@@ -175,7 +172,6 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		activate:        activate,
 		channels:        channels,
 		moderation:      moderationSvc,
-		presence:        pres,
 		objects:         objects,
 		avatar:          avatarSvc,
 		connections:     connections,

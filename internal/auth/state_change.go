@@ -90,12 +90,13 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 				return realtime.CommandOutput{}, err
 			}
 			defer tx.Rollback()
-			result, err := mutate(commandCtx, r.stores.WithTx(tx))
+			txStores := r.stores.WithTx(tx)
+			result, err := mutate(commandCtx, txStores)
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
 			result.Change.CommandID = commandID
-			candidate, err := r.state.BuildPersistentCandidateFrom(commandCtx, r.stores.WithTx(tx))
+			candidate, err := r.state.BuildPersistentCandidateFrom(commandCtx, txStores)
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
@@ -117,7 +118,7 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 				return realtime.CommandOutput{}, err
 			}
 			if result.BeforeCommit != nil {
-				if err := result.BeforeCommit(commandCtx, r.stores.WithTx(tx), commandID, reserved); err != nil {
+				if err := result.BeforeCommit(commandCtx, txStores, commandID, reserved); err != nil {
 					return realtime.CommandOutput{}, err
 				}
 			}

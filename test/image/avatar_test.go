@@ -23,7 +23,6 @@ import (
 	"zephyr.vox/server/ce/internal/db"
 	img "zephyr.vox/server/ce/internal/image"
 	"zephyr.vox/server/ce/internal/oss"
-	"zephyr.vox/server/ce/internal/presence"
 	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/store"
 )
@@ -681,7 +680,7 @@ func TestDeleteUserDuringUploadCleansUncommittedAvatar(t *testing.T) {
 			return []byte("fake-jpeg"), nil
 		},
 	))
-	userSvc := auth.NewUserService(e.stores, e.principals, presence.New(time.Now), avatarSvc)
+	userSvc := auth.NewUserService(e.stores, e.principals, avatarSvc)
 	uploadDone := make(chan error, 1)
 	go func() {
 		_, err := avatarSvc.Upload(context.Background(), aliceID, bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255})))
@@ -720,7 +719,7 @@ func TestDeleteAfterUploadCleansCommittedAvatar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	userSvc := auth.NewUserService(e.stores, e.principals, presence.New(time.Now), e.svc)
+	userSvc := auth.NewUserService(e.stores, e.principals, e.svc)
 	if err := userSvc.Delete(context.Background(), bossID, userID); err != nil {
 		t.Fatal(err)
 	}
@@ -743,7 +742,7 @@ func TestDeleteAfterAvatarMetadataCommitBeforeUploadReturns(t *testing.T) {
 		once.Do(func() { close(committed) })
 		<-release
 	}))
-	userSvc := auth.NewUserService(e.stores, e.principals, presence.New(time.Now), e.svc)
+	userSvc := auth.NewUserService(e.stores, e.principals, e.svc)
 
 	uploadDone := make(chan struct {
 		name string

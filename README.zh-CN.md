@@ -11,7 +11,7 @@
 - 数据库驱动的 RBAC：内置角色、scope binding、ACL 和权限配置
 - 用户管理：列表/详情、资料、重置密码、踢下线、封禁/解封、硬删除
 - 邀请码管理：创建 / 列表 / 删除
-- presence：轻量内存心跳在线状态
+- presence：由 WS 生命周期驱动的在线状态，支持 `presence.set`
 - 实时协议模型：每个客户端独立维护一条 WS 控制连接；每个账号最多一个逻辑 UDP 语音会话
 - 本地对象存储：磁盘文件 + SQLite 元数据 + MIME 探测
 - 头像：上传/重置 + 统一 JPEG 转码（任意可解码图片进，256×256 JPEG 出），公开路由提供读取
@@ -112,7 +112,7 @@ RBAC 持久化在 SQLite 中。`owner` 全局唯一并始终授予 `*`；`admin`
 | 用户管理 | `GET /users`、`GET /users/:id`、`PATCH /users/:id`、`POST /users/:id/password`、`POST /users/:id/kick`、`POST /users/:id/ban`、`POST /users/:id/unban`、`DELETE /users/:id` |
 | RBAC | `GET /rbac/roles`、`POST /rbac/roles`、`PATCH /rbac/roles/:key`、`DELETE /rbac/roles/:key`、`GET/POST/DELETE /rbac/bindings`、`GET/PUT /rbac/config`、`POST /rbac/config/reset`、`POST /owner/transfer` |
 | 邀请码 | `GET /admin/invites`、`POST /admin/invites`、`DELETE /admin/invites/:id` |
-| Presence | `POST /presence/heartbeat`、`GET /presence` |
+| Presence | WS `presence.set`、`presence.updated` 状态事件 |
 
 头像接口：`POST /api/v0/me/avatar` 接收 multipart 的 `file` 字段（任意 Go 可解码的图片格式），统一转码为 JPEG 存储；`DELETE /api/v0/me/avatar` 重置为默认头像。图片通过公开路由 `GET /avatar/:file` 读取——注意该路由不在 `/api/v0` 前缀下。用户 DTO 中的 `avatar` 字段携带裸对象名（如 `12345.jpg`）；客户端拼接公开前缀得到完整 URL，当前前缀固定为 `/avatar/`（如 `/avatar/12345.jpg`）。
 

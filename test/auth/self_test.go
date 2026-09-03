@@ -32,7 +32,7 @@ func newMeSelfEcho(t *testing.T, e *env, svc *auth.UserService) *echo.Echo {
 
 func TestMeProfileHandler(t *testing.T) {
 	e := newEnv(t)
-	svc, _ := newUserService(t, e)
+	svc := newUserService(t, e)
 	app := newMeSelfEcho(t, e, svc)
 	e.createUser(t, "alice", "secret123", "member")
 	token := loginToken(t, e, "alice", "secret123")
@@ -50,7 +50,7 @@ func TestMeProfileHandler(t *testing.T) {
 
 func TestMePasswordHandlerWrongOldPassword(t *testing.T) {
 	e := newEnv(t)
-	svc, _ := newUserService(t, e)
+	svc := newUserService(t, e)
 	app := newMeSelfEcho(t, e, svc)
 	e.createUser(t, "alice", "secret123", "member")
 	token := loginToken(t, e, "alice", "secret123")
@@ -64,7 +64,7 @@ func TestMePasswordHandlerWrongOldPassword(t *testing.T) {
 
 func TestMePasswordHandlerSuccessRevokesTokens(t *testing.T) {
 	e := newEnv(t)
-	svc, _ := newUserService(t, e)
+	svc := newUserService(t, e)
 	app := newMeSelfEcho(t, e, svc)
 	e.createUser(t, "alice", "secret123", "member")
 	login, err := e.svc.Login(context.Background(), "alice", "secret123", "dev-1")
@@ -92,7 +92,7 @@ func TestMePasswordHandlerSuccessRevokesTokens(t *testing.T) {
 
 func TestMePasswordHandlerDeletedUser(t *testing.T) {
 	e := newEnv(t)
-	svc, _ := newUserService(t, e)
+	svc := newUserService(t, e)
 	app := newMeSelfEcho(t, e, svc)
 	u := e.createUser(t, "alice", "secret123", "member")
 	token := loginToken(t, e, "alice", "secret123")

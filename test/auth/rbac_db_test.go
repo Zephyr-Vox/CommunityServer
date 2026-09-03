@@ -9,14 +9,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/labstack/echo-jwt/v5"
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/auth"
-	"zephyr.vox/server/ce/internal/presence"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
 	"zephyr.vox/server/ce/internal/store"
@@ -44,10 +42,9 @@ func requestMethodWithToken(t *testing.T, app *echo.Echo, method, path, token, b
 	return rec
 }
 
-func newUserService(t *testing.T, e *env) (*auth.UserService, *presence.Presence) {
+func newUserService(t *testing.T, e *env) *auth.UserService {
 	t.Helper()
-	pres := presence.New(time.Now)
-	return auth.NewUserService(e.stores, e.principals, pres, nil), pres
+	return auth.NewUserService(e.stores, e.principals, nil)
 }
 
 func newAuthedEcho(t *testing.T, e *env) (*echo.Echo, *rbac.Authorizer) {
@@ -175,7 +172,7 @@ func TestOwnerCannotBeBannedOrDeleted(t *testing.T) {
 	}
 	owner := activation.User
 	actor := e.createUser(t, "admin", "secret123", "admin")
-	svc, _ := newUserService(t, e)
+	svc := newUserService(t, e)
 	if err := svc.Ban(context.Background(), actor.ID, owner.ID); !errors.Is(err, auth.ErrOwnerProtected) {
 		t.Fatalf("Ban owner = %v, want ErrOwnerProtected", err)
 	}
@@ -217,7 +214,7 @@ func TestManagedProfileEmptyPatchReturnsCurrentUser(t *testing.T) {
 	e := newEnv(t)
 	admin := e.createUser(t, "admin", "secret123", "admin")
 	target := e.createUser(t, "target", "secret123", "member")
-	users, _ := newUserService(t, e)
+	users := newUserService(t, e)
 	app, authz := newAuthedEcho(t, e)
 	app.PATCH("/api/v0/users/:id", auth.UpdateUserHandler(users), rbacecho.Require(authz, rbac.PermUserUpdate))
 
@@ -247,7 +244,7 @@ func TestManagedAuthMutationsRecheckPermissionsAfterOwnerTransfer(t *testing.T) 
 	if err := e.stores.TransferOwner(ctx, oldOwner.ID, newOwner.ID); err != nil {
 		t.Fatal(err)
 	}
-	users, _ := newUserService(t, e)
+	users := newUserService(t, e)
 
 	profileTarget := e.createUser(t, "profiletarget", "secret123", "member")
 	if _, err := users.UpdateManagedProfile(ctx, oldOwner.ID, profileTarget.ID, "Changed"); !errors.Is(err, auth.ErrPermissionRequired) {

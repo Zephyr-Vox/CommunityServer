@@ -11,7 +11,7 @@ Single-server community edition of a lightweight voice-community server, in the 
 - Database-backed RBAC: seeded built-in roles, scoped bindings, ACLs and permission configs
 - User management: list/detail, profile, password reset, kick, ban/unban, hard delete
 - Invite management: create / list / delete invite codes
-- Presence: lightweight in-memory heartbeat-based online status
+- Presence: WS lifecycle-driven online status with `presence.set`
 - Realtime protocol model: each client has its own WS control connection; one account has at most one logical UDP voice session
 - Local object storage: disk-backed files with SQLite metadata and MIME detection
 - Avatars: upload/reset with unified JPEG transcoding (any decodable image in, 256×256 JPEG out), served from a public route
@@ -113,7 +113,7 @@ All paths are prefixed with `/api/v0`.
 | Users | `GET /users`, `GET /users/:id`, `PATCH /users/:id`, `POST /users/:id/password`, `POST /users/:id/kick`, `POST /users/:id/ban`, `POST /users/:id/unban`, `DELETE /users/:id` |
 | RBAC | `GET /rbac/roles`, `POST /rbac/roles`, `PATCH /rbac/roles/:key`, `DELETE /rbac/roles/:key`, `GET/POST/DELETE /rbac/bindings`, `GET/PUT /rbac/config`, `POST /rbac/config/reset`, `POST /owner/transfer` |
 | Invites | `GET /admin/invites`, `POST /admin/invites`, `DELETE /admin/invites/:id` |
-| Presence | `POST /presence/heartbeat`, `GET /presence` |
+| Presence | WS `presence.set`, `presence.updated` state events |
 
 Avatar endpoints: `POST /api/v0/me/avatar` accepts a multipart `file` field (any format Go can decode) and stores a uniformly transcoded JPEG; `DELETE /api/v0/me/avatar` resets to the default. The image is served publicly at `GET /avatar/:file` — note this route sits outside the `/api/v0` prefix. The `avatar` field in user DTOs carries the bare object name (e.g. `12345.jpg`); clients build the full URL by joining it with the public prefix, currently the fixed route `/avatar/` (e.g. `/avatar/12345.jpg`).
 

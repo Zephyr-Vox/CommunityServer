@@ -23,13 +23,6 @@ var (
 	ErrOwnerProtected = errors.New("auth: owner is protected")
 )
 
-// PresenceRevoker removes a user from the online registry immediately after
-// kick, ban or deletion. presence.Presence satisfies it; keeping an interface
-// here avoids coupling the auth domain to the presence package.
-type PresenceRevoker interface {
-	Remove(userID int64)
-}
-
 // AvatarCleaner removes a user's avatar object on account deletion.
 // image.AvatarService satisfies it; the interface keeps auth free of any
 // image-domain dependency. Cleanup is best-effort and never fails deletion.
@@ -49,7 +42,6 @@ type UserService struct {
 	stores        *store.Stores
 	users         *store.UserStore
 	principals    *PrincipalCache
-	presence      PresenceRevoker
 	avatarCleaner AvatarCleaner
 	connections   ConnectionRevoker
 	publisher     StateChangePublisher
@@ -80,13 +72,13 @@ func (s *UserService) SetConnectionRevoker(revoker ConnectionRevoker) {
 }
 
 // NewUserService returns a UserService. avatarCleaner may be nil, in which
-// case account deletion leaves avatar objects behind.
-func NewUserService(stores *store.Stores, principals *PrincipalCache, presence PresenceRevoker, avatarCleaner AvatarCleaner) *UserService {
+// case account deletion leaves avatar objects behind. Presence is owned by
+// realtime connection lifecycle and is intentionally not injected here.
+func NewUserService(stores *store.Stores, principals *PrincipalCache, avatarCleaner AvatarCleaner) *UserService {
 	return &UserService{
 		stores:        stores,
 		users:         stores.Users,
 		principals:    principals,
-		presence:      presence,
 		avatarCleaner: avatarCleaner,
 	}
 }
@@ -261,8 +253,8 @@ func isOwner(ctx context.Context, roles *store.RoleStore, userID int64) (bool, e
 }
 
 // Kick bumps auth_version and deletes every session in one transaction, then
-// invalidates the cache and removes the user from presence: all issued tokens
-// die immediately.
+// disconnects the user's active control connections so all issued tokens die
+// immediately. Presence is derived by realtime connection lifecycle.
 func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 	if actorID == userID {
 		return ErrSelfAction
@@ -294,9 +286,6 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 			return err
 		}
 		s.disconnectUser(userID, "kicked")
-		if s.presence != nil {
-			s.presence.Remove(userID)
-		}
 		return nil
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
@@ -332,7 +321,6 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 	}
 	s.disconnectUser(userID, "kicked")
 	s.principals.Invalidate(userID)
-	s.presence.Remove(userID)
 	if err := s.publish(ctx, "user.updated", userID); err != nil {
 		return err
 	}
@@ -369,9 +357,6 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 			return err
 		}
 		s.disconnectUser(userID, "banned")
-		if s.presence != nil {
-			s.presence.Remove(userID)
-		}
 		return nil
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
@@ -402,7 +387,6 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 	}
 	s.disconnectUser(userID, "banned")
 	s.principals.Invalidate(userID)
-	s.presence.Remove(userID)
 	if err := s.publish(ctx, "user.updated", userID); err != nil {
 		return err
 	}
@@ -496,9 +480,6 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 			return err
 		}
 		s.disconnectUser(userID, "account_deleted")
-		if s.presence != nil {
-			s.presence.Remove(userID)
-		}
 		avatarName, ok := value.(string)
 		if !ok {
 			return errors.New("auth: delete runtime returned invalid avatar")
@@ -541,7 +522,6 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	}
 	s.disconnectUser(userID, "account_deleted")
 	s.principals.Invalidate(userID)
-	s.presence.Remove(userID)
 	if err := s.publish(ctx, "user.deleted", userID); err != nil {
 		return err
 	}
