@@ -62,7 +62,7 @@ type RunOptions struct {
 // then shuts the server down gracefully and returns. The TLS mode comes from
 // cfg.Server.TLSMode; an empty value fails closed to required so a directly
 // constructed App cannot silently fall back to plaintext.
-func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
+func (a *App) Run(ctx context.Context, opts ...RunOptions) (runErr error) {
 	var runOpts RunOptions
 	if len(opts) > 0 {
 		runOpts = opts[0]
@@ -78,7 +78,16 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 	if err != nil {
 		return err
 	}
-	defer a.finishRun(running)
+	enteredServe := false
+	defer func() {
+		if !enteredServe {
+			// Listener setup failed before serve took ownership of the process
+			// shutdown sequence. Release every worker and runtime assembled by
+			// beginRun; the failed App is then ready for Close without live owners.
+			runErr = errors.Join(runErr, a.cleanupFailedRun(running))
+		}
+		a.finishRun(running)
+	}()
 
 	addr := net.JoinHostPort(a.cfg.Server.Host, strconv.Itoa(a.cfg.Server.HTTPPort))
 
@@ -168,6 +177,7 @@ func (a *App) Run(ctx context.Context, opts ...RunOptions) error {
 	// Realtime StateStore, EventBus, HTTP/WS and UDP adapters are all assembled
 	// before either listener claims readiness. A voice bind failure above leaves
 	// the HTTP socket closed, so metadata never advertises a dead UDP endpoint.
+	enteredServe = true
 	return a.serve(running, ln, tlsInfo, timeouts)
 }
 

@@ -172,6 +172,23 @@ func (a *App) finishRun(running *appRun) {
 	})
 }
 
+// cleanupFailedRun releases resources assembled by beginRun when Run cannot
+// reach serve. It mirrors the dependency order needed by the active shutdown
+// path, but uses a bounded best-effort context because no listener owns a
+// caller-visible shutdown deadline on a failed startup.
+func (a *App) cleanupFailedRun(running *appRun) error {
+	if a == nil || running == nil || running.supervisor == nil {
+		return nil
+	}
+	running.supervisor.BeginShutdown()
+	voiceErr := a.stopVoice()
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	realtimeErr := a.stopRealtime(cleanupCtx)
+	workersErr := running.supervisor.WaitWorkers(cleanupCtx)
+	return errors.Join(voiceErr, realtimeErr, workersErr)
+}
+
 // ShutdownConnections stops WebSocket admission, requests terminal close from
 // every write pump, and waits for hijacked handlers to exit.
 func (a *App) ShutdownConnections(ctx context.Context) error {
