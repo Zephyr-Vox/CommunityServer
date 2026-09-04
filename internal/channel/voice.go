@@ -403,6 +403,12 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 				}
 			} else if hasCurrent && (current.ChannelID != channelID || input.ForceNew || current.ControlConnectionID != owner.ControlConnectionID || current.ConnectionGeneration != owner.Generation) {
 				return realtime.CommandOutput{}, ErrVoiceExpectedRequired
+			} else if pendingTeardown != nil {
+				// The coordinator has already cleared the owner, but the matching
+				// StateStore authority is still visible until its observer publishes.
+				// Treat that tombstone as an existing binding so a rejoin cannot
+				// silently overwrite the old authority and skip its clear events.
+				return realtime.CommandOutput{}, ErrVoiceExpectedRequired
 			}
 
 			if hasCurrent && current.ChannelID == channelID && current.ControlConnectionID == owner.ControlConnectionID && current.ConnectionGeneration == owner.Generation && !input.ForceNew {

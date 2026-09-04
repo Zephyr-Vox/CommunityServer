@@ -437,6 +437,11 @@ func TestVoiceJoinFoldsPendingOwnerTeardown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := fixture.service.JoinVoice(context.Background(), fixture.adminID, channelID, newRef.ControlConnectionID, "new-voice-key-missing", channel.VoiceJoinInput{
+		DeviceID: "desktop-2",
+	}, "127.0.0.1"); !errors.Is(err, channel.ErrVoiceExpectedRequired) {
+		t.Fatalf("rejoin without expected session = %v, want ErrVoiceExpectedRequired", err)
+	}
 	if _, err := fixture.service.JoinVoice(context.Background(), fixture.adminID, channelID, newRef.ControlConnectionID, "new-voice-key-01", channel.VoiceJoinInput{
 		DeviceID:               "desktop-2",
 		ExpectedVoiceSessionID: fmt.Sprintf("%x", oldAuthority.VoiceSessionID),

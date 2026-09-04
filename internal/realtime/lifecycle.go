@@ -79,6 +79,8 @@ type ConnectionStatePublisher struct {
 	offlineDone    chan struct{}
 	voiceDone      chan struct{}
 	offlineOnce    sync.Once
+	workerCtx      context.Context
+	workerCancel   context.CancelFunc
 }
 
 type voiceAuthorityTransition struct {
@@ -140,6 +142,7 @@ func NewConnectionStatePublisher(state *StateStore, sequencer *PostCommitSequenc
 	if state == nil || sequencer == nil || coordinator == nil {
 		return nil, ErrInvalidConnectionPublisher
 	}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	publisher := &ConnectionStatePublisher{
 		state:          state,
 		sequencer:      sequencer,
@@ -151,6 +154,8 @@ func NewConnectionStatePublisher(state *StateStore, sequencer *PostCommitSequenc
 		offlineStop:    make(chan struct{}),
 		offlineDone:    make(chan struct{}),
 		voiceDone:      make(chan struct{}),
+		workerCtx:      workerCtx,
+		workerCancel:   workerCancel,
 	}
 	coordinator.SetCloseObserver(publisher.connectionClosed)
 	coordinator.SetVoiceAuthorityObserver(publisher.voiceAuthorityChanged)
@@ -169,7 +174,10 @@ func (p *ConnectionStatePublisher) Close(ctx context.Context) error {
 	if ctx == nil {
 		return ErrInvalidConnectionPublisher
 	}
-	p.offlineOnce.Do(func() { close(p.offlineStop) })
+	p.offlineOnce.Do(func() {
+		close(p.offlineStop)
+		p.workerCancel()
+	})
 	for _, done := range []<-chan struct{}{p.offlineDone, p.voiceDone} {
 		select {
 		case <-done:
@@ -592,13 +600,13 @@ func (p *ConnectionStatePublisher) runOfflineBatches() {
 			default:
 			}
 		}
-		release, err := p.acquireRuntimeMutation(context.Background())
+		release, err := p.acquireRuntimeMutation(p.workerCtx)
 		if err == nil {
 			commands := make([]PostCommitCommand, 0, len(batchIDs))
 			for _, userID := range batchIDs {
 				commands = append(commands, p.offlineCommand(userID))
 			}
-			_, err = p.sequencer.SubmitControlBatch(context.Background(), commands)
+			_, err = p.sequencer.SubmitControlBatch(p.workerCtx, commands)
 			release()
 		}
 		p.rateMu.Lock()
@@ -606,7 +614,7 @@ func (p *ConnectionStatePublisher) runOfflineBatches() {
 			delete(p.offlinePending, userID)
 		}
 		p.rateMu.Unlock()
-		if err != nil && !errors.Is(err, ErrSequencerClosed) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, ErrSequencerClosed) {
 			p.sequencer.Fail(fmt.Errorf("control presence teardown: %w", err))
 		}
 	}
@@ -642,16 +650,16 @@ func (p *ConnectionStatePublisher) runVoiceBatches() {
 			default:
 			}
 		}
-		release, err := p.acquireRuntimeMutation(context.Background())
+		release, err := p.acquireRuntimeMutation(p.workerCtx)
 		if err == nil {
 			commands := make([]PostCommitCommand, 0, len(transitions))
 			for _, transition := range transitions {
 				commands = append(commands, p.voiceCommand(transition))
 			}
-			_, err = p.sequencer.SubmitControlBatch(context.Background(), commands)
+			_, err = p.sequencer.SubmitControlBatch(p.workerCtx, commands)
 			release()
 		}
-		if err != nil && !errors.Is(err, ErrSequencerClosed) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, ErrSequencerClosed) {
 			p.sequencer.Fail(fmt.Errorf("voice authority projection: %w", err))
 		}
 	}

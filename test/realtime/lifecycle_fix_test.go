@@ -81,6 +81,64 @@ func TestStaleVoiceTransitionCompletesWithoutFatal(t *testing.T) {
 	}
 }
 
+// TestConnectionStatePublisherCloseCancelsBlockedVoiceBatch proves shutdown
+// can stop a voice projection worker while it is waiting for runtime mutation
+// admission; the worker must not retain an uncancellable background wait.
+func TestConnectionStatePublisherCloseCancelsBlockedVoiceBatch(t *testing.T) {
+	state := newLifecycleTestState(t)
+	publication := newLifecycleTestPublication(t, state)
+	sequencer := newWatchedSequencer(t, publication, func(error) {})
+	coordinator := realtime.NewConnectionCoordinator()
+	publisher, err := realtime.NewConnectionStatePublisher(state, sequencer, coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := &blockingRuntimeAdmission{started: make(chan struct{})}
+	publisher.SetRuntimeMutationAdmission(admission)
+
+	reservation, err := coordinator.ReserveConnect(1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := reservation.Activate(&closeRecorder{}, time.Now().Add(time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := protocol.NewManager(time.Now)
+	prepared, err := manager.Prepare(1, "desktop", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := coordinator.StageVoiceReplacement(owner, nil, 10, prepared, time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stage.Apply(manager); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-admission.started:
+	case <-time.After(time.Second):
+		t.Fatal("voice projection did not reach runtime admission")
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := publisher.Close(closeCtx); err != nil {
+		t.Fatalf("publisher close = %v", err)
+	}
+}
+
+type blockingRuntimeAdmission struct {
+	started chan struct{}
+}
+
+func (a *blockingRuntimeAdmission) Acquire(ctx context.Context) (func(), error) {
+	close(a.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 // TestAccountTeardownClearsRuntimeBeforePublication proves account-wide access
 // loss prepares the candidate before disconnecting connections, while the
 // coordinator/socket teardown itself waits until the database commit boundary.
