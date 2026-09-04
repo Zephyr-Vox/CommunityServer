@@ -826,7 +826,6 @@ func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublication(expected Voic
 	}
 	removed := *user.voice
 	user.voice = nil
-	user.voiceTombstone = &voiceAuthorityTombstone{authority: removed, reason: reason}
 	return removed, true, drain, nil
 }
 
@@ -851,7 +850,6 @@ func (c *ConnectionCoordinator) BeginVoiceRevokeForPublication(expected VoiceAut
 	}
 	removed := *user.voice
 	user.voice = nil
-	user.voiceTombstone = &voiceAuthorityTombstone{authority: removed, reason: reason}
 	return removed, true, drain, cleanup, nil
 }
 

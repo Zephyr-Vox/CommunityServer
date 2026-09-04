@@ -187,6 +187,9 @@ func TestVoiceJoinPublishesAuthorityAndReplaysSensitiveResult(t *testing.T) {
 	if _, ok := fixture.state.Current().VoiceAuthority(fixture.adminID); ok {
 		t.Fatal("published voice authority remains after leave")
 	}
+	if _, _, ok := coordinator.PendingVoiceAuthorityTombstone(fixture.adminID); ok {
+		t.Fatal("voluntary leave retained a stale voice teardown tombstone")
+	}
 	lastAuthority, lastMemberLeft := -1, -1
 	for index, event := range fixture.publication.Capture().Events {
 		switch event.EventType {
@@ -578,6 +581,9 @@ func TestVoiceAccessLossRevokesManagerAndAuthority(t *testing.T) {
 	}
 	if _, ok := fixture.state.Current().VoiceAuthority(fixture.adminID); ok {
 		t.Fatal("StateStore retained inaccessible voice authority")
+	}
+	if _, _, ok := coordinator.PendingVoiceAuthorityTombstone(fixture.adminID); ok {
+		t.Fatal("access-loss teardown retained a stale voice teardown tombstone")
 	}
 	lastLifecycle, lastAuthority, lastMemberLeft := -1, -1, -1
 	for index, event := range fixture.publication.Capture().Events {
