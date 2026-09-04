@@ -432,6 +432,7 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 
 			var prepared *protocol.PreparedSession
 			created := false
+			var reusedInfo protocol.SessionInfo
 			if !hasCurrent || input.ForceNew || current.ControlConnectionID != owner.ControlConnectionID || current.ConnectionGeneration != owner.Generation {
 				if !s.voiceCreateLimiter.Allow(actorID, sourceIP, time.UnixMilli(joinedAt)) {
 					return realtime.CommandOutput{}, ErrVoiceCreateRateLimit
@@ -453,6 +454,13 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 						return realtime.CommandOutput{}, ErrVoiceStale
 					}
 					naturalExpiry = true
+				} else {
+					reusedInfo = protocol.SessionInfo{
+						ID:        snapshot.ID,
+						UserID:    snapshot.UserID,
+						Encrypted: snapshot.Encrypted,
+						ExpiresAt: snapshot.ExpiresAt,
+					}
 				}
 			}
 
@@ -598,12 +606,11 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 			if prepared != nil {
 				info = prepared.Info()
 			} else if hasCurrent {
-				snapshot, snapshotOK := s.voiceManager.Get(current.VoiceSessionID)
-				if !snapshotOK || snapshot.UserID != actorID {
-					return realtime.CommandOutput{}, ErrVoiceStale
-				}
-				info.Encrypted = snapshot.Encrypted
-				info.ExpiresAt = snapshot.ExpiresAt
+				// The session was already validated before the runtime commit. Do not
+				// perform a second fallible Manager lookup here: natural expiry can
+				// otherwise turn a successful coordinator move into an unpublished
+				// runtime mutation after ApplyForPublication has completed.
+				info = reusedInfo
 			}
 			return realtime.CommandOutput{Value: voiceJoinPlan{channel: snapshotChannel(channel), channelID: channel.ID, info: info, created: created, schedules: schedules, cancellations: cancellations}}, nil
 		},

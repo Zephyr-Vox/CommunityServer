@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -205,6 +206,81 @@ func TestVoiceJoinPublishesAuthorityAndReplaysSensitiveResult(t *testing.T) {
 	leaveReplay := leave()
 	if leaveReplay.Code != http.StatusNoContent || leaveReplay.Body.Len() != 0 {
 		t.Fatalf("leave replay status/body = %d/%s", leaveReplay.Code, leaveReplay.Body.String())
+	}
+}
+
+// TestVoiceReuseMoveDoesNotAbortAfterRuntimeCommit verifies that response
+// materialization cannot perform a second fallible Manager lookup after the
+// coordinator has already moved the authority.
+func TestVoiceReuseMoveDoesNotAbortAfterRuntimeCommit(t *testing.T) {
+	fixture := newFixture(t)
+	ctx := context.Background()
+	source, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		Name:       "Reuse source",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		Name:       "Reuse target",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID := mustID(t, source.ID)
+	targetID := mustID(t, target.ID)
+	var managerClockCalls atomic.Int32
+	manager := protocol.NewManager(func() time.Time {
+		calls := managerClockCalls.Add(1)
+		if calls >= 6 {
+			return time.UnixMilli(1_000).Add(protocol.SessionTTL + time.Millisecond)
+		}
+		return time.UnixMilli(1_000)
+	})
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(fixture.adminID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := reservation.Activate(voiceJoinTransport{}, 100_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceRuntime(manager, coordinator, false)
+	fixture.service.SetVoiceClock(func() int64 { return 1_000 })
+	signer, err := realtime.NewRequestIdentitySigner([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceIdempotency(realtime.NewRuntimeIdempotencyCache(), signer)
+
+	if _, err := fixture.service.JoinVoice(ctx, fixture.adminID, sourceID, ref.ControlConnectionID, "reuse-source-key", channel.VoiceJoinInput{}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	authority, ok := coordinator.VoiceAuthority(fixture.adminID)
+	if !ok {
+		t.Fatal("source join did not create voice authority")
+	}
+	_, err = fixture.service.JoinVoice(ctx, fixture.adminID, targetID, ref.ControlConnectionID, "reuse-target-key", channel.VoiceJoinInput{
+		ExpectedVoiceSessionID: fmt.Sprintf("%x", authority.VoiceSessionID),
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("reuse move failed after runtime commit: %v", err)
+	}
+	moved, ok := coordinator.VoiceAuthority(fixture.adminID)
+	if !ok || moved.ChannelID != targetID {
+		t.Fatalf("moved authority = %+v, ok=%t", moved, ok)
+	}
+	if projected, ok := fixture.state.Current().VoiceAuthority(fixture.adminID); !ok || projected.ChannelID != targetID {
+		t.Fatalf("published moved authority = %+v, ok=%t", projected, ok)
 	}
 }
 
