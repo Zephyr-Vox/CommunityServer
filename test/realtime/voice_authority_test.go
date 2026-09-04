@@ -94,6 +94,113 @@ func TestVoiceAuthorityStageReplacementAndStaleTeardown(t *testing.T) {
 	}
 }
 
+// TestVoiceAuthorityStageRecoversAfterNaturalSessionExpiry proves that a UDP
+// expiry removing Manager's user index before coordinator teardown does not
+// make a force-new replacement fail during runtime publication.
+func TestVoiceAuthorityStageRecoversAfterNaturalSessionExpiry(t *testing.T) {
+	now := time.Now()
+	clock := now
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(7, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := reservation.Activate(&closeRecorder{}, now.Add(time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := protocol.NewManager(func() time.Time { return clock })
+	prepared, err := manager.Prepare(7, "desktop", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstStage, err := coordinator.StageVoiceReplacement(owner, nil, 101, prepared, now.UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := firstStage.Apply(manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clock = now.Add(protocol.SessionTTL + time.Second)
+	if _, ok := manager.SessionIDByUser(7); ok {
+		t.Fatal("expired session remained indexed")
+	}
+	replacement, err := manager.Prepare(7, "desktop-2", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStage, err := coordinator.StageVoiceReplacement(owner, &first.Current, 202, replacement, clock.UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := secondStage.Apply(manager)
+	if err != nil {
+		t.Fatalf("replacement after expiry = %v", err)
+	}
+	if second.Current.ChannelID != 202 || second.Current.VoiceSessionID == first.Current.VoiceSessionID {
+		t.Fatalf("replacement authority = %+v", second.Current)
+	}
+}
+
+// TestVoiceAuthorityTombstoneIsConsumedByReplacement proves a pending
+// asynchronous teardown marker cannot survive a later successful rejoin.
+func TestVoiceAuthorityTombstoneIsConsumedByReplacement(t *testing.T) {
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(7, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := reservation.Activate(&closeRecorder{}, time.Now().Add(time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := protocol.NewManager(time.Now)
+	prepared, err := manager.Prepare(7, "desktop", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := coordinator.StageVoiceReplacement(owner, nil, 101, prepared, time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := stage.Apply(manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !coordinator.BeginDisconnect(owner, 4000, "eof") {
+		t.Fatal("disconnect did not claim owner")
+	}
+	tombstone, reason, ok := coordinator.PendingVoiceAuthorityTombstone(7)
+	if !ok || tombstone != first.Current || reason != "eof" {
+		t.Fatalf("tombstone = (%+v, %q, %v)", tombstone, reason, ok)
+	}
+
+	newReservation, err := coordinator.ReserveConnect(7, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newOwner, _, err := newReservation.Activate(&closeRecorder{}, time.Now().Add(time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPrepared, err := manager.Prepare(7, "desktop-2", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newStage, err := coordinator.StageVoiceReplacement(newOwner, nil, 202, newPrepared, time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newStage.Apply(manager); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := coordinator.PendingVoiceAuthorityTombstone(7); ok {
+		t.Fatal("voice teardown tombstone survived replacement")
+	}
+}
+
 func TestVoiceAuthorityStageRejectsOldConnectionGeneration(t *testing.T) {
 	coordinator := realtime.NewConnectionCoordinator()
 	oldReservation, err := coordinator.ReserveConnect(7, 11)

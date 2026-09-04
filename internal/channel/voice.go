@@ -51,6 +51,7 @@ var (
 const (
 	voiceCreateWindow = time.Minute
 	voiceCreateLimit  = 10
+	voiceCreateKeyCap = 8192
 )
 
 // voiceCreateLimiter applies the v1 new-session budget independently for each
@@ -86,6 +87,15 @@ func (l *voiceCreateLimiter) Allow(userID int64, sourceIP string, now time.Time)
 		first++
 	}
 	entries = entries[first:]
+	if len(entries) == 0 {
+		delete(l.entries, key)
+	}
+	if len(entries) == 0 && len(l.entries) >= voiceCreateKeyCap {
+		l.pruneExpiredLocked(cutoff)
+		if len(l.entries) >= voiceCreateKeyCap {
+			return false
+		}
+	}
 	if len(entries) >= voiceCreateLimit {
 		l.entries[key] = entries
 		return false
@@ -94,14 +104,31 @@ func (l *voiceCreateLimiter) Allow(userID int64, sourceIP string, now time.Time)
 	return true
 }
 
+// pruneExpiredLocked removes keys whose entire create window has elapsed.
+// Callers must hold l.mu; the sweep runs only when the bounded table is full.
+func (l *voiceCreateLimiter) pruneExpiredLocked(cutoff time.Time) {
+	for key, entries := range l.entries {
+		if len(entries) == 0 || !entries[len(entries)-1].After(cutoff) {
+			delete(l.entries, key)
+		}
+	}
+}
+
 // voiceJoinPlan is the sequencer-owned output before publication supplies the
 // final state checkpoint. Version is retained only for the no-op branch.
 type voiceJoinPlan struct {
-	channel   realtime.SnapshotChannel
+	channel       realtime.SnapshotChannel
+	channelID     int64
+	info          protocol.SessionInfo
+	created       bool
+	version       *realtime.StateVersion
+	schedules     []voiceTemporarySchedule
+	cancellations []temporaryExpiryCancellation
+}
+
+type voiceTemporarySchedule struct {
 	channelID int64
-	info      protocol.SessionInfo
-	created   bool
-	version   *realtime.StateVersion
+	schedule  realtime.ExpirySchedule
 }
 
 // voiceJoinResult is the HTTP result after StatePublication has committed.
@@ -145,7 +172,7 @@ func (s *Service) VoiceAuthorityProjection() realtime.VoiceAuthorityProjection {
 		if err != nil {
 			return nil, nil, err
 		}
-		candidate.ClearTemporaryExpiry(previous.ChannelID)
+		oldSchedule, shouldCancel := candidate.ClearTemporaryExpiry(previous.ChannelID)
 		var schedule *realtime.ExpirySchedule
 		if channel.Temporary && activeChannelMembers(previous.ChannelID, candidate.Version()) == 0 {
 			value, scheduleErr := candidate.ScheduleTemporaryExpiry(previous.ChannelID, s.voiceNowMillis()+30_000)
@@ -154,10 +181,13 @@ func (s *Service) VoiceAuthorityProjection() realtime.VoiceAuthorityProjection {
 			}
 			schedule = &value
 		}
-		if schedule == nil {
+		if schedule == nil && !shouldCancel {
 			return []realtime.StateEventTemplate{left}, nil, nil
 		}
 		return []realtime.StateEventTemplate{left}, func() {
+			if shouldCancel {
+				s.cancelTemporaryExpiry(temporaryExpiryCancellation{channelID: previous.ChannelID, generation: oldSchedule.Generation})
+			}
 			s.scheduleTemporary(previous.ChannelID, schedule)
 		}, nil
 	}
@@ -183,12 +213,19 @@ func (s *Service) PrepareVoiceAccessLoss(candidate *realtime.StateCandidate) ([]
 	plans := make([]revokePlan, 0)
 	events := make([]realtime.StateEventTemplate, 0)
 	schedules := make(map[int64]realtime.ExpirySchedule)
+	cancellations := make(map[int64]uint64)
 	clearedTemporary := make(map[int64]struct{})
 	for _, authority := range before.VoiceAuthorities() {
 		channel, exists := after.Channel(authority.ChannelID)
 		lost := !exists || !s.visibility.CanAccessChannel(authority.UserID, authority.ChannelID, after)
 		if !lost {
 			continue
+		}
+		oldSchedule, hadSchedule := before.TemporaryExpiry(authority.ChannelID)
+		if hadSchedule && oldSchedule.Generation > 0 && oldSchedule.Deadline > 0 {
+			if previous, exists := cancellations[authority.ChannelID]; !exists || previous < oldSchedule.Generation {
+				cancellations[authority.ChannelID] = oldSchedule.Generation
+			}
 		}
 		if err := candidate.SetVoiceAuthority(authority.UserID, nil); err != nil {
 			return nil, nil, err
@@ -197,16 +234,13 @@ func (s *Service) PrepareVoiceAccessLoss(candidate *realtime.StateCandidate) ([]
 		if !exists {
 			reason = "channel_deleted"
 		} else {
-			left, err := voiceMemberEvent(authority, false, before, s.visibility)
-			if err != nil {
-				return nil, nil, err
-			}
-			events = append(events, left)
-			if channel.Temporary {
+			if channel.Temporary || hadSchedule {
 				if _, cleared := clearedTemporary[channel.ID]; !cleared {
 					candidate.ClearTemporaryExpiry(channel.ID)
 					clearedTemporary[channel.ID] = struct{}{}
 				}
+			}
+			if channel.Temporary {
 				if activeChannelMembers(channel.ID, after) == 0 {
 					schedule, scheduleErr := candidate.ScheduleTemporaryExpiry(channel.ID, s.voiceNowMillis()+30_000)
 					if scheduleErr != nil {
@@ -221,23 +255,40 @@ func (s *Service) PrepareVoiceAccessLoss(candidate *realtime.StateCandidate) ([]
 			return nil, nil, err
 		}
 		events = append(events, authorityEvents...)
+		if exists {
+			left, err := voiceMemberEvent(authority, false, before, s.visibility)
+			if err != nil {
+				return nil, nil, err
+			}
+			events = append(events, left)
+		}
 		plans = append(plans, revokePlan{authority: authority, reason: reason})
 	}
 	if len(plans) == 0 {
 		return nil, nil, nil
 	}
 	return events, func() (func(), error) {
+		drains := make([]protocol.SessionSendDrain, 0, len(plans))
 		cleanups := make([]protocol.RevocationCleanup, 0, len(plans))
 		for _, plan := range plans {
-			_, removed, cleanup, err := s.connections.BeginVoiceRevokeForPublication(plan.authority, s.voiceManager, plan.reason)
+			_, removed, drain, cleanup, err := s.connections.BeginVoiceRevokeForPublication(plan.authority, s.voiceManager, plan.reason)
 			if err != nil {
 				return nil, err
+			}
+			if removed && drain != nil {
+				drains = append(drains, drain)
 			}
 			if removed && cleanup != nil {
 				cleanups = append(cleanups, cleanup)
 			}
 		}
+		for _, drain := range drains {
+			drain()
+		}
 		return func() {
+			for channelID, generation := range cancellations {
+				s.cancelTemporaryExpiry(temporaryExpiryCancellation{channelID: channelID, generation: generation})
+			}
 			for channelID, schedule := range schedules {
 				s.scheduleTemporary(channelID, &schedule)
 			}
@@ -332,6 +383,18 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 			if projected, projectedOK := version.VoiceAuthority(actorID); projectedOK {
 				previousProjected = &projected
 			}
+			var pendingTeardown *realtime.VoiceAuthority
+			pendingTeardownReason := "owner_ws_closed"
+			if !hasCurrent && previousProjected != nil {
+				if tombstone, reason, ok := s.connections.PendingVoiceAuthorityTombstone(actorID); ok && tombstone == *previousProjected {
+					pending := tombstone
+					pendingTeardown = &pending
+					if reason == "" {
+						reason = "owner_ws_closed"
+					}
+					pendingTeardownReason = reason
+				}
+			}
 			if expectedID != ([16]byte{}) {
 				if !hasCurrent || current.VoiceSessionID != expectedID {
 					return realtime.CommandOutput{}, ErrVoiceStale
@@ -397,19 +460,52 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 			if err := candidate.SetVoiceAuthority(actorID, &proposed); err != nil {
 				return realtime.CommandOutput{}, err
 			}
+			schedules := make([]voiceTemporarySchedule, 0, 1)
+			cancellations := make([]temporaryExpiryCancellation, 0, 2)
 			if channel.Temporary {
-				candidate.ClearTemporaryExpiry(channel.ID)
+				if schedule, shouldCancel := candidate.ClearTemporaryExpiry(channel.ID); shouldCancel {
+					cancellations = append(cancellations, temporaryExpiryCancellation{channelID: channel.ID, generation: schedule.Generation})
+				}
+			}
+			if previousProjected != nil && previousProjected.ChannelID != proposed.ChannelID {
+				if previousChannel, previousExists := version.Channel(previousProjected.ChannelID); previousExists && previousChannel.Temporary {
+					if activeChannelMembers(previousChannel.ID, candidate.Version()) == 0 {
+						schedule, scheduleErr := candidate.ScheduleTemporaryExpiry(previousChannel.ID, joinedAt+30_000)
+						if scheduleErr != nil {
+							return realtime.CommandOutput{}, scheduleErr
+						}
+						schedules = append(schedules, voiceTemporarySchedule{channelID: previousChannel.ID, schedule: schedule})
+					} else {
+						if oldSchedule, shouldCancel := candidate.ClearTemporaryExpiry(previousChannel.ID); shouldCancel {
+							cancellations = append(cancellations, temporaryExpiryCancellation{channelID: previousChannel.ID, generation: oldSchedule.Generation})
+						}
+					}
+				}
 			}
 
-			events := make([]realtime.StateEventTemplate, 0, 4)
-			if previousProjected != nil && previousProjected.ChannelID != proposed.ChannelID {
+			events := make([]realtime.StateEventTemplate, 0, 6)
+			if pendingTeardown != nil {
+				teardownEvents, teardownErr := realtime.VoiceAuthorityEventTemplates(pendingTeardown, nil, pendingTeardownReason)
+				if teardownErr != nil {
+					return realtime.CommandOutput{}, teardownErr
+				}
+				events = append(events, teardownEvents...)
+				left, leftErr := voiceMemberEvent(*pendingTeardown, false, version, s.visibility)
+				if leftErr != nil {
+					return realtime.CommandOutput{}, leftErr
+				}
+				events = append(events, left)
+			}
+			memberLeft := pendingTeardown != nil
+			if previousProjected != nil && previousProjected.ChannelID != proposed.ChannelID && !memberLeft {
 				left, err := voiceMemberEvent(*previousProjected, false, version, s.visibility)
 				if err != nil {
 					return realtime.CommandOutput{}, err
 				}
 				events = append(events, left)
+				memberLeft = true
 			}
-			if previousProjected == nil || previousProjected.ChannelID != proposed.ChannelID {
+			if previousProjected == nil || previousProjected.ChannelID != proposed.ChannelID || memberLeft {
 				joined, err := voiceMemberEvent(proposed, true, version, s.visibility)
 				if err != nil {
 					return realtime.CommandOutput{}, err
@@ -440,6 +536,9 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 					if commit.Current != proposed {
 						return nil, realtime.ErrVoiceAuthorityPrecondition
 					}
+					if commit.Drain != nil {
+						commit.Drain()
+					}
 					return commit.Cleanup, nil
 				},
 			}); err != nil {
@@ -452,7 +551,7 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 			if prepared != nil {
 				info = prepared.Info()
 			}
-			return realtime.CommandOutput{Value: voiceJoinPlan{channel: snapshotChannel(channel), channelID: channel.ID, info: info, created: created}}, nil
+			return realtime.CommandOutput{Value: voiceJoinPlan{channel: snapshotChannel(channel), channelID: channel.ID, info: info, created: created, schedules: schedules, cancellations: cancellations}}, nil
 		},
 	})
 	if err != nil {
@@ -461,6 +560,10 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 	plan, ok := completion.Value.(voiceJoinPlan)
 	if !ok {
 		return voiceJoinResult{}, ErrRealtimeUnavailable
+	}
+	s.cancelTemporaryExpiries(plan.cancellations)
+	for _, schedule := range plan.schedules {
+		s.scheduleTemporary(schedule.channelID, &schedule.schedule)
 	}
 	version := completion.Publication.Version
 	state := StateCommand{CommandID: completion.CommandID}
@@ -606,8 +709,7 @@ func (s *Service) LeaveVoice(ctx context.Context, actorID int64, controlConnecti
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			eventPlan := []realtime.StateEventTemplate{left}
-			eventPlan = append(eventPlan, events...)
+			eventPlan := append(events, left)
 			var schedule *realtime.ExpirySchedule
 			if channel.Temporary && activeChannelMembers(channel.ID, version) <= 1 {
 				value, scheduleErr := candidate.ScheduleTemporaryExpiry(channel.ID, nowMillis+30_000)
@@ -620,12 +722,15 @@ func (s *Service) LeaveVoice(ctx context.Context, actorID int64, controlConnecti
 				Candidate: candidate,
 				Events:    eventPlan,
 				CommitRuntime: func() (func(), error) {
-					_, removed, disconnectErr := s.connections.BeginVoiceDisconnectForPublication(current, s.voiceManager, "left")
+					_, removed, drain, disconnectErr := s.connections.BeginVoiceDisconnectForPublication(current, s.voiceManager, "left")
 					if disconnectErr != nil {
 						return nil, disconnectErr
 					}
 					if !removed {
 						return nil, ErrVoiceStale
+					}
+					if drain != nil {
+						drain()
 					}
 					return nil, nil
 				},

@@ -111,6 +111,11 @@ type RevocationHandler func(reason RevocationReason, snap RevokedSessionSnapshot
 // worker.
 type RevocationCleanup func()
 
+// SessionSendDrain waits until all Send operations that claimed a session
+// before its removal have completed. It performs no network I/O and is safe to
+// call only after the caller has released any application/coordinator lock.
+type SessionSendDrain func()
+
 // ExpiryHandler receives sessions that expired naturally and were removed by
 // Get, Send, SessionIDByUser or Purge. It runs outside Manager and Session
 // locks on the goroutine that discovered the expiry, so it must be
@@ -118,6 +123,11 @@ type RevocationCleanup func()
 // not wait for pre-reserved writes because it has no notification ordering.
 // Explicit Delete, InvalidateUser and preemption do not emit expiry callbacks.
 type ExpiryHandler func(userID int64, sessionID [16]byte)
+
+// ExpiryBarrierHandler receives a natural-expiry callback together with the
+// removed session's send barrier. The callback must enqueue the work and the
+// eventual teardown must drain before publishing the authority removal.
+type ExpiryBarrierHandler func(userID int64, sessionID [16]byte, drain SessionSendDrain)
 
 // SessionInfo is the result of a successful ActivatePrepared call: the session
 // id and, in encrypted mode, the one-time master key for the caller's
@@ -196,13 +206,14 @@ type Session struct {
 // mutable state is protected by Session.mu. Lock order is always
 // Manager -> Session; code holding Session.mu must never acquire Manager.mu.
 type Manager struct {
-	mu       sync.Mutex
-	sessions map[[16]byte]*Session
-	byUser   map[int64][16]byte
-	now      func() time.Time
-	limits   Limits
-	onRevoke RevocationHandler
-	onExpire ExpiryHandler
+	mu              sync.Mutex
+	sessions        map[[16]byte]*Session
+	byUser          map[int64][16]byte
+	now             func() time.Time
+	limits          Limits
+	onRevoke        RevocationHandler
+	onExpire        ExpiryHandler
+	onExpireBarrier ExpiryBarrierHandler
 }
 
 // NewManager returns an empty Manager with default limits. The clock is
@@ -243,6 +254,17 @@ func (m *Manager) SetRevocationHandler(handler RevocationHandler) {
 func (m *Manager) SetExpiryHandler(handler ExpiryHandler) {
 	m.mu.Lock()
 	m.onExpire = handler
+	m.onExpireBarrier = nil
+	m.mu.Unlock()
+}
+
+// SetExpiryBarrierHandler installs the natural-expiry callback that carries a
+// send barrier for exact control-plane teardown. It replaces the legacy expiry
+// callback and must be installed before the manager is exposed to requests.
+func (m *Manager) SetExpiryBarrierHandler(handler ExpiryBarrierHandler) {
+	m.mu.Lock()
+	m.onExpireBarrier = handler
+	m.onExpire = nil
 	m.mu.Unlock()
 }
 
@@ -295,31 +317,47 @@ func (m *Manager) Prepare(userID int64, deviceID string, encrypted bool) (*Prepa
 }
 
 // ActivationCleanup performs the old-session best-effort UDP notification after
-// an application staging lock has been released. It is safe to call once; a nil
-// function represents a successful activation that replaced no live session.
+// the old session's send barrier has been drained. It is safe to call once; a
+// nil function represents a successful activation that replaced no live session.
 type ActivationCleanup func()
 
 // ActivatePreparedStaged publishes prepared when the user's current session
 // matches expectedOldID. A nil expectation permits unconditional preemption. It
-// returns cleanup work instead of executing UDP notification while a caller may
-// still hold an application coordinator/publication lock.
-func (m *Manager) ActivatePreparedStaged(prepared *PreparedSession, expectedOldID *[16]byte) (SessionInfo, ActivationCleanup, error) {
+// returns send-drain and notification work instead of waiting or performing UDP
+// notification while a caller may still hold an application lock.
+func (m *Manager) ActivatePreparedStaged(prepared *PreparedSession, expectedOldID *[16]byte) (SessionInfo, SessionSendDrain, ActivationCleanup, error) {
+	return m.activatePreparedStaged(prepared, expectedOldID, false)
+}
+
+// ActivatePreparedStagedAfterNaturalExpiry publishes prepared when the
+// expected session was already removed by natural expiry. The missing expected
+// session is accepted atomically, while a different live session still fails
+// the precondition. Callers must have validated the application authority
+// transition separately.
+func (m *Manager) ActivatePreparedStagedAfterNaturalExpiry(prepared *PreparedSession, expectedOldID *[16]byte) (SessionInfo, SessionSendDrain, ActivationCleanup, error) {
+	return m.activatePreparedStaged(prepared, expectedOldID, true)
+}
+
+// activatePreparedStaged performs the staged activation under one Manager
+// critical section. allowMissingExpected is reserved for the natural-expiry
+// handoff where UDP removed the old index before application cleanup ran.
+func (m *Manager) activatePreparedStaged(prepared *PreparedSession, expectedOldID *[16]byte, allowMissingExpected bool) (SessionInfo, SessionSendDrain, ActivationCleanup, error) {
 	if prepared == nil || prepared.session == nil || prepared.owner != m {
-		return SessionInfo{}, nil, ErrSessionPrecondition
+		return SessionInfo{}, nil, nil, ErrSessionPrecondition
 	}
 	prepared.mu.Lock()
 	if prepared.used {
 		prepared.mu.Unlock()
-		return SessionInfo{}, nil, ErrSessionPrecondition
+		return SessionInfo{}, nil, nil, ErrSessionPrecondition
 	}
 	userID := prepared.session.UserID
 	nowMS := m.nowMillis()
 	m.mu.Lock()
 	currentID, exists := m.byUser[userID]
-	if expectedOldID != nil && (!exists || currentID != *expectedOldID) {
+	if expectedOldID != nil && (!exists || currentID != *expectedOldID) && !(allowMissingExpected && !exists) {
 		m.mu.Unlock()
 		prepared.mu.Unlock()
-		return SessionInfo{}, nil, ErrSessionPrecondition
+		return SessionInfo{}, nil, nil, ErrSessionPrecondition
 	}
 	// Mark used before publishing indexes. Every successful activation has one
 	// linearization point, so a repeated call cannot deactivate and reinsert the
@@ -350,22 +388,28 @@ func (m *Manager) ActivatePreparedStaged(prepared *PreparedSession, expectedOldI
 	info := prepared.info
 	info.ReplacedPrevious = replaced
 	info.MasterKey = append([]byte(nil), info.MasterKey...)
+	drain := SessionSendDrain(func() {
+		drainSessionSends(removedSession)
+	})
 	cleanup := ActivationCleanup(func() {
 		// Explicit replacement must drain an already-reserved Send even when the
 		// session expired while that syscall was blocked. Expiry only suppresses
 		// notification; it cannot release the write-order barrier.
 		runRevocation(revocationWork{session: removedSession, reason: RevocationReplaced, handler: revokeHandler, notify: replaced})
 	})
-	return info, cleanup, nil
+	return info, drain, cleanup, nil
 }
 
 // ActivatePrepared publishes prepared and immediately performs its old-session
 // cleanup. Application code that holds a coordinator or StatePublication lock
 // must use ActivatePreparedStaged and run the returned cleanup after unlocking.
 func (m *Manager) ActivatePrepared(prepared *PreparedSession, expectedOldID *[16]byte) (SessionInfo, error) {
-	info, cleanup, err := m.ActivatePreparedStaged(prepared, expectedOldID)
+	info, drain, cleanup, err := m.ActivatePreparedStaged(prepared, expectedOldID)
 	if err != nil {
 		return SessionInfo{}, err
+	}
+	if drain != nil {
+		drain()
 	}
 	if cleanup != nil {
 		cleanup()
@@ -428,8 +472,11 @@ func (m *Manager) getSession(id [16]byte) (*Session, bool) {
 
 	m.deleteLocked(id, sess.UserID)
 	handler := m.onExpire
+	barrierHandler := m.onExpireBarrier
 	m.mu.Unlock()
-	if handler != nil {
+	if barrierHandler != nil {
+		barrierHandler(sess.UserID, id, SessionSendDrain(func() { drainSessionSends(sess) }))
+	} else if handler != nil {
 		handler(sess.UserID, id)
 	}
 	return nil, false
@@ -467,8 +514,11 @@ func (m *Manager) SessionIDByUser(userID int64) ([16]byte, bool) {
 
 	m.deleteLocked(id, sess.UserID)
 	handler := m.onExpire
+	barrierHandler := m.onExpireBarrier
 	m.mu.Unlock()
-	if handler != nil {
+	if barrierHandler != nil {
+		barrierHandler(sess.UserID, id, SessionSendDrain(func() { drainSessionSends(sess) }))
+	} else if handler != nil {
 		handler(sess.UserID, id)
 	}
 	return [16]byte{}, false
@@ -511,53 +561,22 @@ func (m *Manager) InvalidateUser(userID int64) int {
 	return 1
 }
 
-// Delete removes the session named by id when it belongs to userID. A missing
-// or expired session reports ErrSessionNotFound; a session owned by another
-// user reports ErrSessionNotOwned. Voluntary deletion never emits a
-// revocation notification.
+// Delete removes the session named by id when it belongs to userID and waits
+// for already-reserved sends before returning. A missing or expired session
+// reports ErrSessionNotFound; a session owned by another user reports
+// ErrSessionNotOwned. Voluntary deletion never emits a revocation notification.
 func (m *Manager) Delete(id [16]byte, userID int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	sess, ok := m.sessions[id]
-	if !ok {
-		return ErrSessionNotFound
+	drain, err := m.DeleteStaged(id, userID)
+	if drain != nil {
+		drain()
 	}
-	if sess.UserID != userID {
-		return ErrSessionNotOwned
-	}
-	nowMS := m.nowMillis()
-	sess.mu.Lock()
-	expired := sess.expiredLocked(nowMS)
-	sess.deactivateLocked()
-	sess.mu.Unlock()
-	m.deleteLocked(id, userID)
-	if expired {
-		return ErrSessionNotFound
-	}
-	return nil
+	return err
 }
 
-// Revoke removes exactly id when it belongs to userID and drains its send
-// barrier before issuing the best-effort revocation notification. It is used
-// when control-plane authority is lost; voluntary leave continues to use Delete
-// and intentionally emits no revocation frame.
-func (m *Manager) Revoke(id [16]byte, userID int64) error {
-	cleanup, err := m.RevokeStaged(id, userID)
-	if err != nil {
-		return err
-	}
-	if cleanup != nil {
-		cleanup()
-	}
-	return nil
-}
-
-// RevokeStaged makes the exact session inactive and removes it from the
-// Manager indexes synchronously, then returns the sendMu/UDP notification work
-// for execution outside caller locks. This keeps auth and coordinator teardown
-// non-blocking while preserving audio-before-revocation ordering.
-func (m *Manager) RevokeStaged(id [16]byte, userID int64) (RevocationCleanup, error) {
+// DeleteStaged removes the session named by id from the Manager indexes and
+// returns a send barrier for the caller to run before publishing the matching
+// control-plane teardown. It never emits a revocation notification.
+func (m *Manager) DeleteStaged(id [16]byte, userID int64) (SessionSendDrain, error) {
 	m.mu.Lock()
 	sess, ok := m.sessions[id]
 	if !ok {
@@ -570,19 +589,97 @@ func (m *Manager) RevokeStaged(id [16]byte, userID int64) (RevocationCleanup, er
 	}
 	nowMS := m.nowMillis()
 	sess.mu.Lock()
+	expired := sess.expiredLocked(nowMS)
+	sess.deactivateLocked()
+	sess.mu.Unlock()
+	m.deleteLocked(id, userID)
+	m.mu.Unlock()
+	drain := SessionSendDrain(func() {
+		drainSessionSends(sess)
+	})
+	if expired {
+		return drain, ErrSessionNotFound
+	}
+	return drain, nil
+}
+
+// Revoke removes exactly id when it belongs to userID and drains its send
+// barrier before issuing the best-effort revocation notification. It is used
+// when control-plane authority is lost; voluntary leave continues to use Delete
+// and intentionally emits no revocation frame.
+func (m *Manager) Revoke(id [16]byte, userID int64) error {
+	cleanup, err := m.RevokeStaged(id, userID)
+	if cleanup != nil {
+		cleanup()
+	}
+	return err
+}
+
+// RevokeStaged makes the exact session inactive and removes it from the
+// Manager indexes synchronously, then returns the sendMu/UDP notification work
+// for execution outside caller locks. This keeps auth and coordinator teardown
+// non-blocking while preserving audio-before-revocation ordering.
+func (m *Manager) RevokeStaged(id [16]byte, userID int64) (RevocationCleanup, error) {
+	sess, active, handler, err := m.revokeStaged(id, userID)
+	if sess == nil {
+		return nil, err
+	}
+	cleanup := m.revocationCleanup(sess, active, handler)
+	if !active {
+		return cleanup, ErrSessionNotFound
+	}
+	return cleanup, nil
+}
+
+// RevokeStagedForPublication removes one exact session and returns separate
+// send-drain and notification work. Callers use the drain before publication
+// and retain the notification cleanup for after publication.
+func (m *Manager) RevokeStagedForPublication(id [16]byte, userID int64) (SessionSendDrain, RevocationCleanup, error) {
+	sess, active, handler, err := m.revokeStaged(id, userID)
+	if sess == nil {
+		return nil, nil, err
+	}
+	drain := SessionSendDrain(func() {
+		drainSessionSends(sess)
+	})
+	cleanup := m.revocationCleanup(sess, active, handler)
+	if !active {
+		return drain, cleanup, ErrSessionNotFound
+	}
+	return drain, cleanup, nil
+}
+
+// revokeStaged deactivates and removes one exact session without waiting for
+// its send barrier. The returned session remains owned by the caller's staged
+// drain/notification work after Manager indexes are cleared.
+func (m *Manager) revokeStaged(id [16]byte, userID int64) (*Session, bool, RevocationHandler, error) {
+	m.mu.Lock()
+	sess, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, false, nil, ErrSessionNotFound
+	}
+	if sess.UserID != userID {
+		m.mu.Unlock()
+		return nil, false, nil, ErrSessionNotOwned
+	}
+	nowMS := m.nowMillis()
+	sess.mu.Lock()
 	active := !sess.expiredLocked(nowMS)
 	sess.deactivateLocked()
 	sess.mu.Unlock()
 	m.deleteLocked(id, userID)
 	handler := m.onRevoke
 	m.mu.Unlock()
-	cleanup := RevocationCleanup(func() {
+	return sess, active, handler, nil
+}
+
+// revocationCleanup builds the post-drain notification work shared by staged
+// revocation entry points.
+func (m *Manager) revocationCleanup(sess *Session, active bool, handler RevocationHandler) RevocationCleanup {
+	return RevocationCleanup(func() {
 		runRevocation(revocationWork{session: sess, reason: RevocationRevoked, handler: handler, notify: active})
 	})
-	if !active {
-		return cleanup, ErrSessionNotFound
-	}
-	return cleanup, nil
 }
 
 // Purge is the only full-table scan entry point. It deletes every expired
@@ -590,8 +687,9 @@ func (m *Manager) RevokeStaged(id [16]byte, userID int64) (RevocationCleanup, er
 // 30s ticker. The UDP hot path never calls Purge.
 func (m *Manager) Purge() int {
 	type expiredSession struct {
-		id     [16]byte
-		userID int64
+		id      [16]byte
+		userID  int64
+		session *Session
 	}
 
 	m.mu.Lock()
@@ -606,13 +704,18 @@ func (m *Manager) Purge() int {
 		sess.mu.Unlock()
 		if isExpired {
 			m.deleteLocked(id, sess.UserID)
-			expired = append(expired, expiredSession{id: id, userID: sess.UserID})
+			expired = append(expired, expiredSession{id: id, userID: sess.UserID, session: sess})
 		}
 	}
 	handler := m.onExpire
+	barrierHandler := m.onExpireBarrier
 	m.mu.Unlock()
 
-	if handler != nil {
+	if barrierHandler != nil {
+		for _, sess := range expired {
+			barrierHandler(sess.userID, sess.id, SessionSendDrain(func() { drainSessionSends(sess.session) }))
+		}
+	} else if handler != nil {
 		for _, sess := range expired {
 			handler(sess.userID, sess.id)
 		}
@@ -744,6 +847,7 @@ func runRevocation(work revocationWork) {
 		return
 	}
 
+	drainSessionSends(work.session)
 	work.session.sendMu.Lock()
 	var snapshot *RevokedSessionSnapshot
 	if work.notify && work.handler != nil {
@@ -759,6 +863,17 @@ func runRevocation(work revocationWork) {
 	if snapshot != nil {
 		work.handler(work.reason, *snapshot)
 	}
+}
+
+// drainSessionSends waits for the session's in-flight packet writes without
+// holding Manager.mu or Session.mu. The session must already be inactive so no
+// new Send can pass reserveSendSeq after this barrier is released.
+func drainSessionSends(session *Session) {
+	if session == nil {
+		return
+	}
+	session.sendMu.Lock()
+	session.sendMu.Unlock()
 }
 
 // newRevokedSnapshotLocked captures everything needed for a best-effort

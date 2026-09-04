@@ -596,10 +596,13 @@ func (c *StateCandidate) ScheduleTemporaryExpiry(channelID, deadline int64) (Exp
 	return schedule, nil
 }
 
-// ClearTemporaryExpiry invalidates an active empty-channel timer.
-func (c *StateCandidate) ClearTemporaryExpiry(channelID int64) {
+// ClearTemporaryExpiry invalidates an active empty-channel timer and returns
+// the previous schedule so the owning service can cancel its external timer
+// after this candidate becomes visible.
+func (c *StateCandidate) ClearTemporaryExpiry(channelID int64) (ExpirySchedule, bool) {
 	previous := c.version.runtime.temporaryExpiry[channelID]
 	c.version.runtime.temporaryExpiry[channelID] = ExpirySchedule{Generation: previous.Generation + 1}
+	return previous, previous.Generation > 0 && previous.Deadline > 0
 }
 
 // ScheduleMuteExpiry records an exact timed mute cleanup deadline.

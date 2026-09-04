@@ -117,11 +117,13 @@ type VoiceAuthorityStage struct {
 }
 
 // VoiceAuthorityCommit is the immutable work returned by a successful staged
-// transition. Cleanup must run after the caller releases publication and
-// coordinator locks because it may wait for old UDP sends before notification.
+// transition. Drain must run after the coordinator lock is released but before
+// StatePublication; Cleanup is the best-effort notification work that may run
+// after publication.
 type VoiceAuthorityCommit struct {
 	Previous *VoiceAuthority
 	Current  VoiceAuthority
+	Drain    protocol.SessionSendDrain
 	Cleanup  protocol.ActivationCleanup
 }
 
@@ -237,15 +239,25 @@ type connectionCloseObserver struct {
 }
 
 type connectionUser struct {
-	userID      int64
-	mu          sync.Mutex
-	refs        int
-	connections map[[16]byte]*connectionRecord
-	nextGen     uint64
-	admitted    int
-	live        atomic.Int64
-	voice       *VoiceAuthority
-	nextVoice   uint64
+	userID         int64
+	mu             sync.Mutex
+	refs           int
+	connections    map[[16]byte]*connectionRecord
+	nextGen        uint64
+	admitted       int
+	live           atomic.Int64
+	voice          *VoiceAuthority
+	voiceTombstone *voiceAuthorityTombstone
+	nextVoice      uint64
+}
+
+// voiceAuthorityTombstone records a coordinator teardown that has not yet
+// necessarily reached the immutable StateStore projection. A subsequent join
+// can fold this exact terminal transition into its own publication instead of
+// allowing an asynchronously queued observer callback to become stale.
+type voiceAuthorityTombstone struct {
+	authority VoiceAuthority
+	reason    string
 }
 
 type connectionRecord struct {
@@ -556,6 +568,38 @@ func (c *ConnectionCoordinator) VoiceAuthority(userID int64) (VoiceAuthority, bo
 	return *user.voice, true
 }
 
+// PendingVoiceAuthorityTombstone returns the exact authority transition that
+// has been removed from the coordinator but may still be queued for immutable
+// state publication. The result is a copy and is safe for callers to retain.
+func (c *ConnectionCoordinator) PendingVoiceAuthorityTombstone(userID int64) (VoiceAuthority, string, bool) {
+	if c == nil || userID <= 0 {
+		return VoiceAuthority{}, "", false
+	}
+	user := c.acquireUser(userID)
+	defer c.releaseUser(userID, user)
+	user.mu.Lock()
+	defer user.mu.Unlock()
+	if user.voiceTombstone == nil {
+		return VoiceAuthority{}, "", false
+	}
+	return user.voiceTombstone.authority, user.voiceTombstone.reason, true
+}
+
+// clearPendingVoiceAuthorityTombstone removes only the matching teardown
+// marker, so a stale observer cannot erase a later teardown for the same user.
+func (c *ConnectionCoordinator) clearPendingVoiceAuthorityTombstone(authority *VoiceAuthority) {
+	if c == nil || authority == nil {
+		return
+	}
+	user := c.acquireUser(authority.UserID)
+	defer c.releaseUser(authority.UserID, user)
+	user.mu.Lock()
+	defer user.mu.Unlock()
+	if user.voiceTombstone != nil && user.voiceTombstone.authority == *authority {
+		user.voiceTombstone = nil
+	}
+}
+
 // ActiveConnection returns the current generation for controlConnectionID only
 // when it belongs to userID and is active. HTTP join/leave adapters use this to
 // resolve X-Zephyr-Control-Connection without trusting a client generation.
@@ -654,7 +698,15 @@ func (s *VoiceAuthorityStage) ProposedAuthority() (VoiceAuthority, error) {
 // preserves the required publication -> coordinator -> Manager lock order
 // without allowing network I/O or sendMu waiting under coordinator ownership.
 func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCommit, error) {
-	return s.apply(manager, true)
+	commit, err := s.apply(manager)
+	if err != nil {
+		return VoiceAuthorityCommit{}, err
+	}
+	if commit.Drain != nil {
+		commit.Drain()
+	}
+	s.coordinator.notifyVoiceAuthority(commit.Previous, &commit.Current, "session_replaced")
+	return commit, nil
 }
 
 // ApplyForPublication commits the staged authority without enqueueing the
@@ -662,13 +714,13 @@ func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCo
 // authority transition in the same StatePublication request; doing both would
 // publish duplicate or stale runtime projections.
 func (s *VoiceAuthorityStage) ApplyForPublication(manager *protocol.Manager) (VoiceAuthorityCommit, error) {
-	return s.apply(manager, false)
+	return s.apply(manager)
 }
 
-// apply performs the single coordinator/Manager runtime commit point. notify
-// remains enabled for legacy lifecycle callers that publish the projection via
-// the coordinator observer after Apply returns.
-func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, notify bool) (VoiceAuthorityCommit, error) {
+// apply performs the single coordinator/Manager runtime commit point. Apply
+// publishes the observer transition after draining, while ApplyForPublication
+// leaves that transition for the enclosing StatePublication.
+func (s *VoiceAuthorityStage) apply(manager *protocol.Manager) (VoiceAuthorityCommit, error) {
 	if s == nil || s.coordinator == nil || !validConnectionRef(s.owner) {
 		return VoiceAuthorityCommit{}, ErrVoiceAuthorityPrecondition
 	}
@@ -678,12 +730,6 @@ func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, notify bool) (Voi
 	user := s.coordinator.acquireUser(s.owner.UserID)
 	defer s.coordinator.releaseUser(s.owner.UserID, user)
 	user.mu.Lock()
-	var notifyPrevious, notifyCurrent *VoiceAuthority
-	defer func() {
-		if notify && notifyCurrent != nil {
-			s.coordinator.notifyVoiceAuthority(notifyPrevious, notifyCurrent, "session_replaced")
-		}
-	}()
 	defer user.mu.Unlock()
 	if !user.connectionActiveLocked(s.owner) || !sameVoiceAuthority(user.voice, s.expected) || user.nextVoice+1 != s.generation {
 		return VoiceAuthorityCommit{}, ErrVoiceAuthorityPrecondition
@@ -691,6 +737,7 @@ func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, notify bool) (Voi
 
 	previous := cloneVoiceAuthority(user.voice)
 	var sessionID [16]byte
+	var drain protocol.SessionSendDrain
 	var cleanup protocol.ActivationCleanup
 	if s.prepared != nil {
 		var expectedSessionID *[16]byte
@@ -698,11 +745,19 @@ func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, notify bool) (Voi
 			id := s.expected.VoiceSessionID
 			expectedSessionID = &id
 		}
-		info, stagedCleanup, err := manager.ActivatePreparedStaged(s.prepared, expectedSessionID)
+		info, stagedDrain, stagedCleanup, err := manager.ActivatePreparedStaged(s.prepared, expectedSessionID)
+		if errors.Is(err, protocol.ErrSessionPrecondition) && expectedSessionID != nil {
+			// UDP natural expiry removes the Manager index before its asynchronous
+			// coordinator cleanup. Let Manager accept only a missing expected index
+			// atomically, so this normal race cannot turn a runtime publication into
+			// a process-fatal sequencer failure or preempt a newer session.
+			info, stagedDrain, stagedCleanup, err = manager.ActivatePreparedStagedAfterNaturalExpiry(s.prepared, expectedSessionID)
+		}
 		if err != nil {
 			return VoiceAuthorityCommit{}, err
 		}
 		sessionID = info.ID
+		drain = stagedDrain
 		cleanup = stagedCleanup
 	} else {
 		sessionID = s.expected.VoiceSessionID
@@ -718,9 +773,8 @@ func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, notify bool) (Voi
 		JoinedAt:                 s.joinedAt,
 	}
 	user.voice = &current
-	notifyPrevious = previous
-	notifyCurrent = &current
-	return VoiceAuthorityCommit{Previous: previous, Current: current, Cleanup: cleanup}, nil
+	user.voiceTombstone = nil
+	return VoiceAuthorityCommit{Previous: previous, Current: current, Drain: drain, Cleanup: cleanup}, nil
 }
 
 // BeginVoiceDisconnect conditionally clears expected authority and deactivates
@@ -739,16 +793,8 @@ func (c *ConnectionCoordinator) BeginVoiceDisconnectReason(expected VoiceAuthori
 // BeginVoiceDisconnectForPublication clears one exact authority and suppresses
 // the asynchronous observer. Application commands use it when their candidate
 // and lifecycle events are already reserved in the same StatePublication.
-func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, error) {
-	return c.beginVoiceDisconnectReason(expected, manager, reason, false)
-}
-
-// BeginVoiceRevokeForPublication clears one exact authority without the
-// observer and returns staged UDP revocation cleanup for the caller to run
-// after StatePublication releases its locks. It is used for access-loss and
-// forced teardown paths; voluntary leave deliberately uses Delete instead.
-func (c *ConnectionCoordinator) BeginVoiceRevokeForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.RevocationCleanup, error) {
-	if c == nil || !expected.Valid() || manager == nil {
+func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.SessionSendDrain, error) {
+	if c == nil || !expected.Valid() {
 		return VoiceAuthority{}, false, nil, ErrVoiceAuthorityPrecondition
 	}
 	user := c.acquireUser(expected.UserID)
@@ -758,13 +804,43 @@ func (c *ConnectionCoordinator) BeginVoiceRevokeForPublication(expected VoiceAut
 	if !sameVoiceAuthority(user.voice, &expected) {
 		return VoiceAuthority{}, false, nil, nil
 	}
-	cleanup, err := manager.RevokeStaged(expected.VoiceSessionID, expected.UserID)
-	if err != nil && !errors.Is(err, protocol.ErrSessionNotFound) {
-		return VoiceAuthority{}, false, nil, err
+	var drain protocol.SessionSendDrain
+	if manager != nil {
+		stagedDrain, err := manager.DeleteStaged(expected.VoiceSessionID, expected.UserID)
+		if err != nil && !errors.Is(err, protocol.ErrSessionNotFound) {
+			return VoiceAuthority{}, false, nil, err
+		}
+		drain = stagedDrain
 	}
 	removed := *user.voice
 	user.voice = nil
-	return removed, true, cleanup, nil
+	user.voiceTombstone = &voiceAuthorityTombstone{authority: removed, reason: reason}
+	return removed, true, drain, nil
+}
+
+// BeginVoiceRevokeForPublication clears one exact authority without the
+// observer and returns staged UDP revocation cleanup for the caller to run
+// after StatePublication releases its locks. It is used for access-loss and
+// forced teardown paths; voluntary leave deliberately uses Delete instead.
+func (c *ConnectionCoordinator) BeginVoiceRevokeForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.SessionSendDrain, protocol.RevocationCleanup, error) {
+	if c == nil || !expected.Valid() || manager == nil {
+		return VoiceAuthority{}, false, nil, nil, ErrVoiceAuthorityPrecondition
+	}
+	user := c.acquireUser(expected.UserID)
+	defer c.releaseUser(expected.UserID, user)
+	user.mu.Lock()
+	defer user.mu.Unlock()
+	if !sameVoiceAuthority(user.voice, &expected) {
+		return VoiceAuthority{}, false, nil, nil, nil
+	}
+	drain, cleanup, err := manager.RevokeStagedForPublication(expected.VoiceSessionID, expected.UserID)
+	if err != nil && !errors.Is(err, protocol.ErrSessionNotFound) {
+		return VoiceAuthority{}, false, nil, nil, err
+	}
+	removed := *user.voice
+	user.voice = nil
+	user.voiceTombstone = &voiceAuthorityTombstone{authority: removed, reason: reason}
+	return removed, true, drain, cleanup, nil
 }
 
 // beginVoiceDisconnectReason conditionally clears one exact authority and
@@ -775,27 +851,33 @@ func (c *ConnectionCoordinator) beginVoiceDisconnectReason(expected VoiceAuthori
 		return VoiceAuthority{}, false, ErrVoiceAuthorityPrecondition
 	}
 	user := c.acquireUser(expected.UserID)
-	defer c.releaseUser(expected.UserID, user)
 	user.mu.Lock()
-	var notification *VoiceAuthority
-	defer func() {
-		if notify && notification != nil {
-			c.notifyVoiceAuthority(notification, nil, reason)
-		}
-	}()
-	defer user.mu.Unlock()
 	if !sameVoiceAuthority(user.voice, &expected) {
+		user.mu.Unlock()
+		c.releaseUser(expected.UserID, user)
 		return VoiceAuthority{}, false, nil
 	}
+	var drain protocol.SessionSendDrain
 	if manager != nil {
-		err := manager.Delete(expected.VoiceSessionID, expected.UserID)
+		stagedDrain, err := manager.DeleteStaged(expected.VoiceSessionID, expected.UserID)
 		if err != nil && !errors.Is(err, protocol.ErrSessionNotFound) {
+			user.mu.Unlock()
+			c.releaseUser(expected.UserID, user)
 			return VoiceAuthority{}, false, err
 		}
+		drain = stagedDrain
 	}
 	removed := *user.voice
 	user.voice = nil
-	notification = &removed
+	user.voiceTombstone = &voiceAuthorityTombstone{authority: removed, reason: reason}
+	user.mu.Unlock()
+	c.releaseUser(expected.UserID, user)
+	if drain != nil {
+		drain()
+	}
+	if notify {
+		c.notifyVoiceAuthority(&removed, nil, reason)
+	}
 	return removed, true, nil
 }
 
@@ -904,7 +986,7 @@ func (c *ConnectionCoordinator) PrepareAccountTeardown(userID int64, reason stri
 			if projectionErr != nil {
 				return AccountTeardownPlan{}, projectionErr
 			}
-			events = append(membershipEvents, events...)
+			events = append(events, membershipEvents...)
 			afterPublish = cleanup
 		}
 	}
@@ -1028,6 +1110,7 @@ func (c *ConnectionCoordinator) beginDisconnectLocked(user *connectionUser, ref 
 	if user.voice != nil && user.voice.ControlConnectionID == ref.ControlConnectionID && user.voice.ConnectionGeneration == ref.Generation {
 		plan.voiceAuthority = cloneVoiceAuthority(user.voice)
 		plan.voiceReason = reason
+		user.voiceTombstone = &voiceAuthorityTombstone{authority: *user.voice, reason: reason}
 		if stop := c.voiceAuthorityStop.Load(); stop != nil {
 			plan.voiceAuthorityStop = stop.stop
 		}

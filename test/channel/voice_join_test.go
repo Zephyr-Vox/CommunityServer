@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -148,9 +149,149 @@ func TestVoiceJoinPublishesAuthorityAndReplaysSensitiveResult(t *testing.T) {
 	if _, ok := fixture.state.Current().VoiceAuthority(fixture.adminID); ok {
 		t.Fatal("published voice authority remains after leave")
 	}
+	lastAuthority, lastMemberLeft := -1, -1
+	for index, event := range fixture.publication.Capture().Events {
+		switch event.EventType {
+		case "voice.authority.updated":
+			lastAuthority = index
+		case "channel.member.left":
+			lastMemberLeft = index
+		}
+	}
+	if lastAuthority < 0 || lastMemberLeft < 0 || lastAuthority > lastMemberLeft {
+		t.Fatalf("leave event order = authority %d, member.left %d", lastAuthority, lastMemberLeft)
+	}
 	leaveReplay := leave()
 	if leaveReplay.Code != http.StatusNoContent || leaveReplay.Body.Len() != 0 {
 		t.Fatalf("leave replay status/body = %d/%s", leaveReplay.Code, leaveReplay.Body.String())
+	}
+}
+
+// TestVoiceJoinFoldsPendingOwnerTeardown proves a fast rejoin publishes the
+// queued owner-WS teardown before the new membership and authority events.
+func TestVoiceJoinFoldsPendingOwnerTeardown(t *testing.T) {
+	fixture := newFixture(t)
+	channelSnapshot, _, err := fixture.service.CreateChannel(context.Background(), fixture.adminID, channel.CreateChannelInput{
+		Name:       "Voice",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channelID := mustID(t, channelSnapshot.ID)
+	manager := protocol.NewManager(func() time.Time { return time.UnixMilli(1_000) })
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(fixture.adminID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRef, _, err := reservation.Activate(voiceJoinTransport{}, 100_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceRuntime(manager, coordinator, false)
+	fixture.service.SetVoiceClock(func() int64 { return 1_000 })
+	signer, err := realtime.NewRequestIdentitySigner([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceIdempotency(realtime.NewRuntimeIdempotencyCache(), signer)
+	if _, err := fixture.service.JoinVoice(context.Background(), fixture.adminID, channelID, oldRef.ControlConnectionID, "old-voice-key-01", channel.VoiceJoinInput{DeviceID: "desktop"}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if !coordinator.BeginDisconnect(oldRef, 4000, "eof") {
+		t.Fatal("old owner disconnect did not claim connection")
+	}
+	newReservation, err := coordinator.ReserveConnect(fixture.adminID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRef, _, err := newReservation.Activate(voiceJoinTransport{}, 100_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.service.JoinVoice(context.Background(), fixture.adminID, channelID, newRef.ControlConnectionID, "new-voice-key-01", channel.VoiceJoinInput{DeviceID: "desktop-2"}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	events := fixture.publication.Capture().Events
+	if len(events) < 5 {
+		t.Fatalf("published events = %+v", events)
+	}
+	got := make([]string, 0, 5)
+	for _, event := range events[len(events)-5:] {
+		got = append(got, event.EventType)
+	}
+	want := []string{"voice.revoked", "voice.authority.updated", "channel.member.left", "channel.member.joined", "voice.authority.updated"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("fast rejoin event order = %v, want %v", got, want)
+	}
+}
+
+// TestVoiceJoinCancelsPriorTemporaryExpiryTimer proves invalidating a target
+// channel's grace period removes the old scheduler entry after publication.
+func TestVoiceJoinCancelsPriorTemporaryExpiryTimer(t *testing.T) {
+	fixture := newFixture(t)
+	channelSnapshot, _, err := fixture.service.CreateChannel(context.Background(), fixture.adminID, channel.CreateChannelInput{
+		Name:       "Temporary voice",
+		Mode:       "voice",
+		Temporary:  true,
+		Visibility: "public",
+		Capacity:   2,
+		Position:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channelID := mustID(t, channelSnapshot.ID)
+	callback := make(chan realtime.DeadlineTask, 1)
+	scheduler := realtime.NewDeadlineScheduler(func(task realtime.DeadlineTask) { callback <- task })
+	if scheduler == nil {
+		t.Fatal("nil deadline scheduler")
+	}
+	t.Cleanup(func() { _ = scheduler.Close(context.Background()) })
+	fixture.service.SetDeadlineScheduler(scheduler)
+	candidate, err := fixture.state.BuildRuntimeCandidate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(500 * time.Millisecond).UnixMilli()
+	schedule, err := candidate.ScheduleTemporaryExpiry(channelID, deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.publication.Commit(realtime.PublicationRequest{Candidate: candidate}); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.Schedule(realtime.DeadlineTask{Kind: "temporary", ID: channelID, Generation: schedule.Generation, Deadline: schedule.Deadline})
+
+	manager := protocol.NewManager(func() time.Time { return time.UnixMilli(1_000) })
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(fixture.adminID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := reservation.Activate(voiceJoinTransport{}, 100_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceRuntime(manager, coordinator, false)
+	fixture.service.SetVoiceClock(func() int64 { return 1_000 })
+	signer, err := realtime.NewRequestIdentitySigner([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceIdempotency(realtime.NewRuntimeIdempotencyCache(), signer)
+	if _, err := fixture.service.JoinVoice(context.Background(), fixture.adminID, channelID, ref.ControlConnectionID, "temporary-join-key", channel.VoiceJoinInput{DeviceID: "desktop"}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case task := <-callback:
+		t.Fatalf("invalidated temporary timer fired: %+v", task)
+	case <-time.After(700 * time.Millisecond):
 	}
 }
 
@@ -205,5 +346,90 @@ func TestVoiceAccessLossRevokesManagerAndAuthority(t *testing.T) {
 	}
 	if _, ok := fixture.state.Current().VoiceAuthority(fixture.adminID); ok {
 		t.Fatal("StateStore retained inaccessible voice authority")
+	}
+	lastLifecycle, lastAuthority, lastMemberLeft := -1, -1, -1
+	for index, event := range fixture.publication.Capture().Events {
+		switch event.EventType {
+		case "voice.revoked", "voice.disconnected":
+			lastLifecycle = index
+		case "voice.authority.updated":
+			lastAuthority = index
+		case "channel.member.left":
+			lastMemberLeft = index
+		}
+	}
+	if lastLifecycle < 0 || lastAuthority < 0 || lastMemberLeft < 0 || lastAuthority > lastMemberLeft || lastLifecycle > lastAuthority {
+		t.Fatalf("access-loss event order = lifecycle %d, authority %d, member.left %d", lastLifecycle, lastAuthority, lastMemberLeft)
+	}
+}
+
+// TestVoiceMoveArmsSourceTemporaryExpiry verifies that a cross-channel move
+// invalidates the target timer and starts the same 30-second grace timer for a
+// source temporary channel that became empty.
+func TestVoiceMoveArmsSourceTemporaryExpiry(t *testing.T) {
+	fixture := newFixture(t)
+	ctx := context.Background()
+	source, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		Name:       "Temporary source",
+		Mode:       "voice",
+		Temporary:  true,
+		Visibility: "public",
+		Capacity:   2,
+		Position:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		Name:       "Temporary target",
+		Mode:       "voice",
+		Temporary:  true,
+		Visibility: "public",
+		Capacity:   2,
+		Position:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID := mustID(t, source.ID)
+	targetID := mustID(t, target.ID)
+
+	manager := protocol.NewManager(func() time.Time { return time.UnixMilli(1_000) })
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(fixture.adminID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := reservation.Activate(voiceJoinTransport{}, 100_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceRuntime(manager, coordinator, false)
+	fixture.service.SetVoiceClock(func() int64 { return 1_000 })
+	signer, err := realtime.NewRequestIdentitySigner([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceIdempotency(realtime.NewRuntimeIdempotencyCache(), signer)
+
+	if _, err := fixture.service.JoinVoice(ctx, fixture.adminID, sourceID, ref.ControlConnectionID, "temporary-source-key", channel.VoiceJoinInput{DeviceID: "desktop"}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	authority, ok := coordinator.VoiceAuthority(fixture.adminID)
+	if !ok {
+		t.Fatal("source join did not create voice authority")
+	}
+	if _, err := fixture.service.JoinVoice(ctx, fixture.adminID, targetID, ref.ControlConnectionID, "temporary-target-key", channel.VoiceJoinInput{
+		ExpectedVoiceSessionID: fmt.Sprintf("%x", authority.VoiceSessionID),
+	}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	sourceSchedule, sourceScheduled := fixture.state.Current().TemporaryExpiry(sourceID)
+	if !sourceScheduled || sourceSchedule.Deadline != 31_000 || sourceSchedule.Generation == 0 {
+		t.Fatalf("source temporary schedule = %+v, scheduled=%t", sourceSchedule, sourceScheduled)
+	}
+	targetSchedule, targetScheduled := fixture.state.Current().TemporaryExpiry(targetID)
+	if !targetScheduled || targetSchedule.Deadline != 0 || targetSchedule.Generation == 0 {
+		t.Fatalf("target temporary schedule = %+v, scheduled=%t", targetSchedule, targetScheduled)
 	}
 }

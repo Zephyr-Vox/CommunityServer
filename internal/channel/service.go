@@ -1264,6 +1264,13 @@ type mutationValue struct {
 	noop              bool
 }
 
+// temporaryExpiryCancellation identifies one scheduler slot and the newest
+// generation that an invalidating publication may cancel.
+type temporaryExpiryCancellation struct {
+	channelID  int64
+	generation uint64
+}
+
 // mutationResult combines one command-owned API result with its final
 // publication checkpoint after the sequencer has made that publication visible.
 type mutationResult struct {
@@ -1716,6 +1723,49 @@ func (s *Service) scheduleTemporary(channelID int64, schedule *realtime.ExpirySc
 	s.scheduler.Schedule(realtime.DeadlineTask{Kind: "temporary", ID: channelID, Generation: schedule.Generation, Deadline: schedule.Deadline})
 }
 
+// cancelTemporaryExpiry stops an older timer for one channel after the
+// publication that invalidated it becomes visible. Generation ordering keeps
+// a newly scheduled grace period safe from an older cancellation.
+func (s *Service) cancelTemporaryExpiry(cancellation temporaryExpiryCancellation) {
+	if s == nil || s.scheduler == nil || cancellation.generation == 0 {
+		return
+	}
+	s.scheduler.Cancel("temporary", cancellation.channelID, cancellation.generation)
+}
+
+// cancelTemporaryExpiries applies all exact-generation timer cancellations.
+func (s *Service) cancelTemporaryExpiries(cancellations []temporaryExpiryCancellation) {
+	for _, cancellation := range cancellations {
+		s.cancelTemporaryExpiry(cancellation)
+	}
+}
+
+// temporaryExpiryCleanup finds timers invalidated by a persistent candidate,
+// including channels removed by a transaction before the candidate is built.
+// It returns work for after publication so an old timer cannot race a still
+// visible channel state.
+func (s *Service) temporaryExpiryCleanup(base, after *realtime.StateVersion) func() {
+	if s == nil || s.scheduler == nil || base == nil || after == nil {
+		return nil
+	}
+	cancellations := make([]temporaryExpiryCancellation, 0)
+	for _, channel := range base.Channels() {
+		previous, scheduled := base.TemporaryExpiry(channel.ID)
+		if !scheduled || previous.Generation == 0 || previous.Deadline == 0 {
+			continue
+		}
+		current, currentScheduled := after.TemporaryExpiry(channel.ID)
+		if currentScheduled && current == previous {
+			continue
+		}
+		cancellations = append(cancellations, temporaryExpiryCancellation{channelID: channel.ID, generation: previous.Generation})
+	}
+	if len(cancellations) == 0 {
+		return nil
+	}
+	return func() { s.cancelTemporaryExpiries(cancellations) }
+}
+
 // RestoreTemporarySchedules reconstructs generation-guarded initial-empty
 // timers for persisted temporary channels after process startup.
 func (s *Service) RestoreTemporarySchedules(ctx context.Context) error {
@@ -1795,7 +1845,6 @@ func (s *Service) ExpireTemporary(ctx context.Context, channelID int64, generati
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			candidate.ClearTemporaryExpiry(channelID)
 			events, err := channelDeletedEvents(channel, beforeUsers)
 			if err != nil {
 				return realtime.CommandOutput{}, err
@@ -1824,16 +1873,39 @@ func (s *Service) executionReserveAllUsers(execution *realtime.CommandExecution,
 	if err != nil {
 		return realtime.PublicationResult{}, err
 	}
-	events = append(events, voiceEvents...)
+	timerCleanup := s.temporaryExpiryCleanup(candidate.Base(), candidate.Version())
+	var commitRuntime func() (func(), error)
+	if voiceCommit != nil || timerCleanup != nil {
+		commitRuntime = func() (func(), error) {
+			var voiceCleanup func()
+			if voiceCommit != nil {
+				voiceCleanup, err = voiceCommit()
+				if err != nil {
+					return nil, err
+				}
+			}
+			return func() {
+				if timerCleanup != nil {
+					timerCleanup()
+				}
+				if voiceCleanup != nil {
+					voiceCleanup()
+				}
+			}, nil
+		}
+	}
+	orderedEvents := make([]realtime.StateEventTemplate, 0, len(voiceEvents)+len(events))
+	orderedEvents = append(orderedEvents, voiceEvents...)
+	orderedEvents = append(orderedEvents, events...)
 	userIDs := make([]int64, 0, len(candidate.Version().Users()))
 	for _, user := range candidate.Version().Users() {
 		userIDs = append(userIDs, user.ID)
 	}
 	return execution.Reserve(realtime.PublicationRequest{
 		Candidate:         candidate,
-		Events:            events,
+		Events:            orderedEvents,
 		VisibilityUserIDs: userIDs,
-		CommitRuntime:     voiceCommit,
+		CommitRuntime:     commitRuntime,
 	})
 }
 

@@ -167,7 +167,10 @@ func (s *Service) runMutation(ctx context.Context, userIDs []int64, response mut
 				if err != nil {
 					return realtime.CommandOutput{}, err
 				}
-				events = append(events, voiceEvents...)
+				orderedEvents := make([]realtime.StateEventTemplate, 0, len(voiceEvents)+len(events))
+				orderedEvents = append(orderedEvents, voiceEvents...)
+				orderedEvents = append(orderedEvents, events...)
+				events = orderedEvents
 				voiceCommit = commit
 			}
 			visibilityUserIDs := make([]int64, 0, len(candidate.Version().Users()))

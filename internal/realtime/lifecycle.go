@@ -216,7 +216,10 @@ func (p *ConnectionStatePublisher) voiceCommand(transition voiceAuthorityTransit
 				if err := execution.MarkRuntimeReady(); err != nil {
 					return CommandOutput{}, err
 				}
-				return CommandOutput{Value: false}, nil
+				return CommandOutput{Value: false, AfterPublish: func(context.Context) error {
+					p.coordinator.clearPendingVoiceAuthorityTombstone(previous)
+					return nil
+				}}, nil
 			}
 			var applicationEvents []StateEventTemplate
 			var afterPublish func()
@@ -230,7 +233,7 @@ func (p *ConnectionStatePublisher) voiceCommand(transition voiceAuthorityTransit
 			if err != nil {
 				return CommandOutput{}, err
 			}
-			events := append(applicationEvents, authorityEvents...)
+			events := append(authorityEvents, applicationEvents...)
 			if _, err := execution.Reserve(PublicationRequest{Candidate: candidate, Events: events}); err != nil {
 				return CommandOutput{}, err
 			}
@@ -241,6 +244,7 @@ func (p *ConnectionStatePublisher) voiceCommand(transition voiceAuthorityTransit
 				if afterPublish != nil {
 					afterPublish()
 				}
+				p.coordinator.clearPendingVoiceAuthorityTombstone(previous)
 				return nil
 			}}, nil
 		},

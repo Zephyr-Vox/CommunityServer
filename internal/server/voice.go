@@ -66,6 +66,9 @@ func (v *voiceRuntime) Start(ctx context.Context, host string, port int, supervi
 		for {
 			select {
 			case expiry := <-v.expiries:
+				if expiry.drain != nil {
+					expiry.drain()
+				}
 				authority, ok := v.connections.VoiceAuthority(expiry.userID)
 				if !ok || authority.VoiceSessionID != expiry.sessionID {
 					continue

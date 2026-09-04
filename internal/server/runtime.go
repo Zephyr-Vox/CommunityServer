@@ -427,6 +427,7 @@ type voiceRuntime struct {
 type voiceExpiry struct {
 	userID    int64
 	sessionID [16]byte
+	drain     protocol.SessionSendDrain
 }
 
 // beginStopping marks the voice runtime as intentionally shutting down. After
@@ -524,10 +525,13 @@ func newVoiceRuntime(cfg config.VoiceConfig, connections *realtime.ConnectionCoo
 		connections: connections,
 	}
 	connections.SetVoiceAuthorityDeactivator(func(authority realtime.VoiceAuthority, _ string) {
-		cleanup, err := manager.RevokeStaged(authority.VoiceSessionID, authority.UserID)
+		drain, cleanup, err := manager.RevokeStagedForPublication(authority.VoiceSessionID, authority.UserID)
 		if err != nil && !errors.Is(err, protocol.ErrSessionNotFound) {
 			runtime.fail(fmt.Errorf("voice revoke: %w", err))
 			return
+		}
+		if drain != nil {
+			drain()
 		}
 		if cleanup == nil {
 			return
@@ -538,9 +542,9 @@ func newVoiceRuntime(cfg config.VoiceConfig, connections *realtime.ConnectionCoo
 			runtime.fail(errors.New("voice revoke cleanup reserve exhausted"))
 		}
 	})
-	manager.SetExpiryHandler(func(userID int64, sessionID [16]byte) {
+	manager.SetExpiryBarrierHandler(func(userID int64, sessionID [16]byte, drain protocol.SessionSendDrain) {
 		select {
-		case runtime.expiries <- voiceExpiry{userID: userID, sessionID: sessionID}:
+		case runtime.expiries <- voiceExpiry{userID: userID, sessionID: sessionID, drain: drain}:
 		default:
 			runtime.fail(errors.New("voice expiry cleanup reserve exhausted"))
 		}

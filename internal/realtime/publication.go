@@ -77,8 +77,9 @@ type PublicationRequest struct {
 	VisibilityUserIDs []int64
 	// CommitRuntime applies a staged coordinator transition while the
 	// publication lock excludes half-published state. It must not perform socket
-	// I/O, UDP sends, or wait for another goroutine. Any returned cleanup runs
-	// after the publication and delivery locks have been released.
+	// I/O or UDP sends; it may wait for a previously captured session send
+	// barrier. Any returned cleanup runs after publication and delivery locks
+	// have been released.
 	CommitRuntime func() (cleanup func(), err error)
 }
 
