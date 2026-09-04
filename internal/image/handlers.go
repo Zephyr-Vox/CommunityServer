@@ -1,7 +1,6 @@
 package image
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
 
 	"github.com/labstack/echo/v5"
 
@@ -47,9 +47,9 @@ func UploadAvatarHandler(svc *AvatarService) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		// Buffer the selected part and drain every following part through the same
-		// bounded reader before image processing or storage starts. This keeps
-		// trailing multipart data inside the request hard cap.
+		// Spool the selected part to a private temporary file and drain every
+		// following part through the same bounded reader. This keeps memory bounded
+		// while applying the request hard cap to trailing multipart data as well.
 		c.Request().Body = http.MaxBytesReader(c.Response(), c.Request().Body, svc.cfg.MaxUploadSize)
 
 		multipartReader, err := c.Request().MultipartReader()
@@ -70,7 +70,17 @@ func UploadAvatarHandler(svc *AvatarService) echo.HandlerFunc {
 			if part.FormName() == "file" {
 				fileName := part.FileName()
 				contentType := part.Header.Get("Content-Type")
-				data, readErr := io.ReadAll(part)
+				spool, spoolErr := os.CreateTemp("", "zephyr-avatar-*")
+				if spoolErr != nil {
+					_ = part.Close()
+					return spoolErr
+				}
+				defer func() {
+					_ = spool.Close()
+					_ = os.Remove(spool.Name())
+				}()
+				digest := sha256.New()
+				_, readErr := io.Copy(io.MultiWriter(spool, digest), part)
 				if readErr != nil {
 					_ = part.Close()
 					if isMaxBytesError(readErr) {
@@ -88,9 +98,11 @@ func UploadAvatarHandler(svc *AvatarService) echo.HandlerFunc {
 				if closeErr := part.Close(); closeErr != nil {
 					return api.NewError(codeMissingFile, http.StatusBadRequest, "missing file")
 				}
-				digest := sha256.Sum256(data)
+				if _, err := spool.Seek(0, io.SeekStart); err != nil {
+					return err
+				}
 				identity, err := realtime.NewHTTPCommandIdentity(p.UserID, http.MethodPost, "/api/v0/me/avatar", nil, nil, avatarIdentity{
-					SHA256: hex.EncodeToString(digest[:]), Name: fileName, ContentType: contentType,
+					SHA256: hex.EncodeToString(digest.Sum(nil)), Name: fileName, ContentType: contentType,
 				})
 				if err != nil {
 					return err
@@ -109,7 +121,7 @@ func UploadAvatarHandler(svc *AvatarService) echo.HandlerFunc {
 					}
 					return realtime.HTTPMutationResponse{Status: http.StatusOK, Data: uploadResponse{Avatar: name}}, nil
 				})
-				name, err := svc.upload(ctx, p.UserID, bytes.NewReader(data))
+				name, err := svc.upload(ctx, p.UserID, spool)
 				if err != nil {
 					switch {
 					case errors.Is(err, store.ErrNotFound):

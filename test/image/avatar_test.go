@@ -23,6 +23,7 @@ import (
 	"zephyr.vox/server/ce/internal/db"
 	img "zephyr.vox/server/ce/internal/image"
 	"zephyr.vox/server/ce/internal/oss"
+	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/store"
 )
@@ -416,6 +417,51 @@ func TestAvatarServiceWithInjectedTranscode(t *testing.T) {
 	rc.Close()
 	if obj.ContentType != "image/jpeg" {
 		t.Fatalf("content_type = %q, want image/jpeg", obj.ContentType)
+	}
+}
+
+func TestAvatarPreservesObjectWhenMetadataCommitIsFollowedByFailure(t *testing.T) {
+	e := newEnv(t, defaultCfg())
+	userID := createUser(t, e, "alice")
+	idGen, err := snowflake.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := img.NewAvatarService(e.stores.Users, e.objects, idGen, defaultCfg(), img.WithTranscode(
+		func(io.Reader, img.ImageConverter, int, int) ([]byte, error) {
+			return []byte("fake-jpeg"), nil
+		},
+	))
+	svc.SetStateMutationExecutor(func(ctx context.Context, userID int64, mutate img.StateMutationFunc, _ any) error {
+		tx, err := e.stores.BeginTx(ctx)
+		if err != nil {
+			return err
+		}
+		if err := mutate(ctx, e.stores.WithTx(tx)); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return realtime.ErrSequencerFailed
+	})
+
+	_, err = svc.Upload(context.Background(), userID, bytes.NewReader(pngBytes(t, 8, 8, color.NRGBA{R: 1, A: 255})))
+	if !errors.Is(err, realtime.ErrSequencerFailed) {
+		t.Fatalf("Upload error = %v, want ErrSequencerFailed", err)
+	}
+	user, err := e.stores.Users.GetUserByID(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !user.Avatar.Valid {
+		t.Fatal("metadata commit did not retain avatar name")
+	}
+	if _, rc, err := e.objects.Open(context.Background(), img.AvatarBucket, user.Avatar.String); err != nil {
+		t.Fatalf("committed avatar object missing: %v", err)
+	} else {
+		_ = rc.Close()
 	}
 }
 

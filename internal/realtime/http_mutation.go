@@ -2,10 +2,7 @@ package realtime
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"strings"
 
 	"zephyr.vox/server/ce/internal/store"
 )
@@ -45,8 +42,13 @@ type HTTPMutationState struct {
 	CommandID   int64
 	Checkpoint  Checkpoint
 	StateCursor string
-	Replay      *DurableReplay
+	// Committed reports that the owning database transaction committed before
+	// a later publication phase returned an error.
+	Committed bool
+	Replay    *DurableReplay
 }
+
+const publicCommandNamespace = "0000000000000000000000000000000000000000000000000000000000000000"
 
 type httpMutationCommandContextKey struct{}
 type publicHTTPMutationCommandContextKey struct{}
@@ -66,9 +68,9 @@ func NewHTTPMutationCommand(identity HTTPCommandIdentity, idempotencyKey string)
 }
 
 // NewPublicHTTPCommandIdentity creates the installation-scoped identity for a
-// public mutation. The derived code-hash slot is an internal stable namespace
-// discriminator; unlike activation it is not a credential supplied by the
-// caller.
+// public mutation. It keeps the activation-code column in a fixed namespace;
+// the keyed request HMAC still covers the complete canonical DTO, including
+// any sensitive fields, without persisting an unkeyed digest of them.
 func NewPublicHTTPCommandIdentity(installationID, method, route string, dto any) (InstallationCommandIdentity, error) {
 	raw, err := json.Marshal(dto)
 	if err != nil {
@@ -76,15 +78,12 @@ func NewPublicHTTPCommandIdentity(installationID, method, route string, dto any)
 	}
 	identity := InstallationCommandIdentity{
 		InstallationID:     installationID,
-		ActivationCodeHash: strings.Repeat("0", 64),
+		ActivationCodeHash: publicCommandNamespace,
 		Method:             method, RouteTemplate: route, CanonicalDTO: raw,
 	}
-	canonical, err := canonicalInstallationCommandIdentity(identity)
-	if err != nil {
+	if _, err := canonicalInstallationCommandIdentity(identity); err != nil {
 		return InstallationCommandIdentity{}, err
 	}
-	digest := sha256.Sum256(canonical)
-	identity.ActivationCodeHash = hex.EncodeToString(digest[:])
 	return identity, nil
 }
 

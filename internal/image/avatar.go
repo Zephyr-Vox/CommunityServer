@@ -186,6 +186,16 @@ func (s *AvatarService) upload(ctx context.Context, userID int64, src io.Reader)
 			_, err := txStores.Users.SetAvatar(commandCtx, userID, &name)
 			return err
 		}, name); err != nil {
+			if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Committed {
+				return "", err
+			}
+			// A fatal command error can be returned after the DB commit even for
+			// non-HTTP callers. Preserve the object when commit status is uncertain;
+			// an orphan is recoverable, but a committed row pointing to a deleted
+			// object is not.
+			if errors.Is(err, realtime.ErrSequencerFailed) || errors.Is(err, realtime.ErrCommandPanic) {
+				return "", err
+			}
 			_ = s.objects.Delete(ctx, AvatarBucket, name) // best-effort: no orphan objects
 			return "", err
 		}

@@ -346,6 +346,11 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 			if _, err := execution.Commit(tx); err != nil {
 				return realtime.CommandOutput{}, err
 			}
+			if stateResult != nil {
+				// Mark the external object metadata committed before any later
+				// publication error can reach an adapter's cleanup path.
+				stateResult.Committed = true
+			}
 			for _, userID := range userIDs {
 				if userID > 0 {
 					r.principals.Invalidate(userID)

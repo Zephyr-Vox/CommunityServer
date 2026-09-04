@@ -199,6 +199,44 @@ func TestActivationIdempotencyUsesInstallationIdentityWithoutPlaintext(t *testin
 	}
 }
 
+func TestPublicHTTPIdentityDoesNotHashDTOIntoActivationNamespace(t *testing.T) {
+	const installationID = "0123456789abcdef0123456789abcdef"
+	type request struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	first, err := realtime.NewPublicHTTPCommandIdentity(installationID, "POST", "/api/v0/auth/register", request{
+		Username: "alice", Password: "secret123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := realtime.NewPublicHTTPCommandIdentity(installationID, "POST", "/api/v0/auth/register", request{
+		Username: "alice", Password: "other123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ActivationCodeHash != strings.Repeat("0", 64) || second.ActivationCodeHash != first.ActivationCodeHash {
+		t.Fatalf("public namespace hashes = %q and %q", first.ActivationCodeHash, second.ActivationCodeHash)
+	}
+	signer, err := realtime.NewRequestIdentitySigner([]byte(strings.Repeat("s", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstHMAC, err := signer.SumInstallation(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondHMAC, err := signer.SumInstallation(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstHMAC == secondHMAC {
+		t.Fatal("public request HMAC did not bind the DTO")
+	}
+}
+
 func TestRuntimeIdempotencyCacheCoalescesExpiresAndCapsPerUser(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 	cache := realtime.NewRuntimeIdempotencyCacheWithClock(func() time.Time { return now })

@@ -91,6 +91,29 @@ func TestFirstOwnerActivation(t *testing.T) {
 	}
 }
 
+func TestFirstOwnerActivationReplayWithoutRuntime(t *testing.T) {
+	e := newEnv(t)
+	mgr, err := auth.NewActivationManager(e.stores, e.secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, _, err := mgr.EnsureCode(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := mgr.Activate(context.Background(), "activation-replay-0001", code, "boss", "secret123", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := mgr.Activate(context.Background(), "activation-replay-0001", code, "boss", "secret123", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Replayed || replay.CommandID != first.CommandID || replay.User.ID != first.User.ID {
+		t.Fatalf("activation replay = %+v, first = %+v", replay, first)
+	}
+}
+
 func TestFirstOwnerActivationConcurrent(t *testing.T) {
 	e := newEnv(t)
 	mgr, err := auth.NewActivationManager(e.stores, e.secret)

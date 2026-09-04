@@ -70,9 +70,10 @@ type HTTPCommandIdentity struct {
 	ControlConnectionID string
 }
 
-// InstallationCommandIdentity is the stable identity of the unauthenticated
-// first-owner activation command. InstallationID and ActivationCodeHash are
-// required because no principal exists before the command succeeds.
+// InstallationCommandIdentity is the stable identity of an unauthenticated
+// installation-scoped mutation. Activation uses the SHA-256 activation-code
+// digest; other public mutations use the fixed public namespace in
+// http_mutation.go and rely on the keyed request HMAC to bind their full DTO.
 type InstallationCommandIdentity struct {
 	InstallationID     string
 	ActivationCodeHash string

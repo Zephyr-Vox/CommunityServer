@@ -297,6 +297,9 @@ func (m *ActivationManager) activationReplayResult(user *db.User, replay realtim
 		User: user, CommandID: replay.CommandID, Replayed: true,
 		Checkpoint: replay.Checkpoint, StateCursor: replay.StateCursor,
 	}
+	if m.runtime == nil {
+		return result
+	}
 	current := m.runtime.CurrentCheckpoint()
 	if result.Checkpoint.StreamEpoch != "" && current.StreamEpoch != "" && result.Checkpoint.StreamEpoch != current.StreamEpoch {
 		result.SyncRequired = true
