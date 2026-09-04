@@ -504,6 +504,134 @@ func TestManagerConcurrentLazyGetAndPurgeExpireOnce(t *testing.T) {
 	}
 }
 
+// TestManagerGetStagedReturnsExpiryDrain verifies that an application lookup
+// can preserve old-audio ordering after lazy expiry removes the Manager index.
+func TestManagerGetStagedReturnsExpiryDrain(t *testing.T) {
+	m, clock := newTestManager(t)
+	info, err := activateSession(t, m, 7, "dev", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(protocol.SessionTTL)
+	drainObserved := make(chan protocol.SessionSendDrain, 1)
+	m.SetExpiryBarrierHandler(func(_ int64, _ [16]byte, drain protocol.SessionSendDrain) {
+		drainObserved <- drain
+	})
+
+	if _, drain, ok := m.GetStaged(info.ID); ok || drain == nil {
+		t.Fatalf("GetStaged = ok:%t drain:%v, want expired with drain", ok, drain != nil)
+	}
+	select {
+	case callbackDrain := <-drainObserved:
+		if callbackDrain == nil {
+			t.Fatal("expiry callback received nil drain")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lazy expiry did not invoke barrier callback")
+	}
+}
+
+// TestManagerGetStagedRecoversPriorExpiryDrain verifies that a purge or UDP
+// lookup cannot remove the only ordering barrier before a later join observes
+// the natural expiry.
+func TestManagerGetStagedRecoversPriorExpiryDrain(t *testing.T) {
+	m, clock := newTestManager(t)
+	info, err := activateSession(t, m, 7, "dev", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(protocol.SessionTTL)
+	callbackDrain := make(chan protocol.SessionSendDrain, 1)
+	m.SetExpiryBarrierHandler(func(_ int64, _ [16]byte, drain protocol.SessionSendDrain) {
+		callbackDrain <- drain
+	})
+
+	if n := m.Purge(); n != 1 {
+		t.Fatalf("Purge = %d, want 1", n)
+	}
+	select {
+	case drain := <-callbackDrain:
+		if drain == nil {
+			t.Fatal("expiry callback received nil drain")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Purge did not invoke barrier callback")
+	}
+
+	if _, drain, ok := m.GetStaged(info.ID); ok || drain == nil {
+		t.Fatalf("GetStaged = ok:%t drain:%v, want missing session with pending drain", ok, drain != nil)
+	}
+	// Claiming the pending barrier must make repeated lookups stop retaining it.
+	_, drain, _ := m.GetStaged(info.ID)
+	if drain == nil {
+		t.Fatal("pending expiry drain disappeared before it was claimed")
+	}
+	drain()
+	if _, drain, ok := m.GetStaged(info.ID); ok || drain != nil {
+		t.Fatalf("GetStaged after drain = ok:%t drain:%v, want no pending barrier", ok, drain != nil)
+	}
+}
+
+// TestManagerTeardownRecoversPriorExpiryDrain verifies that exact control-plane
+// teardown also waits for a barrier queued by an earlier natural expiry.
+func TestManagerTeardownRecoversPriorExpiryDrain(t *testing.T) {
+	m, clock := newTestManager(t)
+	info, err := activateSession(t, m, 7, "dev", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(protocol.SessionTTL)
+	m.SetExpiryBarrierHandler(func(_ int64, _ [16]byte, _ protocol.SessionSendDrain) {})
+	if n := m.Purge(); n != 1 {
+		t.Fatalf("Purge = %d, want 1", n)
+	}
+
+	drain, err := m.DeleteStaged(info.ID, info.UserID)
+	if !errors.Is(err, protocol.ErrSessionNotFound) {
+		t.Fatalf("DeleteStaged = %v, want ErrSessionNotFound", err)
+	}
+	if drain == nil {
+		t.Fatal("DeleteStaged lost the pending expiry drain")
+	}
+	drain()
+
+	prepared, err := m.Prepare(info.UserID, "new", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := m.ActivatePreparedStagedAfterNaturalExpiry(prepared, &info.ID); err != nil {
+		t.Fatalf("ActivatePreparedStagedAfterNaturalExpiry = %v", err)
+	}
+}
+
+// TestManagerRevokeRecoversPriorExpiryDrain verifies that access-loss teardown
+// preserves the same barrier when UDP or the purge worker already removed the
+// session.
+func TestManagerRevokeRecoversPriorExpiryDrain(t *testing.T) {
+	m, clock := newTestManager(t)
+	info, err := activateSession(t, m, 7, "dev", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(protocol.SessionTTL)
+	m.SetExpiryBarrierHandler(func(_ int64, _ [16]byte, _ protocol.SessionSendDrain) {})
+	if n := m.Purge(); n != 1 {
+		t.Fatalf("Purge = %d, want 1", n)
+	}
+
+	drain, cleanup, err := m.RevokeStagedForPublication(info.ID, info.UserID)
+	if !errors.Is(err, protocol.ErrSessionNotFound) {
+		t.Fatalf("RevokeStagedForPublication = %v, want ErrSessionNotFound", err)
+	}
+	if drain == nil {
+		t.Fatal("RevokeStagedForPublication lost the pending expiry drain")
+	}
+	if cleanup != nil {
+		t.Fatal("RevokeStagedForPublication returned notification cleanup for an expired session")
+	}
+	drain()
+}
+
 // TestManagerRevokeStagedIsSynchronousInactive proves RevokeStaged removes the
 // exact session from the Manager indexes before returning and defers only the
 // sendMu/notification work to the returned cleanup.

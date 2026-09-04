@@ -439,6 +439,7 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 			var prepared *protocol.PreparedSession
 			created := false
 			var reusedInfo protocol.SessionInfo
+			var naturalExpiryDrain protocol.SessionSendDrain
 			if !hasCurrent || input.ForceNew || current.ControlConnectionID != owner.ControlConnectionID || current.ConnectionGeneration != owner.Generation {
 				if !s.voiceCreateLimiter.Allow(actorID, sourceIP, time.UnixMilli(joinedAt)) {
 					return realtime.CommandOutput{}, ErrVoiceCreateRateLimit
@@ -451,7 +452,7 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 			}
 			naturalExpiry := false
 			if hasCurrent {
-				snapshot, snapshotOK := s.voiceManager.Get(current.VoiceSessionID)
+				snapshot, expiryDrain, snapshotOK := s.voiceManager.GetStaged(current.VoiceSessionID)
 				if !snapshotOK || snapshot.UserID != actorID {
 					if prepared == nil {
 						// A reuse-move must never bind a channel to a Manager session
@@ -460,6 +461,7 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 						return realtime.CommandOutput{}, ErrVoiceStale
 					}
 					naturalExpiry = true
+					naturalExpiryDrain = expiryDrain
 				} else {
 					reusedInfo = protocol.SessionInfo{
 						ID:        snapshot.ID,
@@ -579,6 +581,12 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 				Candidate: candidate,
 				Events:    events,
 				CommitRuntime: func() (func(), error) {
+					if naturalExpiryDrain != nil {
+						// Lazy expiry has already removed the old Manager index and
+						// queued its control cleanup. Wait for old UDP sends here so
+						// the replacement publication cannot overtake old audio.
+						naturalExpiryDrain()
+					}
 					commit, commitErr := stage.ApplyForPublication(s.voiceManager, naturalExpiry)
 					if commitErr != nil {
 						if errors.Is(commitErr, protocol.ErrSessionPrecondition) || errors.Is(commitErr, protocol.ErrSessionExpired) || errors.Is(commitErr, realtime.ErrVoiceAuthorityPrecondition) {

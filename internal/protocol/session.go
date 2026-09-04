@@ -205,6 +205,30 @@ type Session struct {
 	sendMu    sync.Mutex
 }
 
+// expiryBarrier retains the send ordering barrier after natural expiry removes
+// a session from the Manager indexes. The expiry callback and a later staged
+// application lookup may both claim the same barrier; sync.Once makes that
+// handoff safe while allowing either path to release the retained session.
+type expiryBarrier struct {
+	manager *Manager
+	id      [16]byte
+	session *Session
+	once    sync.Once
+}
+
+// drain releases the removed session's in-flight sends once and then lets the
+// Manager forget the retained barrier. It is safe for the expiry worker and a
+// staged application lookup to call concurrently.
+func (b *expiryBarrier) drain() {
+	if b == nil {
+		return
+	}
+	b.once.Do(func() {
+		drainSessionSends(b.session)
+		b.manager.clearExpiryBarrier(b.id, b)
+	})
+}
+
 // Manager is the in-memory session registry. mu protects only the table
 // structure (the id map plus the user -> active-session index); per-session
 // mutable state is protected by Session.mu. Lock order is always
@@ -218,6 +242,7 @@ type Manager struct {
 	onRevoke        RevocationHandler
 	onExpire        ExpiryHandler
 	onExpireBarrier ExpiryBarrierHandler
+	expiryBarriers  map[[16]byte]*expiryBarrier
 }
 
 // NewManager returns an empty Manager with default limits. The clock is
@@ -237,10 +262,11 @@ func NewManagerWithLimits(now func() time.Time, limits Limits) (*Manager, error)
 		return nil, errors.New("protocol: session limits must be positive")
 	}
 	return &Manager{
-		sessions: make(map[[16]byte]*Session),
-		byUser:   make(map[int64][16]byte),
-		now:      now,
-		limits:   limits,
+		sessions:       make(map[[16]byte]*Session),
+		byUser:         make(map[int64][16]byte),
+		now:            now,
+		limits:         limits,
+		expiryBarriers: make(map[[16]byte]*expiryBarrier),
 	}, nil
 }
 
@@ -380,17 +406,22 @@ func (m *Manager) activatePreparedStaged(prepared *PreparedSession, expectedOldI
 			delete(m.byUser, userID)
 			barrierHandler := m.onExpireBarrier
 			expiryHandler := m.onExpire
+			drain := m.newExpiryDrainLocked(currentID, old)
 			old.mu.Unlock()
 			m.mu.Unlock()
 			prepared.mu.Unlock()
 			if barrierHandler != nil {
-				barrierHandler(userID, currentID, SessionSendDrain(func() { drainSessionSends(old) }))
+				barrierHandler(userID, currentID, drain)
 			} else if expiryHandler != nil {
 				expiryHandler(userID, currentID)
 			}
 			return SessionInfo{}, nil, nil, ErrSessionExpired
 		}
 		old.mu.Unlock()
+	}
+	var missingExpectedDrain SessionSendDrain
+	if allowMissingExpected && expectedOldID != nil && !exists {
+		missingExpectedDrain = m.pendingExpiryDrainLocked(*expectedOldID)
 	}
 	// Prepare allocates the session before the caller acquires the application
 	// publication slot. If that wait crosses the transport TTL, do not install
@@ -433,9 +464,12 @@ func (m *Manager) activatePreparedStaged(prepared *PreparedSession, expectedOldI
 	info := prepared.info
 	info.ReplacedPrevious = replaced
 	info.MasterKey = append([]byte(nil), info.MasterKey...)
-	drain := SessionSendDrain(func() {
-		drainSessionSends(removedSession)
-	})
+	drain := missingExpectedDrain
+	if removedSession != nil {
+		drain = SessionSendDrain(func() {
+			drainSessionSends(removedSession)
+		})
+	}
 	cleanup := ActivationCleanup(func() {
 		// Explicit replacement must drain an already-reserved Send even when the
 		// session expired while that syscall was blocked. Expiry only suppresses
@@ -482,12 +516,12 @@ func newSession(id [16]byte, userID int64, deviceID string, encrypted bool, nowM
 // Get returns an immutable snapshot for id, or false if it is unknown or
 // expired. It never exposes a live Session to callers outside this package.
 func (m *Manager) Get(id [16]byte) (SessionSnapshot, bool) {
-	sess, ok := m.getSession(id)
+	sess, _, ok := m.getSessionStaged(id)
 	if !ok {
 		return SessionSnapshot{}, false
 	}
 	sess.mu.Lock()
-	// getSession releases Manager.mu before returning the pointer, so an
+	// getSessionStaged releases Manager.mu before returning the pointer, so an
 	// explicit disconnect can deactivate this session in the meantime. Never
 	// expose that inactive snapshot to callers that use Get as a live check.
 	if !sess.active {
@@ -499,16 +533,46 @@ func (m *Manager) Get(id [16]byte) (SessionSnapshot, bool) {
 	return snap, true
 }
 
+// GetStaged returns an immutable snapshot and, when natural expiry removed the
+// session either during this lookup or earlier, a send barrier for the caller
+// to run before publishing a dependent control-plane transition. The barrier
+// is separate from the non-blocking expiry callback so application code can
+// preserve audio-before-authority ordering without making the UDP read path
+// wait.
+func (m *Manager) GetStaged(id [16]byte) (SessionSnapshot, SessionSendDrain, bool) {
+	sess, drain, ok := m.getSessionStaged(id)
+	if !ok {
+		return SessionSnapshot{}, drain, false
+	}
+	sess.mu.Lock()
+	if !sess.active {
+		sess.mu.Unlock()
+		return SessionSnapshot{}, nil, false
+	}
+	snap := SessionSnapshot{ID: sess.ID, UserID: sess.UserID, DeviceID: sess.DeviceID, CreatedAt: sess.CreatedAt, ExpiresAt: sess.ExpiresAt, Encrypted: sess.encrypted, RemotePresent: sess.remote != nil}
+	sess.mu.Unlock()
+	return snap, nil, true
+}
+
 // getSession returns the live internal session for UDP operations. Expired
 // entries are removed lazily; callers must not retain the result across an
 // operation without checking Session.active under Session.mu.
 func (m *Manager) getSession(id [16]byte) (*Session, bool) {
+	sess, _, ok := m.getSessionStaged(id)
+	return sess, ok
+}
+
+// getSessionStaged is the common lookup path for UDP operations and staged
+// application lookups. On natural expiry it returns the removed session's send
+// barrier while still invoking the configured expiry callback without waiting.
+func (m *Manager) getSessionStaged(id [16]byte) (*Session, SessionSendDrain, bool) {
 	m.mu.Lock()
 
 	sess, ok := m.sessions[id]
 	if !ok {
+		drain := m.pendingExpiryDrainLocked(id)
 		m.mu.Unlock()
-		return nil, false
+		return nil, drain, false
 	}
 	nowMS := m.nowMillis()
 	sess.mu.Lock()
@@ -519,19 +583,20 @@ func (m *Manager) getSession(id [16]byte) (*Session, bool) {
 	sess.mu.Unlock()
 	if !expired {
 		m.mu.Unlock()
-		return sess, true
+		return sess, nil, true
 	}
 
 	m.deleteLocked(id, sess.UserID)
 	handler := m.onExpire
 	barrierHandler := m.onExpireBarrier
+	drain := m.newExpiryDrainLocked(id, sess)
 	m.mu.Unlock()
 	if barrierHandler != nil {
-		barrierHandler(sess.UserID, id, SessionSendDrain(func() { drainSessionSends(sess) }))
+		barrierHandler(sess.UserID, id, drain)
 	} else if handler != nil {
 		handler(sess.UserID, id)
 	}
-	return nil, false
+	return nil, drain, false
 }
 
 // SessionIDByUser returns the active session id for userID. It shares Get's
@@ -567,9 +632,10 @@ func (m *Manager) SessionIDByUser(userID int64) ([16]byte, bool) {
 	m.deleteLocked(id, sess.UserID)
 	handler := m.onExpire
 	barrierHandler := m.onExpireBarrier
+	drain := m.newExpiryDrainLocked(id, sess)
 	m.mu.Unlock()
 	if barrierHandler != nil {
-		barrierHandler(sess.UserID, id, SessionSendDrain(func() { drainSessionSends(sess) }))
+		barrierHandler(sess.UserID, id, drain)
 	} else if handler != nil {
 		handler(sess.UserID, id)
 	}
@@ -632,8 +698,9 @@ func (m *Manager) DeleteStaged(id [16]byte, userID int64) (SessionSendDrain, err
 	m.mu.Lock()
 	sess, ok := m.sessions[id]
 	if !ok {
+		drain := m.pendingExpiryDrainLocked(id)
 		m.mu.Unlock()
-		return nil, ErrSessionNotFound
+		return drain, ErrSessionNotFound
 	}
 	if sess.UserID != userID {
 		m.mu.Unlock()
@@ -674,6 +741,11 @@ func (m *Manager) Revoke(id [16]byte, userID int64) error {
 func (m *Manager) RevokeStaged(id [16]byte, userID int64) (RevocationCleanup, error) {
 	sess, active, handler, err := m.revokeStaged(id, userID)
 	if sess == nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			if drain := m.pendingExpiryDrain(id); drain != nil {
+				return RevocationCleanup(func() { drain() }), err
+			}
+		}
 		return nil, err
 	}
 	cleanup := m.revocationCleanup(sess, active, handler)
@@ -689,6 +761,9 @@ func (m *Manager) RevokeStaged(id [16]byte, userID int64) (RevocationCleanup, er
 func (m *Manager) RevokeStagedForPublication(id [16]byte, userID int64) (SessionSendDrain, RevocationCleanup, error) {
 	sess, active, handler, err := m.revokeStaged(id, userID)
 	if sess == nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			return m.pendingExpiryDrain(id), nil, err
+		}
 		return nil, nil, err
 	}
 	drain := SessionSendDrain(func() {
@@ -739,9 +814,9 @@ func (m *Manager) revocationCleanup(sess *Session, active bool, handler Revocati
 // 30s ticker. The UDP hot path never calls Purge.
 func (m *Manager) Purge() int {
 	type expiredSession struct {
-		id      [16]byte
-		userID  int64
-		session *Session
+		id     [16]byte
+		userID int64
+		drain  SessionSendDrain
 	}
 
 	m.mu.Lock()
@@ -756,7 +831,7 @@ func (m *Manager) Purge() int {
 		sess.mu.Unlock()
 		if isExpired {
 			m.deleteLocked(id, sess.UserID)
-			expired = append(expired, expiredSession{id: id, userID: sess.UserID, session: sess})
+			expired = append(expired, expiredSession{id: id, userID: sess.UserID, drain: m.newExpiryDrainLocked(id, sess)})
 		}
 	}
 	handler := m.onExpire
@@ -765,7 +840,7 @@ func (m *Manager) Purge() int {
 
 	if barrierHandler != nil {
 		for _, sess := range expired {
-			barrierHandler(sess.userID, sess.id, SessionSendDrain(func() { drainSessionSends(sess.session) }))
+			barrierHandler(sess.userID, sess.id, sess.drain)
 		}
 	} else if handler != nil {
 		for _, sess := range expired {
@@ -773,6 +848,49 @@ func (m *Manager) Purge() int {
 		}
 	}
 	return len(expired)
+}
+
+// newExpiryDrainLocked creates the barrier for a naturally expired session.
+// Callers must hold Manager.mu; the barrier is retained only when the staged
+// callback is installed so a later application lookup can recover a callback
+// that was already removed by UDP or Purge.
+func (m *Manager) newExpiryDrainLocked(id [16]byte, session *Session) SessionSendDrain {
+	drain := SessionSendDrain(func() { drainSessionSends(session) })
+	if m.onExpireBarrier == nil {
+		return drain
+	}
+	barrier := &expiryBarrier{manager: m, id: id, session: session}
+	m.expiryBarriers[id] = barrier
+	return barrier.drain
+}
+
+// pendingExpiryDrain returns a previously queued natural-expiry barrier for an
+// exact teardown operation. The returned barrier remains safe if the expiry
+// worker claims it concurrently.
+func (m *Manager) pendingExpiryDrain(id [16]byte) SessionSendDrain {
+	m.mu.Lock()
+	drain := m.pendingExpiryDrainLocked(id)
+	m.mu.Unlock()
+	return drain
+}
+
+// pendingExpiryDrainLocked returns a previously queued natural-expiry barrier
+// for a staged application lookup. Callers must hold Manager.mu.
+func (m *Manager) pendingExpiryDrainLocked(id [16]byte) SessionSendDrain {
+	if barrier := m.expiryBarriers[id]; barrier != nil {
+		return barrier.drain
+	}
+	return nil
+}
+
+// clearExpiryBarrier drops a completed natural-expiry barrier if it is still
+// the entry for id. It never waits while holding Manager.mu.
+func (m *Manager) clearExpiryBarrier(id [16]byte, barrier *expiryBarrier) {
+	m.mu.Lock()
+	if current := m.expiryBarriers[id]; current == barrier {
+		delete(m.expiryBarriers, id)
+	}
+	m.mu.Unlock()
 }
 
 // Len returns the current number of table entries, including not-yet-purged
