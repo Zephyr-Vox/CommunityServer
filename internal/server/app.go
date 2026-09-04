@@ -50,18 +50,19 @@ type App struct {
 	upgrades       *realtime.UpgradeLimiter
 	metadata       realtime.Metadata
 
-	runtimeMu       sync.RWMutex
-	stopMu          sync.Mutex
-	state           *realtime.StateStore
-	publication     *realtime.StatePublication
-	eventBus        *realtime.EventBus
-	sequencer       *realtime.PostCommitSequencer
-	syncStrategy    realtime.StateSyncStrategy
-	connectionState *realtime.ConnectionStatePublisher
-	mutationGate    *realtime.MutationGate
-	deadlines       *realtime.DeadlineScheduler
-	commands        *requestAdmission
-	durableCommands *realtime.DurableIdempotency
+	runtimeMu            sync.RWMutex
+	stopMu               sync.Mutex
+	state                *realtime.StateStore
+	publication          *realtime.StatePublication
+	eventBus             *realtime.EventBus
+	sequencer            *realtime.PostCommitSequencer
+	syncStrategy         realtime.StateSyncStrategy
+	connectionState      *realtime.ConnectionStatePublisher
+	mutationGate         *realtime.MutationGate
+	deadlines            *realtime.DeadlineScheduler
+	commands             *requestAdmission
+	durableCommands      *realtime.DurableIdempotency
+	voiceIdempotencyStop func()
 
 	lifecycleMu sync.Mutex
 	running     *appRun
@@ -167,7 +168,7 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	}
 	// Metadata advertises only application surfaces that are mounted and
 	// usable. The UDP transport is paired with channel join/leave below.
-	metadata.Features = []string{"voice"}
+	metadata.Features = []string{"voice", "temporary_channels"}
 	app := &App{
 		cfg:             cfg,
 		conn:            conn,
@@ -255,7 +256,9 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	channels.SetStateCommandRuntime(app.state, app.sequencer)
 	channels.SetDeadlineScheduler(app.deadlines)
 	channels.SetVoiceRuntime(voice.Manager(), connections, cfg.Server.TLSMode != "off")
-	channels.SetVoiceIdempotency(realtime.NewRuntimeIdempotencyCache(), requestSigner)
+	voiceIdempotency := realtime.NewRuntimeIdempotencyCache()
+	app.voiceIdempotencyStop = voiceIdempotency.StartJanitor(context.Background(), realtime.RuntimeIdempotencyTTL/2)
+	channels.SetVoiceIdempotency(voiceIdempotency, requestSigner)
 	app.connectionState.SetVoiceAuthorityProjection(channels.VoiceAuthorityProjection())
 	moderationSvc.SetStateMutationGate(app.mutationGate)
 	moderationSvc.SetDurableIdempotency(durableCommands)

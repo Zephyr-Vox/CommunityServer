@@ -440,6 +440,19 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 				}
 				created = true
 			}
+			naturalExpiry := false
+			if hasCurrent {
+				snapshot, snapshotOK := s.voiceManager.Get(current.VoiceSessionID)
+				if !snapshotOK || snapshot.UserID != actorID {
+					if prepared == nil {
+						// A reuse-move must never bind a channel to a Manager session
+						// that has already expired or been removed. Replacements can
+						// continue through the staged natural-expiry handoff below.
+						return realtime.CommandOutput{}, ErrVoiceStale
+					}
+					naturalExpiry = true
+				}
+			}
 
 			var expected *realtime.VoiceAuthority
 			if hasCurrent {
@@ -497,6 +510,19 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 				events = append(events, left)
 			}
 			memberLeft := pendingTeardown != nil
+			if naturalExpiry && hasCurrent && !memberLeft {
+				expiryEvents, expiryErr := realtime.VoiceAuthorityEventTemplates(expected, nil, "udp_timeout")
+				if expiryErr != nil {
+					return realtime.CommandOutput{}, expiryErr
+				}
+				events = append(events, expiryEvents...)
+				left, leftErr := voiceMemberEvent(current, false, version, s.visibility)
+				if leftErr != nil {
+					return realtime.CommandOutput{}, leftErr
+				}
+				events = append(events, left)
+				memberLeft = true
+			}
 			if previousProjected != nil && previousProjected.ChannelID != proposed.ChannelID && !memberLeft {
 				left, err := voiceMemberEvent(*previousProjected, false, version, s.visibility)
 				if err != nil {
@@ -520,7 +546,15 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 					authorityReason = "channel_moved"
 				}
 			}
-			authorityEvents, err := realtime.VoiceAuthorityEventTemplates(expected, &proposed, authorityReason)
+			var authorityEvents []realtime.StateEventTemplate
+			if naturalExpiry && hasCurrent {
+				// Natural expiry is a terminal old-session transition followed by
+				// a fresh join, so clients receive disconnected/clear before the
+				// replacement authority rather than a misleading session_replaced.
+				authorityEvents, err = realtime.VoiceAuthorityEventTemplates(nil, &proposed, "joined")
+			} else {
+				authorityEvents, err = realtime.VoiceAuthorityEventTemplates(expected, &proposed, authorityReason)
+			}
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}

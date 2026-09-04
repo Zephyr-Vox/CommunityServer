@@ -227,6 +227,45 @@ func (c *RuntimeIdempotencyCache) DeleteExpired() int {
 	return c.pruneLocked(c.now())
 }
 
+// StartJanitor starts a bounded expiry worker for completed runtime retry
+// records. The returned stop function is safe to call more than once and
+// waits until the worker has exited. A non-positive interval uses half the
+// fixed retry TTL, so ordinary records are released before their next retry
+// window could admit the cache's hard cap.
+func (c *RuntimeIdempotencyCache) StartJanitor(ctx context.Context, interval time.Duration) func() {
+	if c == nil {
+		return func() {}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if interval <= 0 {
+		interval = RuntimeIdempotencyTTL / 2
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				c.DeleteExpired()
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return func() {
+		stopOnce.Do(func() { close(stop) })
+		<-done
+	}
+}
+
 // Len returns the count of completed and in-flight runtime retry slots.
 func (c *RuntimeIdempotencyCache) Len() int {
 	if c == nil {

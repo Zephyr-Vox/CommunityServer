@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -390,6 +391,32 @@ func TestRuntimeIdempotencyGlobalCapPreservesLiveResults(t *testing.T) {
 	claim, err := cache.Claim(10_000, "global-key-extra", requestHMAC)
 	if err != nil || !claim.Owner() {
 		t.Fatalf("post-expiry global claim owner=%t err=%v", claim != nil && claim.Owner(), err)
+	}
+}
+
+func TestRuntimeIdempotencyJanitorReleasesExpiredResults(t *testing.T) {
+	start := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	var now atomic.Int64
+	now.Store(start.UnixNano())
+	cache := realtime.NewRuntimeIdempotencyCacheWithClock(func() time.Time {
+		return time.Unix(0, now.Load())
+	})
+	claim, err := cache.Claim(1, "janitor-key-0001", strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Complete(runtimeResult(1)); err != nil {
+		t.Fatal(err)
+	}
+	stop := cache.StartJanitor(context.Background(), time.Millisecond)
+	defer stop()
+	now.Store(start.Add(realtime.RuntimeIdempotencyTTL).UnixNano())
+	deadline := time.Now().Add(time.Second)
+	for cache.Len() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if cache.Len() != 0 {
+		t.Fatalf("janitor left expired runtime entries = %d", cache.Len())
 	}
 }
 

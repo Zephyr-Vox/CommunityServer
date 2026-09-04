@@ -27,7 +27,8 @@ func TestRealtimeHTTPAndWebSocketHandoff(t *testing.T) {
 	var metadata struct {
 		Code int `json:"code"`
 		Data struct {
-			ProtocolVersion int `json:"protocol_version"`
+			ProtocolVersion int      `json:"protocol_version"`
+			Features        []string `json:"features"`
 			VoiceEndpoint   struct {
 				Host string `json:"host"`
 				Port int    `json:"port"`
@@ -37,7 +38,7 @@ func TestRealtimeHTTPAndWebSocketHandoff(t *testing.T) {
 	if err := json.NewDecoder(metadataResp.Body).Decode(&metadata); err != nil {
 		t.Fatal(err)
 	}
-	if metadataResp.StatusCode != http.StatusOK || metadata.Code != 0 || metadata.Data.ProtocolVersion != 1 || metadata.Data.VoiceEndpoint.Host == "" || metadata.Data.VoiceEndpoint.Port == 0 {
+	if metadataResp.StatusCode != http.StatusOK || metadata.Code != 0 || metadata.Data.ProtocolVersion != 1 || len(metadata.Data.Features) != 2 || metadata.Data.Features[0] != "voice" || metadata.Data.Features[1] != "temporary_channels" || metadata.Data.VoiceEndpoint.Host == "" || metadata.Data.VoiceEndpoint.Port == 0 {
 		t.Fatalf("metadata = status:%d body:%+v", metadataResp.StatusCode, metadata)
 	}
 

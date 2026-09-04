@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -228,6 +229,90 @@ func TestVoiceJoinFoldsPendingOwnerTeardown(t *testing.T) {
 	want := []string{"voice.revoked", "voice.authority.updated", "channel.member.left", "channel.member.joined", "voice.authority.updated"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("fast rejoin event order = %v, want %v", got, want)
+	}
+}
+
+// TestVoiceJoinHandlesNaturalExpiryBeforeReplacement verifies that a dead
+// session cannot be reused for a move, while an explicit new-session join
+// publishes the terminal timeout transition before the fresh authority.
+func TestVoiceJoinHandlesNaturalExpiryBeforeReplacement(t *testing.T) {
+	fixture := newFixture(t)
+	ctx := context.Background()
+	source, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		Name:       "Expired source",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		Name:       "Expired target",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID := mustID(t, source.ID)
+	targetID := mustID(t, target.ID)
+	now := time.UnixMilli(1_000)
+	manager := protocol.NewManager(func() time.Time { return now })
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(fixture.adminID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := reservation.Activate(voiceJoinTransport{}, 100_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceRuntime(manager, coordinator, true)
+	fixture.service.SetVoiceClock(func() int64 { return now.UnixMilli() })
+	signer, err := realtime.NewRequestIdentitySigner([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceIdempotency(realtime.NewRuntimeIdempotencyCache(), signer)
+
+	if _, err := fixture.service.JoinVoice(ctx, fixture.adminID, sourceID, ref.ControlConnectionID, "expired-source-key", channel.VoiceJoinInput{DeviceID: "desktop"}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	authority, ok := coordinator.VoiceAuthority(fixture.adminID)
+	if !ok {
+		t.Fatal("source join did not create voice authority")
+	}
+	now = now.Add(protocol.SessionTTL + time.Second)
+	moveInput := channel.VoiceJoinInput{ExpectedVoiceSessionID: fmt.Sprintf("%x", authority.VoiceSessionID)}
+	if _, err := fixture.service.JoinVoice(ctx, fixture.adminID, targetID, ref.ControlConnectionID, "expired-move-key", moveInput, "127.0.0.1"); !errors.Is(err, channel.ErrVoiceStale) {
+		t.Fatalf("expired reuse-move error = %v, want ErrVoiceStale", err)
+	}
+	if _, err := fixture.service.JoinVoice(ctx, fixture.adminID, targetID, ref.ControlConnectionID, "expired-replace-key", channel.VoiceJoinInput{
+		ExpectedVoiceSessionID: moveInput.ExpectedVoiceSessionID,
+		ForceNew:               true,
+		DeviceID:               "desktop-2",
+	}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	current, ok := coordinator.VoiceAuthority(fixture.adminID)
+	if !ok || current.ChannelID != targetID {
+		t.Fatalf("replacement authority = %+v, ok=%t", current, ok)
+	}
+	if got, ok := manager.SessionIDByUser(fixture.adminID); !ok || got != current.VoiceSessionID {
+		t.Fatalf("replacement manager session = %x, ok=%t; authority = %x", got, ok, current.VoiceSessionID)
+	}
+	events := fixture.publication.Capture().Events
+	if len(events) < 5 {
+		t.Fatalf("published events = %+v", events)
+	}
+	got := eventTypes(events[len(events)-5:])
+	want := []string{"voice.disconnected", "voice.authority.updated", "channel.member.left", "channel.member.joined", "voice.authority.updated"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("natural expiry replacement event order = %v, want %v", got, want)
 	}
 }
 

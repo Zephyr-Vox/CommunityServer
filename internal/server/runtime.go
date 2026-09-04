@@ -268,6 +268,13 @@ func (a *App) stopRealtime(ctx context.Context) error {
 	}
 	a.stopMu.Lock()
 	defer a.stopMu.Unlock()
+	voiceIdempotencyStop := a.voiceIdempotencyStop
+	a.voiceIdempotencyStop = nil
+	defer func() {
+		if voiceIdempotencyStop != nil {
+			voiceIdempotencyStop()
+		}
+	}()
 	a.runtimeMu.Lock()
 	sequencer := a.sequencer
 	eventBus := a.eventBus
