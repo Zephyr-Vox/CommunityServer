@@ -581,7 +581,7 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 				CommitRuntime: func() (func(), error) {
 					commit, commitErr := stage.ApplyForPublication(s.voiceManager, naturalExpiry)
 					if commitErr != nil {
-						if errors.Is(commitErr, protocol.ErrSessionPrecondition) || errors.Is(commitErr, protocol.ErrSessionExpired) {
+						if errors.Is(commitErr, protocol.ErrSessionPrecondition) || errors.Is(commitErr, protocol.ErrSessionExpired) || errors.Is(commitErr, realtime.ErrVoiceAuthorityPrecondition) {
 							// A runtime command has already reserved its publication. Mark
 							// this exact-session race as a cancellable no-op so the
 							// sequencer releases the reservation without declaring the
@@ -794,7 +794,10 @@ func (s *Service) LeaveVoice(ctx context.Context, actorID int64, controlConnecti
 						return nil, disconnectErr
 					}
 					if !removed {
-						return nil, ErrVoiceStale
+						// A concurrent WS EOF or UDP expiry may have won the exact
+						// coordinator CAS after this command built its candidate.
+						// This is a normal stale request, not a publication failure.
+						return nil, fmt.Errorf("%w: %w", context.Canceled, ErrVoiceStale)
 					}
 					if drain != nil {
 						drain()

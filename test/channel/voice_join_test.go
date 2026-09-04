@@ -387,6 +387,99 @@ func TestVoiceJoinRejectsExpiryAtActivationBoundary(t *testing.T) {
 	}
 }
 
+// TestVoiceJoinTreatsCoordinatorLossAsStale verifies that an expiry/teardown
+// winning after join planning does not turn an exact authority race into a
+// process-fatal publication error.
+func TestVoiceJoinTreatsCoordinatorLossAsStale(t *testing.T) {
+	fixture := newFixture(t)
+	ctx := context.Background()
+	source, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		Name:       "Coordinator race source",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		Name:       "Coordinator race target",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID := mustID(t, source.ID)
+	targetID := mustID(t, target.ID)
+	manager := protocol.NewManager(func() time.Time { return time.UnixMilli(1_000) })
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(fixture.adminID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := reservation.Activate(voiceJoinTransport{}, 100_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceRuntime(manager, coordinator, true)
+	fixture.service.SetVoiceClock(func() int64 { return 1_000 })
+	signer, err := realtime.NewRequestIdentitySigner([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceIdempotency(realtime.NewRuntimeIdempotencyCache(), signer)
+	if _, err := fixture.service.JoinVoice(ctx, fixture.adminID, sourceID, ref.ControlConnectionID, "coordinator-race-source", channel.VoiceJoinInput{DeviceID: "desktop"}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	authority, ok := coordinator.VoiceAuthority(fixture.adminID)
+	if !ok {
+		t.Fatal("source join did not create voice authority")
+	}
+	entered := make(chan struct{})
+	claimed := make(chan struct{}, 1)
+	fixture.publication.SetHook(func(stage realtime.PublicationStage) {
+		if stage != realtime.PublicationBeforeRingAppend {
+			return
+		}
+		close(entered)
+		if _, ok, err := coordinator.BeginVoiceDisconnectReason(authority, nil, "udp_timeout"); err == nil && ok {
+			claimed <- struct{}{}
+		}
+	})
+	defer fixture.publication.SetHook(nil)
+	result := make(chan error, 1)
+	go func() {
+		_, joinErr := fixture.service.JoinVoice(ctx, fixture.adminID, targetID, ref.ControlConnectionID, "coordinator-race-replace", channel.VoiceJoinInput{
+			DeviceID:               "desktop-2",
+			ForceNew:               true,
+			ExpectedVoiceSessionID: fmt.Sprintf("%x", authority.VoiceSessionID),
+		}, "127.0.0.1")
+		result <- joinErr
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not reach publication boundary")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, channel.ErrVoiceStale) {
+			t.Fatalf("coordinator-race replacement error = %v, want ErrVoiceStale", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("coordinator-race replacement did not finish")
+	}
+	select {
+	case <-claimed:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent coordinator teardown did not claim authority")
+	}
+}
+
 // TestVoiceJoinFoldsPendingOwnerTeardown proves a fast rejoin publishes the
 // queued owner-WS teardown before the new membership and authority events.
 func TestVoiceJoinFoldsPendingOwnerTeardown(t *testing.T) {

@@ -50,10 +50,11 @@ func (v *voiceRuntime) Start(ctx context.Context, host string, port int, supervi
 	}
 	v.fatal = supervisor.Fatal
 	v.started = true
-	v.closeMu.Unlock()
 
 	// UDPServer owns PacketConn after Start. Its non-close return is fatal; the
 	// supervisor cancels the process root and owns the subsequent stop sequence.
+	// Keep closeMu held until all stopPurge dependencies are registered: a
+	// concurrent App.Close must not wait on purgeDone before its worker exists.
 	supervisor.Go("udp read", func(context.Context) error { return <-errCh })
 	supervisor.Go("udp purge", func(context.Context) error {
 		defer close(purgeDone)
@@ -90,6 +91,7 @@ func (v *voiceRuntime) Start(ctx context.Context, host string, port int, supervi
 			}
 		}
 	})
+	v.closeMu.Unlock()
 	return nil
 }
 
