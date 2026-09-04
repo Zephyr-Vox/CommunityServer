@@ -114,6 +114,63 @@ func TestActivationResponseLossReplaysAfterRestart(t *testing.T) {
 	}
 }
 
+func TestLegacyActivationReplayRequiresSync(t *testing.T) {
+	dir := t.TempDir()
+	app := newAppAt(t, dir)
+	code, pending, err := app.EnsureActivationCode(context.Background())
+	if err != nil || !pending {
+		t.Fatalf("EnsureActivationCode = (_, %t, %v)", pending, err)
+	}
+	const key = "activate-legacy-0001"
+	body := `{"code":"` + code + `","username":"boss","password":"secret123","nickname":"Boss"}`
+	first := postJSONIdempotency(t, app, "/api/v0/admin/activate", key, body)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first activation = %d %s", first.Code, first.Body.String())
+	}
+	commandID := first.Header().Get("X-Zephyr-Command-ID")
+	if commandID == "" {
+		t.Fatal("first activation omitted command ID")
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replace the new wrapped result with the legacy user envelope to model a
+	// record created before activation checkpoint persistence was introduced.
+	conn, err := store.Open(filepath.Join(dir, "zephyr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var storedBody string
+	if err := conn.QueryRow(`SELECT result_body FROM activation_idempotency WHERE idempotency_key = ?`, key).Scan(&storedBody); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	var stored struct {
+		Body json.RawMessage `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(storedBody), &stored); err != nil || len(stored.Body) == 0 {
+		conn.Close()
+		t.Fatalf("stored activation result = %s, want wrapped body", storedBody)
+	}
+	if _, err := conn.Exec(`UPDATE activation_idempotency SET result_body = ? WHERE idempotency_key = ?`, string(stored.Body), key); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newAppAt(t, dir)
+	replay := postJSONIdempotency(t, restarted, "/api/v0/admin/activate", key, body)
+	if replay.Code != http.StatusOK || replay.Header().Get("X-Zephyr-Command-ID") != commandID {
+		t.Fatalf("legacy activation replay = %d command=%q body=%s", replay.Code, replay.Header().Get("X-Zephyr-Command-ID"), replay.Body.String())
+	}
+	if replay.Header().Get("X-Zephyr-Sync-Required") != "true" || replay.Header().Get("X-Zephyr-State-Cursor") != "" || replay.Header().Get("X-Zephyr-Stream-Epoch") != "" || replay.Header().Get("X-Zephyr-Geid") != "" {
+		t.Fatalf("legacy activation replay headers = %v", replay.Header())
+	}
+}
+
 func TestActivationRequiresIdempotencyKey(t *testing.T) {
 	app := newTestApp(t)
 	code, _, err := app.EnsureActivationCode(context.Background())

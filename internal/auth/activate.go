@@ -291,7 +291,7 @@ func (m *ActivationManager) activate(ctx context.Context, idempotencyKey, code, 
 }
 
 // activationReplayResult turns a durable activation replay into the public
-// outcome and suppresses an obsolete cursor after a process epoch change.
+// outcome and suppresses an obsolete or incomplete cursor.
 func (m *ActivationManager) activationReplayResult(user *db.User, replay realtime.ActivationReplay) ActivationResult {
 	result := ActivationResult{
 		User: user, CommandID: replay.CommandID, Replayed: true,
@@ -301,7 +301,7 @@ func (m *ActivationManager) activationReplayResult(user *db.User, replay realtim
 		return result
 	}
 	current := m.runtime.CurrentCheckpoint()
-	if result.Checkpoint.StreamEpoch != "" && current.StreamEpoch != "" && result.Checkpoint.StreamEpoch != current.StreamEpoch {
+	if result.Checkpoint.StreamEpoch == "" || result.Checkpoint.GEID == 0 || result.StateCursor == "" || current.StreamEpoch == "" || result.Checkpoint.StreamEpoch != current.StreamEpoch {
 		result.SyncRequired = true
 		result.Checkpoint = realtime.Checkpoint{}
 		result.StateCursor = ""
