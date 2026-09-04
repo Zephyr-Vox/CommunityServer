@@ -48,7 +48,6 @@ type AuthService struct {
 	refreshTTL  time.Duration
 	now         func() int64 // Unix milliseconds, injectable for tests
 	connections ConnectionRevoker
-	publisher   StateChangePublisher
 	gate        MutationGate
 	runtime     *StateMutationRuntime
 }
@@ -58,12 +57,6 @@ type AuthService struct {
 // a nil value leaves the service usable for HTTP-only tests.
 func (s *AuthService) SetConnectionRevoker(revoker ConnectionRevoker) {
 	s.connections = revoker
-}
-
-// SetStateChangePublisher installs the persistent realtime projection bridge
-// for auth-version-changing password mutations.
-func (s *AuthService) SetStateChangePublisher(publisher StateChangePublisher) {
-	s.publisher = publisher
 }
 
 // SetStateMutationGate installs the process-wide persistent mutation gate.
@@ -249,9 +242,6 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID int64, newPassw
 	}
 	s.disconnectUser(userID, "password_changed")
 	s.principals.Invalidate(userID)
-	if s.publisher != nil {
-		return s.publisher(ctx, StateChange{EventType: "user.updated", UserID: userID})
-	}
 	return nil
 }
 
@@ -317,9 +307,6 @@ func (s *AuthService) ResetPassword(ctx context.Context, actorID, userID int64, 
 	}
 	s.disconnectUser(userID, "password_reset")
 	s.principals.Invalidate(userID)
-	if s.publisher != nil {
-		return s.publisher(ctx, StateChange{EventType: "user.updated", UserID: userID})
-	}
 	return nil
 }
 

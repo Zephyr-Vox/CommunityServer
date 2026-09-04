@@ -139,11 +139,6 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 	return completion.Value, nil
 }
 
-// StateChangePublisher serializes a committed account change into the
-// application realtime projection. Server assembly supplies it; standalone auth
-// tests and HTTP-only embeddings may leave it nil.
-type StateChangePublisher func(context.Context, StateChange) error
-
 // MutationGate serializes one persistent account write with its following
 // in-process state publication. Server assembly shares one gate across every
 // domain that changes the realtime persistent projection.

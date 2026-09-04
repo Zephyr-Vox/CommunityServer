@@ -2,11 +2,9 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
@@ -332,100 +330,6 @@ func (a *App) realtimeComponents() (*realtime.StateStore, *realtime.PostCommitSe
 	a.runtimeMu.RLock()
 	defer a.runtimeMu.RUnlock()
 	return a.state, a.sequencer, a.state != nil && a.sequencer != nil
-}
-
-// publishAccountChange refreshes the persistent projection after an account
-// transaction has committed and emits canonical user/self event DTOs. Existing
-// account services retain their domain transactions; this bridge serializes the
-// following state publication before their HTTP handler reports success.
-func (a *App) publishAccountChange(ctx context.Context, change auth.StateChange) error {
-	if change.UserID <= 0 || (change.EventType != "user.created" && change.EventType != "user.updated" && change.EventType != "user.deleted") {
-		return errors.New("server: invalid account state change")
-	}
-	state, sequencer, ok := a.realtimeComponents()
-	if !ok {
-		return errors.New("server: realtime unavailable")
-	}
-	completionCtx := context.WithoutCancel(ctx)
-	_, err := sequencer.Submit(completionCtx, realtime.PostCommitCommand{
-		QueueBytes: 1,
-		CommandID:  change.CommandID,
-		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
-			candidate, err := state.BuildPersistentCandidate(commandCtx)
-			if err != nil {
-				return realtime.CommandOutput{}, err
-			}
-			events, err := accountStateEvents(change, candidate.Version())
-			if err != nil {
-				return realtime.CommandOutput{}, err
-			}
-			visibilityUserIDs := make([]int64, 0)
-			for _, user := range candidate.Version().Users() {
-				visibilityUserIDs = append(visibilityUserIDs, user.ID)
-			}
-			visibilityUserIDs = append(visibilityUserIDs, change.UserID)
-			if _, err := execution.Reserve(realtime.PublicationRequest{
-				Candidate:         candidate,
-				Events:            events,
-				VisibilityUserIDs: visibilityUserIDs,
-			}); err != nil {
-				return realtime.CommandOutput{}, err
-			}
-			if err := execution.MarkRuntimeReady(); err != nil {
-				return realtime.CommandOutput{}, err
-			}
-			return realtime.CommandOutput{}, nil
-		},
-	})
-	if err != nil {
-		a.reportRealtimeFatal(fmt.Errorf("account state publication: %w", err))
-	}
-	return err
-}
-
-// accountStateEvents creates canonical public user data and targeted self data
-// from the exact candidate that StatePublication will make visible.
-func accountStateEvents(change auth.StateChange, version *realtime.StateVersion) ([]realtime.StateEventTemplate, error) {
-	if change.EventType == "user.deleted" {
-		data, err := json.Marshal(struct {
-			UserID string `json:"user_id"`
-		}{UserID: strconv.FormatInt(change.UserID, 10)})
-		if err != nil {
-			return nil, err
-		}
-		return []realtime.StateEventTemplate{{EventType: "user.deleted", Scope: realtime.Scope{Type: "server"}, Data: data}}, nil
-	}
-	if _, exists := version.User(change.UserID); !exists {
-		return nil, errors.New("server: account missing from realtime projection")
-	}
-	userData, err := json.Marshal(struct {
-		UserID string `json:"user_id"`
-	}{UserID: strconv.FormatInt(change.UserID, 10)})
-	if err != nil {
-		return nil, err
-	}
-	events := []realtime.StateEventTemplate{{
-		EventType:     change.EventType,
-		Scope:         realtime.Scope{Type: "server"},
-		Data:          userData,
-		SubjectUserID: change.UserID,
-	}}
-	if change.EventType == "user.updated" {
-		selfData, err := json.Marshal(struct {
-			Self realtime.SnapshotSelf `json:"self"`
-		}{Self: realtime.SnapshotSelfFor(change.UserID, version)})
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, realtime.StateEventTemplate{
-			EventType:       "self.updated",
-			Scope:           realtime.Scope{Type: "server"},
-			Data:            selfData,
-			DeliveryPolicy:  realtime.StateDeliveryUserTargeted,
-			RecipientUserID: change.UserID,
-		})
-	}
-	return events, nil
 }
 
 // connectionAuthenticator returns the process-owned WebSocket authentication

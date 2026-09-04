@@ -34,16 +34,8 @@ type AvatarService struct {
 	transcodeSlots chan struct{}
 	userLocks      *avatarUserLocks
 	afterMetadata  func()
-	publishState   func(context.Context, int64) error
 	gate           MutationGate
 	executeState   StateMutationExecutor
-}
-
-// SetStatePublisher installs the application callback invoked after avatar
-// metadata commits. It lets the canonical realtime user projection replace the
-// old avatar value before the HTTP request reports success.
-func (s *AvatarService) SetStatePublisher(publisher func(context.Context, int64) error) {
-	s.publishState = publisher
 }
 
 // MutationGate serializes avatar metadata writes with their following
@@ -201,11 +193,6 @@ func (s *AvatarService) upload(ctx context.Context, userID int64, src io.Reader,
 			_ = s.objects.Delete(ctx, AvatarBucket, name) // best-effort: no orphan objects
 			return "", err
 		}
-		if s.publishState != nil {
-			if err := s.publishState(ctx, userID); err != nil {
-				return "", err
-			}
-		}
 	}
 	if s.afterMetadata != nil {
 		s.afterMetadata()
@@ -244,11 +231,6 @@ func (s *AvatarService) Reset(ctx context.Context, userID int64) error {
 		defer release()
 		if _, err := s.users.SetAvatar(ctx, userID, nil); err != nil {
 			return err
-		}
-		if s.publishState != nil {
-			if err := s.publishState(ctx, userID); err != nil {
-				return err
-			}
 		}
 	}
 	if user.Avatar.Valid {

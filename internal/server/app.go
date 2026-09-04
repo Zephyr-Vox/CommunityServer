@@ -256,13 +256,6 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		conn.Close()
 		return nil, fmt.Errorf("server: restore temporary channel schedules: %w", err)
 	}
-	register.SetStateChangePublisher(app.publishAccountChange)
-	activate.SetStateChangePublisher(app.publishAccountChange)
-	users.SetStateChangePublisher(app.publishAccountChange)
-	authSvc.SetStateChangePublisher(app.publishAccountChange)
-	avatarSvc.SetStatePublisher(func(ctx context.Context, userID int64) error {
-		return app.publishAccountChange(ctx, auth.StateChange{EventType: "user.updated", UserID: userID})
-	})
 	if err := app.routes(e); err != nil {
 		_ = app.stopRealtime(context.Background())
 		conn.Close()

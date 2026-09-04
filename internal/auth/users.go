@@ -44,16 +44,8 @@ type UserService struct {
 	principals    *PrincipalCache
 	avatarCleaner AvatarCleaner
 	connections   ConnectionRevoker
-	publisher     StateChangePublisher
 	gate          MutationGate
 	runtime       *StateMutationRuntime
-}
-
-// SetStateChangePublisher installs the post-commit realtime projection bridge
-// used by public account mutations. It is configured once during server
-// assembly, before handlers can call this service.
-func (s *UserService) SetStateChangePublisher(publisher StateChangePublisher) {
-	s.publisher = publisher
 }
 
 // SetStateMutationGate installs the process-wide persistent mutation gate.
@@ -154,9 +146,6 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.publish(ctx, "user.updated", userID); err != nil {
-		return nil, err
-	}
 	return updated, nil
 }
 
@@ -214,9 +203,6 @@ func (s *UserService) UpdateManagedProfile(ctx context.Context, actorID, userID 
 		user, err = tx.Users.UpdateNickname(ctx, userID, nickname)
 		return err
 	}); err != nil {
-		return nil, err
-	}
-	if err := s.publish(ctx, "user.updated", userID); err != nil {
 		return nil, err
 	}
 	return user, nil
@@ -321,9 +307,6 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 	}
 	s.disconnectUser(userID, "kicked")
 	s.principals.Invalidate(userID)
-	if err := s.publish(ctx, "user.updated", userID); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -387,9 +370,6 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 	}
 	s.disconnectUser(userID, "banned")
 	s.principals.Invalidate(userID)
-	if err := s.publish(ctx, "user.updated", userID); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -430,9 +410,6 @@ func (s *UserService) Unban(ctx context.Context, actorID, userID int64) error {
 		return err
 	}
 	s.principals.Invalidate(userID)
-	if err := s.publish(ctx, "user.updated", userID); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -522,22 +499,10 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 	}
 	s.disconnectUser(userID, "account_deleted")
 	s.principals.Invalidate(userID)
-	if err := s.publish(ctx, "user.deleted", userID); err != nil {
-		return err
-	}
 	if s.avatarCleaner != nil && avatarName != "" {
 		_ = s.avatarCleaner.DeleteAvatar(ctx, avatarName) // best-effort after commit
 	}
 	return nil
-}
-
-// publish forwards a committed account change to the optional application
-// realtime bridge. Nil preserves the service's standalone use in unit tests.
-func (s *UserService) publish(ctx context.Context, eventType string, userID int64) error {
-	if s.publisher == nil {
-		return nil
-	}
-	return s.publisher(ctx, StateChange{EventType: eventType, UserID: userID})
 }
 
 // parsePagination reads limit/offset query parameters with defaults of 50 and
