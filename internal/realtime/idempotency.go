@@ -131,21 +131,35 @@ type DurableActivationIdempotency struct {
 }
 
 // ActivationCommandResult is the canonical response stored for a bootstrap
-// activation. State checkpoint fields are intentionally absent until this
-// pre-realtime HTTP mutation becomes a StateStore consumer.
+// activation. Checkpoint and StateCursor are persisted with the response when
+// activation is executed through the StateMutationRuntime.
 type ActivationCommandResult struct {
-	CommandID int64
-	Status    int
-	Body      json.RawMessage
-	Headers   store.IdempotencyHeaders
+	CommandID   int64
+	Status      int
+	Body        json.RawMessage
+	Headers     store.IdempotencyHeaders
+	Checkpoint  Checkpoint
+	StateCursor string
 }
 
 // ActivationReplay is the response reconstructed from a completed activation.
 type ActivationReplay struct {
-	CommandID int64
-	Status    int
-	Body      json.RawMessage
-	Headers   store.IdempotencyHeaders
+	CommandID   int64
+	Status      int
+	Body        json.RawMessage
+	Headers     store.IdempotencyHeaders
+	Checkpoint  Checkpoint
+	StateCursor string
+}
+
+// activationStoredResult is the private durable representation used by the
+// existing activation table. Keeping the API body nested preserves exact
+// replay bytes while allowing checkpoint metadata to survive restarts without
+// exposing it as part of the public response body.
+type activationStoredResult struct {
+	Body        json.RawMessage `json:"body"`
+	Checkpoint  Checkpoint      `json:"checkpoint"`
+	StateCursor string          `json:"state_cursor"`
 }
 
 // DurableReplay is the canonical response reconstructed from a completed
@@ -220,7 +234,7 @@ func (d *DurableActivationIdempotency) Lookup(ctx context.Context, identity Inst
 	if !equalHexDigest(record.ActivationCodeHash, identity.ActivationCodeHash) || !equalHexDigest(record.RequestHMAC, requestHMAC) {
 		return ActivationReplay{}, true, ErrIdempotencyMismatch
 	}
-	result, err := canonicalizeActivationCommandResult(ActivationCommandResult{
+	result, err := activationResultFromStoredBody(ActivationCommandResult{
 		CommandID: record.CommandID,
 		Status:    int(record.Status),
 		Body:      record.ResultBody,
@@ -230,11 +244,34 @@ func (d *DurableActivationIdempotency) Lookup(ctx context.Context, identity Inst
 		return ActivationReplay{}, true, err
 	}
 	return ActivationReplay{
-		CommandID: result.CommandID,
-		Status:    result.Status,
-		Body:      append(json.RawMessage(nil), result.Body...),
-		Headers:   result.Headers,
+		CommandID:   result.CommandID,
+		Status:      result.Status,
+		Body:        append(json.RawMessage(nil), result.Body...),
+		Headers:     result.Headers,
+		Checkpoint:  result.Checkpoint,
+		StateCursor: result.StateCursor,
 	}, true, nil
+}
+
+// LookupPublic returns a completed installation-scoped public mutation and
+// suppresses checkpoint metadata when the record belongs to an older process
+// epoch. Public identities use the same durable table as activation because
+// both commands run before an authenticated principal is available.
+func (d *DurableActivationIdempotency) LookupPublic(ctx context.Context, identity InstallationCommandIdentity, idempotencyKey, currentEpoch string) (DurableReplay, bool, error) {
+	replay, found, err := d.Lookup(ctx, identity, idempotencyKey)
+	if err != nil || !found {
+		return DurableReplay{}, found, err
+	}
+	result := DurableReplay{
+		CommandID: replay.CommandID, Status: replay.Status, Body: replay.Body, Headers: replay.Headers,
+		Checkpoint: replay.Checkpoint, StateCursor: replay.StateCursor,
+	}
+	if currentEpoch != "" && result.Checkpoint.StreamEpoch != "" && result.Checkpoint.StreamEpoch != currentEpoch {
+		result.SyncRequired = true
+		result.Checkpoint = Checkpoint{}
+		result.StateCursor = ""
+	}
+	return result, true, nil
 }
 
 // Admit reserves a shared durable retry slot in the activation transaction.
@@ -259,6 +296,16 @@ func (d *DurableActivationIdempotency) Save(ctx context.Context, txStores *store
 	if err != nil {
 		return err
 	}
+	body := result.Body
+	if result.StateCursor != "" || result.Checkpoint.StreamEpoch != "" {
+		stored, err := json.Marshal(activationStoredResult{
+			Body: result.Body, Checkpoint: result.Checkpoint, StateCursor: result.StateCursor,
+		})
+		if err != nil {
+			return err
+		}
+		body = stored
+	}
 	return txStores.ActivationIdempotency.Save(ctx, store.ActivationIdempotencyRecord{
 		InstallationID:     identity.InstallationID,
 		IdempotencyKey:     idempotencyKey,
@@ -266,8 +313,18 @@ func (d *DurableActivationIdempotency) Save(ctx context.Context, txStores *store
 		RequestHMAC:        requestHMAC,
 		CommandID:          result.CommandID,
 		Status:             int64(result.Status),
-		ResultBody:         result.Body,
+		ResultBody:         body,
 		Headers:            result.Headers,
+	})
+}
+
+// SavePublic persists one public mutation response in the same transaction as
+// its domain change. The installation-scoped record remains replayable even
+// though the mutation creates or changes no authenticated principal.
+func (d *DurableActivationIdempotency) SavePublic(ctx context.Context, txStores *store.Stores, identity InstallationCommandIdentity, idempotencyKey string, result CanonicalCommandResult) error {
+	return d.Save(ctx, txStores, identity, idempotencyKey, ActivationCommandResult{
+		CommandID: result.CommandID, Status: result.Status, Body: result.Body,
+		Headers: result.Headers, Checkpoint: result.Checkpoint, StateCursor: result.StateCursor,
 	})
 }
 
@@ -460,6 +517,13 @@ func canonicalizeActivationCommandResult(result ActivationCommandResult) (Activa
 	if result.CommandID <= 0 || result.Status < 100 || result.Status > 599 || invalidResourceHeaders(result.Headers) {
 		return ActivationCommandResult{}, ErrInvalidCommandResult
 	}
+	if result.Checkpoint.StreamEpoch != "" {
+		if validateStreamEpoch(result.Checkpoint.StreamEpoch) != nil || result.StateCursor == "" {
+			return ActivationCommandResult{}, ErrInvalidCommandResult
+		}
+	} else if result.StateCursor != "" {
+		return ActivationCommandResult{}, ErrInvalidCommandResult
+	}
 	if result.Status == 204 && len(result.Body) == 0 {
 		result.Body = json.RawMessage("null")
 	}
@@ -469,6 +533,18 @@ func canonicalizeActivationCommandResult(result ActivationCommandResult) (Activa
 	}
 	result.Body = body
 	return result, nil
+}
+
+// activationResultFromStoredBody unwraps new activation records and accepts
+// older records that predate checkpoint persistence.
+func activationResultFromStoredBody(result ActivationCommandResult) (ActivationCommandResult, error) {
+	var stored activationStoredResult
+	if err := json.Unmarshal(result.Body, &stored); err == nil && len(stored.Body) > 0 {
+		result.Body = stored.Body
+		result.Checkpoint = stored.Checkpoint
+		result.StateCursor = stored.StateCursor
+	}
+	return canonicalizeActivationCommandResult(result)
 }
 
 // canonicalFields sorts named command identity components and rejects duplicate

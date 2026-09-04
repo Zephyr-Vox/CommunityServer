@@ -144,6 +144,11 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		conn.Close()
 		return nil, fmt.Errorf("server: durable command idempotency: %w", err)
 	}
+	publicDurableCommands, err := realtime.NewDurableActivationIdempotency(stores, requestSigner)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("server: public durable command idempotency: %w", err)
+	}
 	channels := channel.NewService(stores, principals)
 	moderationSvc := moderation.NewService(stores, principals)
 
@@ -216,6 +221,12 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	}
 	register.SetStateMutationGate(app.mutationGate)
 	register.SetStateCommandRuntime(accountRuntime)
+	accountRuntime.SetDurableIdempotency(durableCommands)
+	accountRuntime.SetPublicDurableIdempotency(publicDurableCommands)
+	if cursors, ok := app.syncStrategy.(realtime.StateCursorIssuer); ok {
+		accountRuntime.SetStateCursorIssuer(cursors)
+		activate.SetStateCursorIssuer(cursors)
+	}
 	activate.SetStateMutationGate(app.mutationGate)
 	activate.SetStateCommandRuntime(accountRuntime)
 	users.SetStateMutationGate(app.mutationGate)
@@ -223,12 +234,14 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	authSvc.SetStateMutationGate(app.mutationGate)
 	authSvc.SetStateCommandRuntime(accountRuntime)
 	avatarSvc.SetStateMutationGate(app.mutationGate)
-	avatarSvc.SetStateMutationExecutor(func(ctx context.Context, userID int64, mutate image.StateMutationFunc) error {
+	avatarSvc.SetStateMutationPreparer(accountRuntime.PrepareHTTPMutation)
+	avatarSvc.SetStateMutationExecutor(func(ctx context.Context, userID int64, mutate image.StateMutationFunc, value any) error {
 		_, err := accountRuntime.Run(ctx, []int64{userID}, func(commandCtx context.Context, txStores *store.Stores) (auth.AccountMutationResult, error) {
 			if err := mutate(commandCtx, txStores); err != nil {
 				return auth.AccountMutationResult{}, err
 			}
 			return auth.AccountMutationResult{
+				Value:  value,
 				Change: auth.StateChange{EventType: "user.updated", UserID: userID},
 			}, nil
 		})

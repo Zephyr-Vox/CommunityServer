@@ -34,6 +34,9 @@ func requestMethodWithToken(t *testing.T, app *echo.Echo, method, path, token, b
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete {
+		req.Header.Set("Idempotency-Key", "auth-test-command-0001")
+	}
 	if token != "" {
 		req.Header.Set(echo.HeaderAuthorization, "Bearer "+token)
 	}

@@ -143,7 +143,7 @@ func TestRunReadTimeoutClosesSlowBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if _, err := fmt.Fprintf(conn, "POST /api/v0/auth/register HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"username\":\"alice\"", addr); err != nil {
+	if _, err := fmt.Fprintf(conn, "POST /api/v0/auth/register HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nIdempotency-Key: run-register-0001\r\nContent-Length: 64\r\n\r\n{\"username\":\"alice\"", addr); err != nil {
 		t.Fatal(err)
 	}
 
@@ -174,7 +174,7 @@ func TestRunForceClosesConnectionAfterShutdownDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if _, err := fmt.Fprintf(conn, "POST /api/v0/auth/register HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"username\":\"alice\"", addr); err != nil {
+	if _, err := fmt.Fprintf(conn, "POST /api/v0/auth/register HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nIdempotency-Key: run-register-0002\r\nContent-Length: 64\r\n\r\n{\"username\":\"alice\"", addr); err != nil {
 		cancel()
 		<-done
 		t.Fatal(err)

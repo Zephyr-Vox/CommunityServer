@@ -22,6 +22,9 @@ func postJSON(t *testing.T, app *server.App, path, body string) *httptest.Respon
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	if path == "/api/v0/auth/register" {
+		req.Header.Set("Idempotency-Key", fmt.Sprintf("test-register-%016d", testCommandKeyCounter.Add(1)))
+	}
 	rec := httptest.NewRecorder()
 	app.Echo().ServeHTTP(rec, req)
 	return rec

@@ -38,6 +38,7 @@ type ActivationManager struct {
 	durable  *realtime.DurableActivationIdempotency
 	gate     MutationGate
 	runtime  *StateMutationRuntime
+	cursors  realtime.StateCursorIssuer
 }
 
 // SetStateMutationGate installs the process-wide persistent mutation gate.
@@ -47,6 +48,12 @@ func (m *ActivationManager) SetStateMutationGate(gate MutationGate) { m.gate = g
 // configured once during server assembly before activation is exposed.
 func (m *ActivationManager) SetStateCommandRuntime(runtime *StateMutationRuntime) {
 	m.runtime = runtime
+}
+
+// SetStateCursorIssuer installs the process-local signer used to persist and
+// return the exact checkpoint produced by first-owner activation.
+func (m *ActivationManager) SetStateCursorIssuer(cursors realtime.StateCursorIssuer) {
+	m.cursors = cursors
 }
 
 // NewActivationManager returns an ActivationManager bound to stores. identityKey
@@ -102,9 +109,12 @@ func (m *ActivationManager) EnsureCode(ctx context.Context) (code string, ok boo
 // results reconstruct User from the stored canonical DTO and preserve the
 // original command ID.
 type ActivationResult struct {
-	User      *db.User
-	CommandID int64
-	Replayed  bool
+	User         *db.User
+	CommandID    int64
+	Replayed     bool
+	Checkpoint   realtime.Checkpoint
+	StateCursor  string
+	SyncRequired bool
 }
 
 // Activate executes or replays a first-owner activation under the
@@ -135,7 +145,7 @@ func (m *ActivationManager) activate(ctx context.Context, idempotencyKey, code, 
 		if err != nil {
 			return ActivationResult{}, err
 		}
-		return ActivationResult{User: user, CommandID: replay.CommandID, Replayed: true}, nil
+		return m.activationReplayResult(user, replay), nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -148,7 +158,7 @@ func (m *ActivationManager) activate(ctx context.Context, idempotencyKey, code, 
 		if err != nil {
 			return ActivationResult{}, err
 		}
-		return ActivationResult{User: user, CommandID: replay.CommandID, Replayed: true}, nil
+		return m.activationReplayResult(user, replay), nil
 	}
 
 	// The code is one-shot: anything but an exact digest match fails without
@@ -204,12 +214,20 @@ func (m *ActivationManager) activate(ctx context.Context, idempotencyKey, code, 
 			return AccountMutationResult{
 				Value:  &activation,
 				Change: StateChange{EventType: "user.created", UserID: user.ID},
-				BeforeCommit: func(commitCtx context.Context, commitStores *store.Stores, commandID int64, _ realtime.PublicationResult) error {
+				BeforeCommit: func(commitCtx context.Context, commitStores *store.Stores, commandID int64, publication realtime.PublicationResult) error {
+					if m.cursors == nil || publication.Version == nil {
+						return errors.New("auth: activation state cursor issuer unavailable")
+					}
+					cursor, err := m.cursors.IssueStateCursor(user.ID, publication.Version)
+					if err != nil {
+						return err
+					}
 					activation.CommandID = commandID
+					activation.Checkpoint = publication.Checkpoint
+					activation.StateCursor = cursor
 					return m.durable.Save(commitCtx, commitStores, identity, idempotencyKey, realtime.ActivationCommandResult{
-						CommandID: commandID,
-						Status:    200,
-						Body:      body,
+						CommandID: commandID, Status: 200, Body: body,
+						Checkpoint: publication.Checkpoint, StateCursor: cursor,
 					})
 				},
 			}, nil
@@ -270,6 +288,22 @@ func (m *ActivationManager) activate(ctx context.Context, idempotencyKey, code, 
 	}
 	m.codeHash = ""
 	return ActivationResult{User: user, CommandID: commandID}, nil
+}
+
+// activationReplayResult turns a durable activation replay into the public
+// outcome and suppresses an obsolete cursor after a process epoch change.
+func (m *ActivationManager) activationReplayResult(user *db.User, replay realtime.ActivationReplay) ActivationResult {
+	result := ActivationResult{
+		User: user, CommandID: replay.CommandID, Replayed: true,
+		Checkpoint: replay.Checkpoint, StateCursor: replay.StateCursor,
+	}
+	current := m.runtime.CurrentCheckpoint()
+	if result.Checkpoint.StreamEpoch != "" && current.StreamEpoch != "" && result.Checkpoint.StreamEpoch != current.StreamEpoch {
+		result.SyncRequired = true
+		result.Checkpoint = realtime.Checkpoint{}
+		result.StateCursor = ""
+	}
+	return result
 }
 
 // activationIdentity builds the canonical request identity after validating

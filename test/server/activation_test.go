@@ -70,6 +70,11 @@ func TestActivationResponseLossReplaysAfterRestart(t *testing.T) {
 	if firstCommandID == "" {
 		t.Fatal("first activation omitted command ID")
 	}
+	for _, header := range []string{"X-Zephyr-State-Cursor", "X-Zephyr-Stream-Epoch", "X-Zephyr-Geid"} {
+		if first.Header().Get(header) == "" {
+			t.Fatalf("first activation omitted %s", header)
+		}
+	}
 	firstBody := first.Body.String()
 	if err := app.Close(); err != nil {
 		t.Fatal(err)
@@ -79,6 +84,9 @@ func TestActivationResponseLossReplaysAfterRestart(t *testing.T) {
 	replay := postJSONIdempotency(t, restarted, "/api/v0/admin/activate", key, body)
 	if replay.Code != http.StatusOK || replay.Header().Get("X-Zephyr-Command-ID") != firstCommandID || replay.Body.String() != firstBody {
 		t.Fatalf("activation replay = %d command=%q body=%s", replay.Code, replay.Header().Get("X-Zephyr-Command-ID"), replay.Body.String())
+	}
+	if replay.Header().Get("X-Zephyr-Sync-Required") != "true" || replay.Header().Get("X-Zephyr-State-Cursor") != "" || replay.Header().Get("X-Zephyr-Stream-Epoch") != "" || replay.Header().Get("X-Zephyr-Geid") != "" {
+		t.Fatalf("activation restart headers = %v", replay.Header())
 	}
 	mismatch := postJSONIdempotency(t, restarted, "/api/v0/admin/activate", key, `{"code":"`+code+`","username":"other","password":"secret123","nickname":"Boss"}`)
 	if mismatch.Code != http.StatusConflict {

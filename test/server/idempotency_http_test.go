@@ -13,6 +13,32 @@ import (
 	"zephyr.vox/server/ce/internal/server"
 )
 
+// TestAccountMutationsRequireAndReplayDurably covers the account-specific
+// adapters that share the same sequenced HTTP contract as channel and RBAC.
+func TestAccountMutationsRequireAndReplayDurably(t *testing.T) {
+	app := newTestApp(t)
+	_, ownerToken := activateAdmin(t, app)
+
+	missing := httptest.NewRequest(http.MethodPost, "/api/v0/auth/register", strings.NewReader(`{"username":"missing","password":"secret123"}`))
+	missing.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	missingRec := httptest.NewRecorder()
+	app.Echo().ServeHTTP(missingRec, missing)
+	if missingRec.Code != http.StatusBadRequest || decode(t, missingRec)["code"] != float64(1000) {
+		t.Fatalf("missing account key = %d %s", missingRec.Code, missingRec.Body.String())
+	}
+
+	registerBody := `{"username":"account-idem","password":"secret123","nickname":"First"}`
+	registerFirst := postJSONIdempotency(t, app, "/api/v0/auth/register", "account-register-0001", registerBody)
+	registerReplay := postJSONIdempotency(t, app, "/api/v0/auth/register", "account-register-0001", registerBody)
+	assertSameCommandReplay(t, registerFirst, registerReplay)
+
+	profileBody := `{"nickname":"Second"}`
+	profileHeaders := http.Header{"Idempotency-Key": {"account-profile-0001"}}
+	profileFirst := requestTokenWithHeaders(t, app, http.MethodPatch, "/api/v0/me", ownerToken, profileBody, profileHeaders)
+	profileReplay := requestTokenWithHeaders(t, app, http.MethodPatch, "/api/v0/me", ownerToken, profileBody, profileHeaders)
+	assertSameCommandReplay(t, profileFirst, profileReplay)
+}
+
 // TestStepSixMutationsRequireAndReplayDurably exercises the shared durable
 // command path through channel, moderation, and RBAC control mutations.
 func TestStepSixMutationsRequireAndReplayDurably(t *testing.T) {

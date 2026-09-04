@@ -61,10 +61,15 @@ type PostCommitCommand struct {
 	Execute func(context.Context, int64, *CommandExecution) (CommandOutput, error)
 }
 
-// CommandOutput is command-owned result data for the HTTP or WS adapter and is
-// never interpreted by the sequencer.
+// CommandOutput is command-owned result data for the HTTP or WS adapter. Its
+// optional post-publication callback runs before command admission barriers are
+// released.
 type CommandOutput struct {
 	Value any
+	// AfterPublish runs after the publication commit and before Acquire's
+	// release function runs. It is for in-process side effects that must share
+	// the command's linearization barrier, such as closing revoked sockets.
+	AfterPublish func(context.Context) error
 }
 
 // CommandCompletion is delivered only after StatePublication has committed the
@@ -673,6 +678,13 @@ func (s *PostCommitSequencer) execute(pending *queuedCommand) (completion Comman
 	execution.mu.Lock()
 	execution.published = true
 	execution.mu.Unlock()
+	if output.AfterPublish != nil {
+		if err := output.AfterPublish(execution.completionCtx); err != nil {
+			err = fmt.Errorf("%w: %v", ErrSequencerFailed, err)
+			s.fail(err)
+			return CommandCompletion{}, err
+		}
+	}
 	return CommandCompletion{CommandID: commandID, Publication: publication, Value: output.Value}, nil
 }
 

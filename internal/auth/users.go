@@ -9,6 +9,7 @@ import (
 
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/rbac"
+	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/store"
 )
 
@@ -113,6 +114,26 @@ func (s *UserService) Get(ctx context.Context, userID int64) (*UserWithRoles, er
 // avatar column here.
 func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname string) (*db.User, error) {
 	if nickname == "" {
+		if s.runtime != nil {
+			value, err := s.runtime.Run(ctx, []int64{userID}, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+				user, err := txStores.Users.GetUserByID(commandCtx, userID)
+				if err != nil {
+					return AccountMutationResult{}, err
+				}
+				return AccountMutationResult{Value: user, Change: StateChange{UserID: userID}, Noop: true}, nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+				return nil, nil
+			}
+			user, ok := value.(*db.User)
+			if !ok {
+				return nil, errors.New("auth: profile runtime returned invalid user")
+			}
+			return user, nil
+		}
 		// An omitted patch field is not a write. Reusing the value read above
 		// would overwrite a nickname committed concurrently by another request.
 		return s.users.GetUserByID(ctx, userID)
@@ -130,6 +151,9 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 		})
 		if err != nil {
 			return nil, err
+		}
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			return nil, nil
 		}
 		user, ok := value.(*db.User)
 		if !ok {
@@ -155,6 +179,29 @@ func (s *UserService) UpdateProfile(ctx context.Context, userID int64, nickname 
 // UpdateProfile instead and require no management permission.
 func (s *UserService) UpdateManagedProfile(ctx context.Context, actorID, userID int64, nickname string) (*db.User, error) {
 	if nickname == "" {
+		if s.runtime != nil {
+			value, err := s.runtime.Run(ctx, []int64{actorID, userID}, func(commandCtx context.Context, txStores *store.Stores) (AccountMutationResult, error) {
+				if err := requireServerPermission(commandCtx, txStores, actorID, rbac.PermUserUpdate); err != nil {
+					return AccountMutationResult{}, err
+				}
+				user, err := txStores.Users.GetUserByID(commandCtx, userID)
+				if err != nil {
+					return AccountMutationResult{}, err
+				}
+				return AccountMutationResult{Value: user, Change: StateChange{UserID: userID}, Noop: true}, nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+				return nil, nil
+			}
+			user, ok := value.(*db.User)
+			if !ok {
+				return nil, errors.New("auth: managed profile runtime returned invalid user")
+			}
+			return user, nil
+		}
 		return s.users.GetUserByID(ctx, userID)
 	}
 	if s.runtime != nil {
@@ -176,6 +223,9 @@ func (s *UserService) UpdateManagedProfile(ctx context.Context, actorID, userID 
 		})
 		if err != nil {
 			return nil, err
+		}
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			return nil, nil
 		}
 		user, ok := value.(*db.User)
 		if !ok {
@@ -266,12 +316,17 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 			if err := txStores.Sessions.DeleteUserSessions(commandCtx, userID); err != nil {
 				return AccountMutationResult{}, err
 			}
-			return AccountMutationResult{Change: StateChange{EventType: "user.updated", UserID: userID}}, nil
+			return AccountMutationResult{
+				Change:       StateChange{EventType: "user.updated", UserID: userID},
+				AfterPublish: func(context.Context) error { s.disconnectUser(userID, "kicked"); return nil },
+			}, nil
 		})
 		if err != nil {
 			return err
 		}
-		s.disconnectUser(userID, "kicked")
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			return nil
+		}
 		return nil
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
@@ -334,12 +389,17 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 			if err := txStores.Users.Ban(commandCtx, userID); err != nil {
 				return AccountMutationResult{}, err
 			}
-			return AccountMutationResult{Change: StateChange{EventType: "user.updated", UserID: userID}}, nil
+			return AccountMutationResult{
+				Change:       StateChange{EventType: "user.updated", UserID: userID},
+				AfterPublish: func(context.Context) error { s.disconnectUser(userID, "banned"); return nil },
+			}, nil
 		})
 		if err != nil {
 			return err
 		}
-		s.disconnectUser(userID, "banned")
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			return nil
+		}
 		return nil
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
@@ -389,6 +449,9 @@ func (s *UserService) Unban(ctx context.Context, actorID, userID int64) error {
 			}
 			return AccountMutationResult{Change: StateChange{EventType: "user.updated", UserID: userID}}, nil
 		})
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			return nil
+		}
 		return err
 	}
 	unlock := s.principals.LockMutation(actorID, userID)
@@ -451,12 +514,17 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 			if user.Avatar.Valid {
 				avatarName = user.Avatar.String
 			}
-			return AccountMutationResult{Value: avatarName, Change: StateChange{EventType: "user.deleted", UserID: userID}}, nil
+			return AccountMutationResult{
+				Value: avatarName, Change: StateChange{EventType: "user.deleted", UserID: userID},
+				AfterPublish: func(context.Context) error { s.disconnectUser(userID, "account_deleted"); return nil },
+			}, nil
 		})
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
-		s.disconnectUser(userID, "account_deleted")
 		avatarName, ok := value.(string)
 		if !ok {
 			return errors.New("auth: delete runtime returned invalid avatar")

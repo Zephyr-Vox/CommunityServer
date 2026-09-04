@@ -19,6 +19,7 @@ func TestRebuildAppOnSameDatabase(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v0/auth/register",
 		strings.NewReader(`{"username":"alice","password":"secret123"}`))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("Idempotency-Key", "restart-register-0001")
 	rec := httptest.NewRecorder()
 	first.Echo().ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {

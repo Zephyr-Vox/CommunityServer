@@ -9,6 +9,7 @@ import (
 
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/oss"
+	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/store"
 )
@@ -36,6 +37,7 @@ type AvatarService struct {
 	afterMetadata  func()
 	gate           MutationGate
 	executeState   StateMutationExecutor
+	prepareState   StateMutationPreparer
 }
 
 // MutationGate serializes avatar metadata writes with their following
@@ -54,12 +56,22 @@ type StateMutationFunc func(context.Context, *store.Stores) error
 // StateMutationExecutor commits one avatar metadata update together with its
 // account state projection. The object bytes are already durable when this
 // callback runs, while the user-row update remains rollbackable.
-type StateMutationExecutor func(context.Context, int64, StateMutationFunc) error
+type StateMutationExecutor func(context.Context, int64, StateMutationFunc, any) error
+
+// StateMutationPreparer looks up a completed durable HTTP command before an
+// avatar upload or reset performs object-storage work.
+type StateMutationPreparer func(context.Context, realtime.HTTPMutationCommand) (context.Context, realtime.DurableReplay, bool, error)
 
 // SetStateMutationExecutor installs the application-owned ordered account
 // mutation callback. It is configured before avatar routes are exposed.
 func (s *AvatarService) SetStateMutationExecutor(executor StateMutationExecutor) {
 	s.executeState = executor
+}
+
+// SetStateMutationPreparer installs the application-owned durable replay
+// lookup used by avatar HTTP handlers.
+func (s *AvatarService) SetStateMutationPreparer(preparer StateMutationPreparer) {
+	s.prepareState = preparer
 }
 
 var ErrTranscodeBusy = errors.New("image: transcode capacity exhausted")
@@ -121,14 +133,13 @@ func NewAvatarService(users *store.UserStore, objects *oss.LocalObjectStorage, i
 // only content sniffing, reads, decoding and transcoding; storage and metadata
 // work immediately release it so slow I/O cannot exhaust transcode capacity.
 func (s *AvatarService) Upload(ctx context.Context, userID int64, src io.Reader) (string, error) {
-	return s.upload(ctx, userID, src, nil)
+	return s.upload(ctx, userID, src)
 }
 
-// upload performs Upload and calls beforeCommit after the bounded transcode
-// finishes but before object or user metadata is changed. The HTTP adapter uses
-// this gate to finish validating the multipart request body without buffering
-// the selected file in memory.
-func (s *AvatarService) upload(ctx context.Context, userID int64, src io.Reader, beforeCommit func() error) (string, error) {
+// upload performs Upload after the bounded transcode finishes and before object
+// or user metadata is changed. HTTP callers validate the complete bounded
+// multipart body before invoking this method.
+func (s *AvatarService) upload(ctx context.Context, userID int64, src io.Reader) (string, error) {
 	unlock := s.userLocks.lock(userID)
 	defer unlock()
 	user, err := s.users.GetUserByID(ctx, userID)
@@ -154,11 +165,6 @@ func (s *AvatarService) upload(ctx context.Context, userID int64, src io.Reader,
 		}
 		return s.transcode(reader, s.conv, s.cfg.TargetSize, s.cfg.MaxDimension)
 	}()
-	if beforeCommit != nil {
-		if commitErr := beforeCommit(); commitErr != nil {
-			return "", commitErr
-		}
-	}
 	if err != nil {
 		return "", err
 	}
@@ -179,9 +185,13 @@ func (s *AvatarService) upload(ctx context.Context, userID int64, src io.Reader,
 		if err := s.executeState(ctx, userID, func(commandCtx context.Context, txStores *store.Stores) error {
 			_, err := txStores.Users.SetAvatar(commandCtx, userID, &name)
 			return err
-		}); err != nil {
+		}, name); err != nil {
 			_ = s.objects.Delete(ctx, AvatarBucket, name) // best-effort: no orphan objects
 			return "", err
+		}
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			_ = s.objects.Delete(ctx, AvatarBucket, name)
+			return "", nil
 		}
 	} else {
 		release, err := acquireMutation(ctx, s.gate)
@@ -220,8 +230,11 @@ func (s *AvatarService) Reset(ctx context.Context, userID int64) error {
 		if err := s.executeState(ctx, userID, func(commandCtx context.Context, txStores *store.Stores) error {
 			_, err := txStores.Users.SetAvatar(commandCtx, userID, nil)
 			return err
-		}); err != nil {
+		}, nil); err != nil {
 			return err
+		}
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			return nil
 		}
 	} else {
 		release, err := acquireMutation(ctx, s.gate)

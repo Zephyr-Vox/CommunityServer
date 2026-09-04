@@ -7,6 +7,7 @@ import (
 
 	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/rbac"
+	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/store"
 )
 
@@ -217,12 +218,17 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID int64, newPassw
 			if err := txStores.Sessions.DeleteUserSessions(commandCtx, userID); err != nil {
 				return AccountMutationResult{}, err
 			}
-			return AccountMutationResult{Change: StateChange{EventType: "user.updated", UserID: userID}}, nil
+			return AccountMutationResult{
+				Change:       StateChange{EventType: "user.updated", UserID: userID},
+				AfterPublish: func(context.Context) error { s.disconnectUser(userID, "password_changed"); return nil },
+			}, nil
 		})
 		if err != nil {
 			return err
 		}
-		s.disconnectUser(userID, "password_changed")
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			return nil
+		}
 		return nil
 	}
 	unlock := s.principals.LockMutation(userID)
@@ -272,12 +278,17 @@ func (s *AuthService) ResetPassword(ctx context.Context, actorID, userID int64, 
 			if err := txStores.Sessions.DeleteUserSessions(commandCtx, userID); err != nil {
 				return AccountMutationResult{}, err
 			}
-			return AccountMutationResult{Change: StateChange{EventType: "user.updated", UserID: userID}}, nil
+			return AccountMutationResult{
+				Change:       StateChange{EventType: "user.updated", UserID: userID},
+				AfterPublish: func(context.Context) error { s.disconnectUser(userID, "password_reset"); return nil },
+			}, nil
 		})
 		if err != nil {
 			return err
 		}
-		s.disconnectUser(userID, "password_reset")
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			return nil
+		}
 		return nil
 	}
 	unlock := s.principals.LockMutation(actorID, userID)

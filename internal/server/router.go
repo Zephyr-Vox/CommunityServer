@@ -99,12 +99,15 @@ func (a *App) routes(e *echo.Echo) error {
 	users := api.Group("/users")
 	users.GET("", auth.ListUsersHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserRead))...)
 	users.GET("/:id", auth.GetUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserRead))...)
-	users.PATCH("/:id", auth.UpdateUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
-	users.POST("/:id/password", auth.ResetUserPasswordHandler(a.authSvc), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
-	users.POST("/:id/kick", auth.KickUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserKick))...)
-	users.POST("/:id/ban", auth.BanUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
-	users.POST("/:id/unban", auth.UnbanUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserUpdate))...)
-	users.DELETE("/:id", auth.DeleteUserHandler(a.users), authed(rbacecho.Require(authz, rbac.PermUserDelete))...)
+	// Account mutations perform permission checks at sequencer dequeue. Keeping
+	// only AuthN middleware here lets a completed idempotent replay happen
+	// before current permission changes reject the original command's result.
+	users.PATCH("/:id", auth.UpdateUserHandler(a.users), authed()...)
+	users.POST("/:id/password", auth.ResetUserPasswordHandler(a.authSvc), authed()...)
+	users.POST("/:id/kick", auth.KickUserHandler(a.users), authed()...)
+	users.POST("/:id/ban", auth.BanUserHandler(a.users), authed()...)
+	users.POST("/:id/unban", auth.UnbanUserHandler(a.users), authed()...)
+	users.DELETE("/:id", auth.DeleteUserHandler(a.users), authed()...)
 
 	rbacGroup := api.Group("/rbac")
 	rbacGroup.GET("/roles", rbaccontrol.ListRolesHandler(rbacSvc), authed()...)

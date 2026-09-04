@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"zephyr.vox/server/ce/internal/db"
+	"zephyr.vox/server/ce/internal/realtime"
 	"zephyr.vox/server/ce/internal/store"
 )
 
@@ -121,6 +122,9 @@ func (s *RegisterService) Register(ctx context.Context, username, password, nick
 		})
 		if err != nil {
 			return nil, err
+		}
+		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {
+			return nil, nil
 		}
 		user, ok := value.(*db.User)
 		if !ok {

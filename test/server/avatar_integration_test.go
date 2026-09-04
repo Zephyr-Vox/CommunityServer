@@ -60,6 +60,7 @@ func TestAvatarUploadServesPublicly(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v0/me/avatar", &buf)
 	req.Header.Set(echo.HeaderContentType, w.FormDataContentType())
 	req.Header.Set(echo.HeaderAuthorization, "Bearer "+token)
+	req.Header.Set("Idempotency-Key", "avatar-upload-0001")
 	rec := httptest.NewRecorder()
 	app.Echo().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

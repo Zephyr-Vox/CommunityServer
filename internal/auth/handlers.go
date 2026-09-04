@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -8,6 +9,8 @@ import (
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/api"
+	"zephyr.vox/server/ce/internal/commandhttp"
+	"zephyr.vox/server/ce/internal/db"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
 	"zephyr.vox/server/ce/internal/realtime"
@@ -113,6 +116,7 @@ func LogoutHandler(svc *AuthService) echo.HandlerFunc {
 // Errors:
 //   - 1 invalid invite: invite code missing, unknown, expired or exhausted
 //   - 2 username taken: username already registered
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1008 rate limited: too many registration attempts
@@ -123,12 +127,41 @@ func RegisterHandler(svc *RegisterService) echo.HandlerFunc {
 		codeUsernameTaken = 2
 	)
 	return func(c *echo.Context) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req registerRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
+		installation, err := svc.stores.Installation.Get(c.Request().Context())
+		if err != nil {
+			return err
+		}
+		identity, err := realtime.NewPublicHTTPCommandIdentity(installation.InstallationID, http.MethodPost, "/api/v0/auth/register", req)
+		if err != nil {
+			return err
+		}
+		ctx, state, replayed, err := preparePublicAccountHTTPMutation(c, svc.runtime, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		ctx = withAccountResponseBuilder(ctx, func(value any) (realtime.HTTPMutationResponse, error) {
+			user, ok := value.(*db.User)
+			if !ok {
+				return realtime.HTTPMutationResponse{}, errors.New("auth: invalid register response")
+			}
+			return realtime.HTTPMutationResponse{Status: http.StatusCreated, Data: userEnvelope{User: newUserResponse(user)}}, nil
+		})
 
-		user, err := svc.Register(c.Request().Context(), req.Username, req.Password, req.Nickname, req.Invite)
+		user, err := svc.Register(ctx, req.Username, req.Password, req.Nickname, req.Invite)
+		if state != nil && state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		if err != nil {
 			switch {
 			case errors.Is(err, ErrInvalidInvite):
@@ -139,7 +172,8 @@ func RegisterHandler(svc *RegisterService) echo.HandlerFunc {
 				return err
 			}
 		}
-		return api.OK(c, http.StatusCreated, userEnvelope{User: newUserResponse(user)})
+		setAccountStateHeaders(c, state)
+		return commandhttp.OK(c, http.StatusCreated, userEnvelope{User: newUserResponse(user)})
 	}
 }
 
@@ -161,16 +195,16 @@ func ActivateHandler(mgr *ActivationManager) echo.HandlerFunc {
 		codeIdempotencyMismatch   = 9
 	)
 	return func(c *echo.Context) error {
-		idempotencyKey := c.Request().Header.Get("Idempotency-Key")
-		if !realtime.IdempotencyKeyValid(idempotencyKey) {
-			return api.InvalidField("header.Idempotency-Key", "must be 16-64 characters using letters, digits, underscore, or hyphen")
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
 		}
 		var req activateRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
 
-		result, err := mgr.Activate(c.Request().Context(), idempotencyKey, req.Code, req.Username, req.Password, req.Nickname)
+		result, err := mgr.Activate(c.Request().Context(), key, req.Code, req.Username, req.Password, req.Nickname)
 		if err != nil {
 			switch {
 			case errors.Is(err, ErrInvalidActivationCode):
@@ -185,7 +219,12 @@ func ActivateHandler(mgr *ActivationManager) echo.HandlerFunc {
 				return err
 			}
 		}
-		c.Response().Header().Set("X-Zephyr-Command-ID", strconv.FormatInt(result.CommandID, 10))
+		if result.SyncRequired {
+			c.Response().Header().Set("X-Zephyr-Command-ID", strconv.FormatInt(result.CommandID, 10))
+			c.Response().Header().Set("X-Zephyr-Sync-Required", "true")
+		} else {
+			commandhttp.SetStateCommandHeaders(c, result.CommandID, result.Checkpoint, result.StateCursor)
+		}
 		return api.OK(c, http.StatusOK, userEnvelope{User: newUserResponse(result.User)})
 	}
 }
@@ -348,6 +387,7 @@ func GetUserHandler(svc *UserService) echo.HandlerFunc {
 // Errors:
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 user not found
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -359,6 +399,10 @@ func UpdateUserHandler(svc *UserService) echo.HandlerFunc {
 		codeUserNotFound = 2
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		id, err := parsePathID(c)
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
@@ -367,7 +411,28 @@ func UpdateUserHandler(svc *UserService) echo.HandlerFunc {
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		user, err := svc.UpdateManagedProfile(c.Request().Context(), p.UserID, id, req.Nickname)
+		identity, err := realtime.NewHTTPCommandIdentity(p.UserID, http.MethodPatch, "/api/v0/users/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(id, 10)}}, nil, req)
+		if err != nil {
+			return err
+		}
+		ctx, state, replayed, err := prepareAccountHTTPMutation(c, svc.runtime, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		ctx = withAccountResponseBuilder(ctx, func(value any) (realtime.HTTPMutationResponse, error) {
+			user, ok := value.(*db.User)
+			if !ok {
+				return realtime.HTTPMutationResponse{}, errors.New("auth: invalid profile response")
+			}
+			return realtime.HTTPMutationResponse{Status: http.StatusOK, Data: newUserResponse(user)}, nil
+		})
+		user, err := svc.UpdateManagedProfile(ctx, p.UserID, id, req.Nickname)
+		if state != nil && state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
 		if errors.Is(err, store.ErrNotFound) {
 			return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
 		}
@@ -377,7 +442,8 @@ func UpdateUserHandler(svc *UserService) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		return api.OK(c, http.StatusOK, newUserResponse(user))
+		setAccountStateHeaders(c, state)
+		return commandhttp.OK(c, http.StatusOK, newUserResponse(user))
 	})
 }
 
@@ -388,6 +454,7 @@ func UpdateUserHandler(svc *UserService) echo.HandlerFunc {
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 user not found
 //   - 3 owner protected: owner transfer is required before this operation
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -400,6 +467,10 @@ func ResetUserPasswordHandler(svc *AuthService) echo.HandlerFunc {
 		codeOwnerProtected = 3
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		id, err := parsePathID(c)
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
@@ -408,7 +479,21 @@ func ResetUserPasswordHandler(svc *AuthService) echo.HandlerFunc {
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		if err := svc.ResetPassword(c.Request().Context(), p.UserID, id, req.Password); err != nil {
+		identity, err := realtime.NewHTTPCommandIdentity(p.UserID, http.MethodPost, "/api/v0/users/:id/password", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(id, 10)}}, nil, req)
+		if err != nil {
+			return err
+		}
+		ctx, state, replayed, err := prepareAccountHTTPMutation(c, svc.runtime, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		ctx = withAccountResponseBuilder(ctx, func(any) (realtime.HTTPMutationResponse, error) {
+			return realtime.HTTPMutationResponse{Status: http.StatusNoContent}, nil
+		})
+		if err := svc.ResetPassword(ctx, p.UserID, id, req.Password); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
 			}
@@ -420,6 +505,10 @@ func ResetUserPasswordHandler(svc *AuthService) echo.HandlerFunc {
 			}
 			return err
 		}
+		if state != nil && state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
+		setAccountStateHeaders(c, state)
 		return api.NoContent(c, http.StatusNoContent)
 	})
 }
@@ -432,6 +521,7 @@ func ResetUserPasswordHandler(svc *AuthService) echo.HandlerFunc {
 //   - 2 self action: kicking yourself is not allowed
 //   - 3 user not found
 //   - 4 owner protected: owner transfer is required before this operation
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing user:kick permission
 //   - 1009 internal: unexpected server error
@@ -443,11 +533,29 @@ func KickUserHandler(svc *UserService) echo.HandlerFunc {
 		codeOwnerProtected = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		id, err := parsePathID(c)
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
 		}
-		if err := svc.Kick(c.Request().Context(), p.UserID, id); err != nil {
+		identity, err := realtime.NewHTTPCommandIdentity(p.UserID, http.MethodPost, "/api/v0/users/:id/kick", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(id, 10)}}, nil, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, state, replayed, err := prepareAccountHTTPMutation(c, svc.runtime, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		ctx = withAccountResponseBuilder(ctx, func(any) (realtime.HTTPMutationResponse, error) {
+			return realtime.HTTPMutationResponse{Status: http.StatusNoContent}, nil
+		})
+		if err := svc.Kick(ctx, p.UserID, id); err != nil {
 			switch {
 			case errors.Is(err, ErrSelfAction):
 				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot kick yourself")
@@ -461,6 +569,10 @@ func KickUserHandler(svc *UserService) echo.HandlerFunc {
 				return err
 			}
 		}
+		if state != nil && state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
+		setAccountStateHeaders(c, state)
 		return api.NoContent(c, http.StatusNoContent)
 	})
 }
@@ -473,6 +585,7 @@ func KickUserHandler(svc *UserService) echo.HandlerFunc {
 //   - 2 self action: banning yourself is not allowed
 //   - 3 user not found
 //   - 4 owner protected: owner transfer is required before this operation
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing user:update permission
 //   - 1009 internal: unexpected server error
@@ -484,11 +597,29 @@ func BanUserHandler(svc *UserService) echo.HandlerFunc {
 		codeOwnerProtected = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		id, err := parsePathID(c)
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
 		}
-		if err := svc.Ban(c.Request().Context(), p.UserID, id); err != nil {
+		identity, err := realtime.NewHTTPCommandIdentity(p.UserID, http.MethodPost, "/api/v0/users/:id/ban", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(id, 10)}}, nil, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, state, replayed, err := prepareAccountHTTPMutation(c, svc.runtime, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		ctx = withAccountResponseBuilder(ctx, func(any) (realtime.HTTPMutationResponse, error) {
+			return realtime.HTTPMutationResponse{Status: http.StatusNoContent}, nil
+		})
+		if err := svc.Ban(ctx, p.UserID, id); err != nil {
 			switch {
 			case errors.Is(err, ErrSelfAction):
 				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot ban yourself")
@@ -502,6 +633,10 @@ func BanUserHandler(svc *UserService) echo.HandlerFunc {
 				return err
 			}
 		}
+		if state != nil && state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
+		setAccountStateHeaders(c, state)
 		return api.NoContent(c, http.StatusNoContent)
 	})
 }
@@ -512,6 +647,7 @@ func BanUserHandler(svc *UserService) echo.HandlerFunc {
 // Errors:
 //   - 1 invalid id: malformed or non-positive path id
 //   - 2 user not found
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing user:update permission
 //   - 1009 internal: unexpected server error
@@ -521,11 +657,29 @@ func UnbanUserHandler(svc *UserService) echo.HandlerFunc {
 		codeUserNotFound = 2
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		id, err := parsePathID(c)
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
 		}
-		if err := svc.Unban(c.Request().Context(), p.UserID, id); err != nil {
+		identity, err := realtime.NewHTTPCommandIdentity(p.UserID, http.MethodPost, "/api/v0/users/:id/unban", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(id, 10)}}, nil, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, state, replayed, err := prepareAccountHTTPMutation(c, svc.runtime, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		ctx = withAccountResponseBuilder(ctx, func(any) (realtime.HTTPMutationResponse, error) {
+			return realtime.HTTPMutationResponse{Status: http.StatusNoContent}, nil
+		})
+		if err := svc.Unban(ctx, p.UserID, id); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				return api.NewError(codeUserNotFound, http.StatusNotFound, "user not found")
 			}
@@ -534,6 +688,10 @@ func UnbanUserHandler(svc *UserService) echo.HandlerFunc {
 			}
 			return err
 		}
+		if state != nil && state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
+		setAccountStateHeaders(c, state)
 		return api.NoContent(c, http.StatusNoContent)
 	})
 }
@@ -546,6 +704,7 @@ func UnbanUserHandler(svc *UserService) echo.HandlerFunc {
 //   - 2 self action: deleting yourself is not allowed
 //   - 3 user not found
 //   - 4 owner protected: owner transfer is required before this operation
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1003 forbidden: missing user:delete permission
 //   - 1009 internal: unexpected server error
@@ -557,11 +716,29 @@ func DeleteUserHandler(svc *UserService) echo.HandlerFunc {
 		codeOwnerProtected = 4
 	)
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		id, err := parsePathID(c)
 		if err != nil {
 			return api.NewError(codeInvalidID, http.StatusBadRequest, "invalid id")
 		}
-		if err := svc.Delete(c.Request().Context(), p.UserID, id); err != nil {
+		identity, err := realtime.NewHTTPCommandIdentity(p.UserID, http.MethodDelete, "/api/v0/users/:id", []realtime.CanonicalField{{Name: "id", Value: strconv.FormatInt(id, 10)}}, nil, struct{}{})
+		if err != nil {
+			return err
+		}
+		ctx, state, replayed, err := prepareAccountHTTPMutation(c, svc.runtime, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		ctx = withAccountResponseBuilder(ctx, func(any) (realtime.HTTPMutationResponse, error) {
+			return realtime.HTTPMutationResponse{Status: http.StatusNoContent}, nil
+		})
+		if err := svc.Delete(ctx, p.UserID, id); err != nil {
 			switch {
 			case errors.Is(err, ErrSelfAction):
 				return api.NewError(codeSelfAction, http.StatusBadRequest, "cannot delete yourself")
@@ -575,6 +752,10 @@ func DeleteUserHandler(svc *UserService) echo.HandlerFunc {
 				return err
 			}
 		}
+		if state != nil && state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
+		setAccountStateHeaders(c, state)
 		return api.NoContent(c, http.StatusNoContent)
 	})
 }
@@ -583,21 +764,48 @@ func DeleteUserHandler(svc *UserService) echo.HandlerFunc {
 // AuthN; no specific permission is required.
 //
 // Errors:
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
 //   - 1009 internal: unexpected server error
 func MeProfileHandler(svc *UserService) echo.HandlerFunc {
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req updateProfileRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		user, err := svc.UpdateProfile(c.Request().Context(), p.UserID, req.Nickname)
+		identity, err := realtime.NewHTTPCommandIdentity(p.UserID, http.MethodPatch, "/api/v0/me", nil, nil, req)
 		if err != nil {
 			return err
 		}
-		return api.OK(c, http.StatusOK, newUserResponse(user))
+		ctx, state, replayed, err := prepareAccountHTTPMutation(c, svc.runtime, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		ctx = withAccountResponseBuilder(ctx, func(value any) (realtime.HTTPMutationResponse, error) {
+			user, ok := value.(*db.User)
+			if !ok {
+				return realtime.HTTPMutationResponse{}, errors.New("auth: invalid profile response")
+			}
+			return realtime.HTTPMutationResponse{Status: http.StatusOK, Data: newUserResponse(user)}, nil
+		})
+		user, err := svc.UpdateProfile(ctx, p.UserID, req.Nickname)
+		if state != nil && state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
+		if err != nil {
+			return err
+		}
+		setAccountStateHeaders(c, state)
+		return commandhttp.OK(c, http.StatusOK, newUserResponse(user))
 	})
 }
 
@@ -606,6 +814,7 @@ func MeProfileHandler(svc *UserService) echo.HandlerFunc {
 //
 // Errors:
 //   - 1 wrong current password: old_password does not match
+//   - 9 idempotency mismatch: the retry key belongs to another request
 //   - 1000 invalid request parameters: field validation failed
 //   - 1001 malformed request: body could not be parsed
 //   - 1002 unauthorized: missing or invalid access token
@@ -613,11 +822,29 @@ func MeProfileHandler(svc *UserService) echo.HandlerFunc {
 func MePasswordHandler(svc *AuthService) echo.HandlerFunc {
 	const codeWrongPassword = 1
 	return rbacecho.WithPrincipal(func(c *echo.Context, p *rbac.Principal) error {
+		key, err := idempotencyKey(c)
+		if err != nil {
+			return err
+		}
 		var req changeOwnPasswordRequest
 		if err := api.Bind(c, &req); err != nil {
 			return err
 		}
-		if err := svc.ChangeOwnPassword(c.Request().Context(), p.UserID, req.OldPassword, req.NewPassword); err != nil {
+		identity, err := realtime.NewHTTPCommandIdentity(p.UserID, http.MethodPost, "/api/v0/me/password", nil, nil, req)
+		if err != nil {
+			return err
+		}
+		ctx, state, replayed, err := prepareAccountHTTPMutation(c, svc.runtime, key, identity)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
+		ctx = withAccountResponseBuilder(ctx, func(any) (realtime.HTTPMutationResponse, error) {
+			return realtime.HTTPMutationResponse{Status: http.StatusNoContent}, nil
+		})
+		if err := svc.ChangeOwnPassword(ctx, p.UserID, req.OldPassword, req.NewPassword); err != nil {
 			if errors.Is(err, ErrWrongPassword) {
 				return api.NewError(codeWrongPassword, http.StatusBadRequest, "wrong current password")
 			}
@@ -626,6 +853,10 @@ func MePasswordHandler(svc *AuthService) echo.HandlerFunc {
 			}
 			return err
 		}
+		if state != nil && state.Replay != nil {
+			return commandhttp.ReplayDurable(c, *state.Replay)
+		}
+		setAccountStateHeaders(c, state)
 		return api.NoContent(c, http.StatusNoContent)
 	})
 }
@@ -687,4 +918,76 @@ func InviteDeleteHandler(svc *InviteService) echo.HandlerFunc {
 		}
 		return api.NoContent(c, http.StatusNoContent)
 	})
+}
+
+// idempotencyKey validates the single retry key required by every sequenced
+// authenticated account mutation.
+func idempotencyKey(c *echo.Context) (string, error) {
+	values := c.Request().Header.Values("Idempotency-Key")
+	if len(values) != 1 || !realtime.IdempotencyKeyValid(values[0]) {
+		return "", api.InvalidField("header.Idempotency-Key", "must be 16-64 characters using letters, digits, underscore, or hyphen")
+	}
+	return values[0], nil
+}
+
+// prepareAccountHTTPMutation performs completed durable replay before account
+// authorization and returns a request-local state carrier for the new command.
+func prepareAccountHTTPMutation(c *echo.Context, runtime *StateMutationRuntime, key string, identity realtime.HTTPCommandIdentity) (context.Context, *realtime.HTTPMutationState, bool, error) {
+	if runtime == nil {
+		return c.Request().Context(), nil, false, nil
+	}
+	command, err := realtime.NewHTTPMutationCommand(identity, key)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	ctx, replay, found, err := runtime.PrepareHTTPMutation(c.Request().Context(), command)
+	if errors.Is(err, realtime.ErrIdempotencyMismatch) {
+		return nil, nil, false, api.NewError(9, http.StatusConflict, "idempotency key reused with different request")
+	}
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if found {
+		return nil, nil, true, commandhttp.ReplayDurable(c, replay)
+	}
+	state := &realtime.HTTPMutationState{}
+	return realtime.WithHTTPMutationState(ctx, state), state, false, nil
+}
+
+// preparePublicAccountHTTPMutation performs completed replay for registration,
+// whose installation-scoped identity is established before a principal exists.
+func preparePublicAccountHTTPMutation(c *echo.Context, runtime *StateMutationRuntime, key string, identity realtime.InstallationCommandIdentity) (context.Context, *realtime.HTTPMutationState, bool, error) {
+	if runtime == nil {
+		return c.Request().Context(), nil, false, nil
+	}
+	command, err := realtime.NewPublicHTTPMutationCommand(identity, key)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	ctx, replay, found, err := runtime.PreparePublicHTTPMutation(c.Request().Context(), command)
+	if errors.Is(err, realtime.ErrIdempotencyMismatch) {
+		return nil, nil, false, api.NewError(9, http.StatusConflict, "idempotency key reused with different request")
+	}
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if found {
+		return nil, nil, true, commandhttp.ReplayDurable(c, replay)
+	}
+	state := &realtime.HTTPMutationState{}
+	return realtime.WithHTTPMutationState(ctx, state), state, false, nil
+}
+
+// withAccountResponseBuilder binds the endpoint's stable response shape to a
+// request so the account runtime can persist it in the same transaction.
+func withAccountResponseBuilder(ctx context.Context, builder realtime.HTTPMutationResponseBuilder) context.Context {
+	return realtime.WithHTTPMutationResponseBuilder(ctx, builder)
+}
+
+// setAccountStateHeaders exposes the checkpoint and cursor returned by the
+// exact StatePublication for one account command.
+func setAccountStateHeaders(c *echo.Context, state *realtime.HTTPMutationState) {
+	if state != nil {
+		commandhttp.SetStateCommandHeaders(c, state.CommandID, state.Checkpoint, state.StateCursor)
+	}
 }

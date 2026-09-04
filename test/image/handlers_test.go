@@ -74,6 +74,9 @@ func doRequest(t *testing.T, app *echo.Echo, method, path, token, contentType st
 	if contentType != "" {
 		req.Header.Set(echo.HeaderContentType, contentType)
 	}
+	if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete {
+		req.Header.Set("Idempotency-Key", "image-test-command-0001")
+	}
 	rec := httptest.NewRecorder()
 	app.ServeHTTP(rec, req)
 	return rec
