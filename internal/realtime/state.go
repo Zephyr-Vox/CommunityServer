@@ -596,11 +596,24 @@ func (c *StateCandidate) ScheduleTemporaryExpiry(channelID, deadline int64) (Exp
 	return schedule, nil
 }
 
-// ClearTemporaryExpiry invalidates an active empty-channel timer and returns
-// the previous schedule so the owning service can cancel its external timer
-// after this candidate becomes visible.
+// ClearTemporaryExpiry invalidates a temporary channel's timer and returns the
+// previous schedule so the owning service can cancel its external timer after
+// this candidate becomes visible. It does not create a runtime entry when no
+// timer or cancellation generation exists, and removes entries for channels
+// that are no longer temporary.
 func (c *StateCandidate) ClearTemporaryExpiry(channelID int64) (ExpirySchedule, bool) {
-	previous := c.version.runtime.temporaryExpiry[channelID]
+	if c == nil || c.version == nil {
+		return ExpirySchedule{}, false
+	}
+	previous, exists := c.version.runtime.temporaryExpiry[channelID]
+	channel, existsChannel := c.version.persistent.channels[channelID]
+	if !existsChannel || !channel.Temporary || channel.Mode != "voice" {
+		delete(c.version.runtime.temporaryExpiry, channelID)
+		return previous, exists && previous.Generation > 0 && previous.Deadline > 0
+	}
+	if !exists {
+		return ExpirySchedule{}, false
+	}
 	c.version.runtime.temporaryExpiry[channelID] = ExpirySchedule{Generation: previous.Generation + 1}
 	return previous, previous.Generation > 0 && previous.Deadline > 0
 }

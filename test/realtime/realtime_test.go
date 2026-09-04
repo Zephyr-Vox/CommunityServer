@@ -99,6 +99,50 @@ func TestStateStoreCopiesProjectionAndBuildsCandidate(t *testing.T) {
 	}
 }
 
+// TestClearTemporaryExpiryDoesNotCreateRuntimeGhost verifies that authority
+// teardown bookkeeping does not allocate timer state for channels that never
+// had an empty-channel deadline, while an existing generation is still
+// invalidated for stale callback rejection.
+func TestClearTemporaryExpiryDoesNotCreateRuntimeGhost(t *testing.T) {
+	state, err := realtime.NewStateStoreWithEpoch(context.Background(), &staticProjectionLoader{projection: &store.StateProjection{
+		Channels: []db.Channel{
+			{ID: 20, Name: "Permanent voice", Mode: "voice", Visibility: "public", Capacity: 256},
+			{ID: 21, Name: "Temporary voice", Mode: "voice", Temporary: 1, Visibility: "public", Capacity: 256},
+		},
+	}}, testEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := state.BuildRuntimeCandidate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if previous, shouldCancel := candidate.ClearTemporaryExpiry(20); shouldCancel || previous != (realtime.ExpirySchedule{}) {
+		t.Fatalf("permanent clear = (%+v, %t)", previous, shouldCancel)
+	}
+	if _, exists := candidate.Version().TemporaryExpiry(20); exists {
+		t.Fatal("permanent channel acquired a temporary expiry entry")
+	}
+	if previous, shouldCancel := candidate.ClearTemporaryExpiry(21); shouldCancel || previous != (realtime.ExpirySchedule{}) {
+		t.Fatalf("empty temporary clear = (%+v, %t)", previous, shouldCancel)
+	}
+	if _, exists := candidate.Version().TemporaryExpiry(21); exists {
+		t.Fatal("unscheduled temporary channel acquired an expiry entry")
+	}
+	schedule, err := candidate.ScheduleTemporaryExpiry(21, 30_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous, shouldCancel := candidate.ClearTemporaryExpiry(21)
+	if !shouldCancel || previous != schedule {
+		t.Fatalf("scheduled clear = (%+v, %t), want (%+v, true)", previous, shouldCancel, schedule)
+	}
+	current, exists := candidate.Version().TemporaryExpiry(21)
+	if !exists || current.Generation != schedule.Generation+1 || current.Deadline != 0 {
+		t.Fatalf("cancelled schedule = (%+v, %t)", current, exists)
+	}
+}
+
 func TestStoresLoadCompleteProjectionFromOneReadView(t *testing.T) {
 	stores := newStores(t)
 	ctx := context.Background()

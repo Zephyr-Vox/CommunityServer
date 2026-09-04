@@ -343,6 +343,10 @@ func TestVoiceJoinFoldsPendingOwnerTeardown(t *testing.T) {
 	if _, err := fixture.service.JoinVoice(context.Background(), fixture.adminID, channelID, oldRef.ControlConnectionID, "old-voice-key-01", channel.VoiceJoinInput{DeviceID: "desktop"}, "127.0.0.1"); err != nil {
 		t.Fatal(err)
 	}
+	oldAuthority, ok := coordinator.VoiceAuthority(fixture.adminID)
+	if !ok {
+		t.Fatal("old voice authority missing")
+	}
 	if !coordinator.BeginDisconnect(oldRef, 4000, "eof") {
 		t.Fatal("old owner disconnect did not claim connection")
 	}
@@ -354,7 +358,10 @@ func TestVoiceJoinFoldsPendingOwnerTeardown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.service.JoinVoice(context.Background(), fixture.adminID, channelID, newRef.ControlConnectionID, "new-voice-key-01", channel.VoiceJoinInput{DeviceID: "desktop-2"}, "127.0.0.1"); err != nil {
+	if _, err := fixture.service.JoinVoice(context.Background(), fixture.adminID, channelID, newRef.ControlConnectionID, "new-voice-key-01", channel.VoiceJoinInput{
+		DeviceID:               "desktop-2",
+		ExpectedVoiceSessionID: fmt.Sprintf("%x", oldAuthority.VoiceSessionID),
+	}, "127.0.0.1"); err != nil {
 		t.Fatal(err)
 	}
 

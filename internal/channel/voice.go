@@ -396,7 +396,9 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 				}
 			}
 			if expectedID != ([16]byte{}) {
-				if !hasCurrent || current.VoiceSessionID != expectedID {
+				matchesCurrent := hasCurrent && current.VoiceSessionID == expectedID
+				matchesPendingTeardown := !hasCurrent && pendingTeardown != nil && pendingTeardown.VoiceSessionID == expectedID
+				if !matchesCurrent && !matchesPendingTeardown {
 					return realtime.CommandOutput{}, ErrVoiceStale
 				}
 			} else if hasCurrent && (current.ChannelID != channelID || input.ForceNew || current.ControlConnectionID != owner.ControlConnectionID || current.ConnectionGeneration != owner.Generation) {

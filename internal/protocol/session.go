@@ -355,8 +355,11 @@ func (m *Manager) activatePreparedStaged(prepared *PreparedSession, expectedOldI
 		return SessionInfo{}, nil, nil, ErrSessionPrecondition
 	}
 	userID := prepared.session.UserID
-	nowMS := m.nowMillis()
 	m.mu.Lock()
+	// Sample the clock at the Manager linearization point. Waiting for the
+	// Manager lock is part of activation, so an older sample could install a
+	// prepared session after its transport TTL had already elapsed.
+	nowMS := m.nowMillis()
 	currentID, exists := m.byUser[userID]
 	if expectedOldID != nil && (!exists || currentID != *expectedOldID) && !(allowMissingExpected && !exists) {
 		m.mu.Unlock()
