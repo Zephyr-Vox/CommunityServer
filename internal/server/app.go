@@ -165,6 +165,9 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		conn.Close()
 		return nil, fmt.Errorf("server: realtime metadata: %w", err)
 	}
+	// Metadata advertises only application surfaces that are mounted and
+	// usable. The UDP transport is paired with channel join/leave below.
+	metadata.Features = []string{"voice"}
 	app := &App{
 		cfg:             cfg,
 		conn:            conn,
@@ -251,6 +254,9 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	channels.SetDurableIdempotency(durableCommands)
 	channels.SetStateCommandRuntime(app.state, app.sequencer)
 	channels.SetDeadlineScheduler(app.deadlines)
+	channels.SetVoiceRuntime(voice.Manager(), connections, cfg.Server.TLSMode != "off")
+	channels.SetVoiceIdempotency(realtime.NewRuntimeIdempotencyCache(), requestSigner)
+	app.connectionState.SetVoiceAuthorityProjection(channels.VoiceAuthorityProjection())
 	moderationSvc.SetStateMutationGate(app.mutationGate)
 	moderationSvc.SetDurableIdempotency(durableCommands)
 	moderationSvc.SetStateCommandRuntime(app.state, app.sequencer)

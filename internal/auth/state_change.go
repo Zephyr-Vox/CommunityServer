@@ -290,6 +290,7 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 				return realtime.CommandOutput{}, err
 			}
 			var beforePublish func(context.Context) error
+			afterPublish := result.AfterPublish
 			var preparationEvents []realtime.StateEventTemplate
 			if result.PreparePublication != nil {
 				plan, err := result.PreparePublication(commandCtx, candidate)
@@ -297,6 +298,17 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 					return realtime.CommandOutput{}, err
 				}
 				beforePublish = plan.BeforePublish
+				if plan.AfterPublish != nil {
+					previousAfterPublish := afterPublish
+					afterPublish = func(afterContext context.Context) error {
+						if previousAfterPublish != nil {
+							if err := previousAfterPublish(afterContext); err != nil {
+								return err
+							}
+						}
+						return plan.AfterPublish(afterContext)
+					}
+				}
 				preparationEvents = plan.Events
 			}
 			accountEvents, err := accountStateEvents(result.Change, candidate.Version())
@@ -374,7 +386,7 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 					r.principals.Invalidate(userID)
 				}
 			}
-			return realtime.CommandOutput{Value: result.Value, BeforePublish: beforePublish, AfterPublish: result.AfterPublish}, nil
+			return realtime.CommandOutput{Value: result.Value, BeforePublish: beforePublish, AfterPublish: afterPublish}, nil
 		},
 	})
 	if err != nil {

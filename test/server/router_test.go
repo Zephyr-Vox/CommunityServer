@@ -11,7 +11,7 @@ import (
 // endpoints alongside empty-path routes such as PATCH /api/v0/me.
 func TestRouteTable(t *testing.T) {
 	app := newTestApp(t)
-	got := make([]string, 0, 57)
+	got := make([]string, 0, 59)
 	for _, r := range app.Echo().Router().Routes() {
 		got = append(got, r.Method+" "+r.Path)
 	}
@@ -61,6 +61,8 @@ func TestRouteTable(t *testing.T) {
 		"POST /api/v0/auth/register",
 		"POST /api/v0/channels",
 		"POST /api/v0/channels/:id/access",
+		"POST /api/v0/channels/:id/join",
+		"POST /api/v0/channels/current/leave",
 		"POST /api/v0/groups",
 		"POST /api/v0/groups/:id/access",
 		"POST /api/v0/me/avatar",

@@ -161,6 +161,15 @@ func (s *Service) runMutation(ctx context.Context, userIDs []int64, response mut
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
+			var voiceCommit func() (func(), error)
+			if s.voiceAccessLoss != nil {
+				voiceEvents, commit, err := s.voiceAccessLoss(candidate)
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				events = append(events, voiceEvents...)
+				voiceCommit = commit
+			}
 			visibilityUserIDs := make([]int64, 0, len(candidate.Version().Users()))
 			for _, user := range candidate.Version().Users() {
 				visibilityUserIDs = append(visibilityUserIDs, user.ID)
@@ -169,6 +178,7 @@ func (s *Service) runMutation(ctx context.Context, userIDs []int64, response mut
 				Candidate:         candidate,
 				Events:            events,
 				VisibilityUserIDs: visibilityUserIDs,
+				CommitRuntime:     voiceCommit,
 			}); err != nil {
 				return realtime.CommandOutput{}, err
 			}

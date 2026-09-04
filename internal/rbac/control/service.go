@@ -57,15 +57,16 @@ type PrincipalMutations interface {
 // Service owns control-plane RBAC mutation policy above the persistence layer.
 // It is safe for concurrent use when its Stores and PrincipalMutations are.
 type Service struct {
-	stores     *store.Stores
-	principals PrincipalMutations
-	gate       MutationGate
-	state      *realtime.StateStore
-	sequencer  *realtime.PostCommitSequencer
-	visibility *realtime.VisibilityResolver
-	scopedAuth *rbacscope.Authorizer
-	cursors    realtime.StateCursorIssuer
-	durable    *realtime.DurableIdempotency
+	stores          *store.Stores
+	principals      PrincipalMutations
+	gate            MutationGate
+	state           *realtime.StateStore
+	sequencer       *realtime.PostCommitSequencer
+	visibility      *realtime.VisibilityResolver
+	scopedAuth      *rbacscope.Authorizer
+	cursors         realtime.StateCursorIssuer
+	durable         *realtime.DurableIdempotency
+	voiceAccessLoss VoiceAccessLossPreparation
 }
 
 // StateChange identifies a committed RBAC mutation requiring an immutable
@@ -87,6 +88,12 @@ type StateChange struct {
 type MutationGate interface {
 	Acquire(context.Context) (func(), error)
 }
+
+// VoiceAccessLossPreparation extends an RBAC candidate with exact voice
+// membership/revocation events when the candidate removes a user's channel
+// visibility. The returned cleanup runs only after StatePublication releases
+// its locks and must not perform network I/O while the publication is held.
+type VoiceAccessLossPreparation func(*realtime.StateCandidate) ([]realtime.StateEventTemplate, func() (func(), error), error)
 
 // NewService returns a Service backed by stores and principal cache barriers.
 func NewService(stores *store.Stores, principals PrincipalMutations) *Service {
@@ -116,6 +123,13 @@ func (s *Service) SetStateCursorIssuer(cursors realtime.StateCursorIssuer) { s.c
 // SetDurableIdempotency installs restart-safe completed HTTP command storage.
 func (s *Service) SetDurableIdempotency(durable *realtime.DurableIdempotency) {
 	s.durable = durable
+}
+
+// SetVoiceAccessLossPreparation installs the application-owned voice cleanup
+// hook used by RBAC mutations that can change effective channel visibility.
+// It must be configured before the RBAC routes become reachable.
+func (s *Service) SetVoiceAccessLossPreparation(preparation VoiceAccessLossPreparation) {
+	s.voiceAccessLoss = preparation
 }
 
 // StateCommand identifies the exact command and state checkpoint completed by

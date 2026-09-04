@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"zephyr.vox/server/ce/internal/protocol"
 	"zephyr.vox/server/ce/internal/rbac"
 	"zephyr.vox/server/ce/internal/rbac/scope"
 	"zephyr.vox/server/ce/internal/realtime"
@@ -51,7 +52,7 @@ var (
 	// runtime-sensitive resource invariant.
 	ErrInvalidChannelState = errors.New("channel: invalid channel state")
 	// ErrChannelActive is returned when deletion would orphan a runtime voice
-	// authority before the voice-join lifecycle is implemented.
+	// authority before the channel teardown lifecycle is complete.
 	ErrChannelActive = errors.New("channel: channel has active voice authority")
 	// ErrParentAccessRequired is returned when a channel ACL grant into a
 	// private parent would leave its principal unable to see that parent.
@@ -79,16 +80,23 @@ type MutationGate interface {
 // Service owns the first channel control-plane slice. It is safe for concurrent
 // use after server assembly installs its immutable state and sequencer runtime.
 type Service struct {
-	stores     *store.Stores
-	principals PrincipalMutations
-	gate       MutationGate
-	state      *realtime.StateStore
-	sequencer  *realtime.PostCommitSequencer
-	authorizer *scope.Authorizer
-	visibility *realtime.VisibilityResolver
-	cursors    realtime.StateCursorIssuer
-	scheduler  *realtime.DeadlineScheduler
-	durable    *realtime.DurableIdempotency
+	stores             *store.Stores
+	principals         PrincipalMutations
+	gate               MutationGate
+	state              *realtime.StateStore
+	sequencer          *realtime.PostCommitSequencer
+	authorizer         *scope.Authorizer
+	visibility         *realtime.VisibilityResolver
+	cursors            realtime.StateCursorIssuer
+	scheduler          *realtime.DeadlineScheduler
+	durable            *realtime.DurableIdempotency
+	voiceManager       *protocol.Manager
+	connections        *realtime.ConnectionCoordinator
+	voiceIdempotency   *realtime.RuntimeIdempotencyCache
+	requestSigner      *realtime.RequestIdentitySigner
+	voiceEncrypted     bool
+	voiceCreateLimiter *voiceCreateLimiter
+	voiceNow           func() int64
 }
 
 // CreateGroupInput contains validated group fields for a creation command.
@@ -158,10 +166,11 @@ type AccessMutation struct {
 // barriers. Call SetStateCommandRuntime and SetStateMutationGate before use.
 func NewService(stores *store.Stores, principals PrincipalMutations) *Service {
 	return &Service{
-		stores:     stores,
-		principals: principals,
-		authorizer: scope.NewAuthorizer(),
-		visibility: realtime.NewVisibilityResolver(),
+		stores:             stores,
+		principals:         principals,
+		authorizer:         scope.NewAuthorizer(),
+		visibility:         realtime.NewVisibilityResolver(),
+		voiceCreateLimiter: newVoiceCreateLimiter(),
 	}
 }
 
@@ -193,6 +202,29 @@ func (s *Service) SetDurableIdempotency(durable *realtime.DurableIdempotency) {
 // SetDeadlineScheduler installs the server-owned runtime deadline scheduler.
 func (s *Service) SetDeadlineScheduler(scheduler *realtime.DeadlineScheduler) {
 	s.scheduler = scheduler
+}
+
+// SetVoiceRuntime installs the process-owned voice manager and connection
+// coordinator used by channel join/leave commands. The manager remains
+// transport-only; this adapter owns the application authority binding.
+func (s *Service) SetVoiceRuntime(manager *protocol.Manager, connections *realtime.ConnectionCoordinator, encrypted bool) {
+	s.voiceManager = manager
+	s.connections = connections
+	s.voiceEncrypted = encrypted
+}
+
+// SetVoiceIdempotency installs the bounded in-memory retry cache and stable
+// request signer used by sensitive voice join/leave responses. Results never
+// enter the database, state ring, or application logs.
+func (s *Service) SetVoiceIdempotency(cache *realtime.RuntimeIdempotencyCache, signer *realtime.RequestIdentitySigner) {
+	s.voiceIdempotency = cache
+	s.requestSigner = signer
+}
+
+// SetVoiceClock installs a millisecond clock for deterministic voice lifecycle
+// tests. Production assembly leaves it unset and uses wall clock time.
+func (s *Service) SetVoiceClock(now func() int64) {
+	s.voiceNow = now
 }
 
 // StateCommand identifies the exact published checkpoint for one successful
@@ -438,7 +470,7 @@ func (s *Service) AddGroupAccess(ctx context.Context, actorID, groupID int64, ex
 		if err != nil {
 			return mutationValue{}, err
 		}
-		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+		if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
 		etag, err := realtime.NumericEntityETag("group", updated.ID, updated.Version)
@@ -495,7 +527,7 @@ func (s *Service) DeleteGroupAccess(ctx context.Context, actorID, groupID, acces
 		if err != nil {
 			return mutationValue{}, err
 		}
-		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+		if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
 		etag, err := realtime.NumericEntityETag("group", updated.ID, updated.Version)
@@ -663,7 +695,7 @@ func (s *Service) AddChannelAccess(ctx context.Context, actorID, channelID int64
 			}
 			events = append(events, channelEvents...)
 		}
-		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+		if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
 		etag, err := realtime.NumericEntityETag("channel", updatedChannel.ID, updatedChannel.Version)
@@ -720,7 +752,7 @@ func (s *Service) DeleteChannelAccess(ctx context.Context, actorID, channelID, a
 		if err != nil {
 			return mutationValue{}, err
 		}
-		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+		if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
 		etag, err := realtime.NumericEntityETag("channel", updated.ID, updated.Version)
@@ -788,7 +820,7 @@ func (s *Service) UpdateGroup(ctx context.Context, actorID, groupID int64, expec
 		if err != nil {
 			return mutationValue{}, err
 		}
-		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+		if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
 		return mutationValue{group: snapshotGroup(updated)}, nil
@@ -839,7 +871,7 @@ func (s *Service) DeleteGroup(ctx context.Context, actorID, groupID int64, expec
 		if err != nil {
 			return mutationValue{}, err
 		}
-		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+		if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
 		return mutationValue{}, nil
@@ -977,7 +1009,7 @@ func (s *Service) UpdateChannel(ctx context.Context, actorID, channelID int64, e
 		if err != nil {
 			return mutationValue{}, err
 		}
-		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+		if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
 		return mutationValue{channel: snapshotChannel(updated)}, nil
@@ -989,8 +1021,8 @@ func (s *Service) UpdateChannel(ctx context.Context, actorID, channelID int64, e
 }
 
 // DeleteChannel removes one channel after exact-scope authorization and ETag
-// comparison. Active runtime voice authorities are rejected until the voice
-// lifecycle can stage their conditional teardown with this publication.
+// comparison. Active voice authorities are conditionally torn down in the
+// same StatePublication instead of being rejected or orphaned.
 func (s *Service) DeleteChannel(ctx context.Context, actorID, channelID int64, expectedETag string) (StateCommand, error) {
 	result, err := s.runMutation(ctx, actorID, func(mutationValue) (int, any, store.IdempotencyHeaders) {
 		return http.StatusNoContent, nil, store.IdempotencyHeaders{}
@@ -1009,7 +1041,9 @@ func (s *Service) DeleteChannel(ctx context.Context, actorID, channelID int64, e
 		if !decision.Allow {
 			return mutationValue{}, ErrPermissionRequired
 		}
-		if activeChannelMembers(channel.ID, version) != 0 {
+		if s.voiceManager == nil && activeChannelMembers(channel.ID, version) != 0 {
+			// Focused service fixtures that do not install the voice runtime
+			// cannot safely perform the exact coordinator teardown.
 			return mutationValue{}, ErrChannelActive
 		}
 		beforeUsers := visibleChannelUsers(channel.ID, version, s.visibility)
@@ -1028,7 +1062,7 @@ func (s *Service) DeleteChannel(ctx context.Context, actorID, channelID int64, e
 		if err != nil {
 			return mutationValue{}, err
 		}
-		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+		if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
 		return mutationValue{}, nil
@@ -1085,7 +1119,7 @@ func (s *Service) CreateGroup(ctx context.Context, actorID int64, input CreateGr
 		if err != nil {
 			return mutationValue{}, err
 		}
-		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+		if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
 		return mutationValue{group: snapshotGroup(snapshot)}, nil
@@ -1199,7 +1233,7 @@ func (s *Service) CreateChannel(ctx context.Context, actorID int64, input Create
 		if err != nil {
 			return mutationValue{}, err
 		}
-		if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+		if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 			return mutationValue{}, err
 		}
 		return mutationValue{channel: snapshotChannel(snapshot), temporarySchedule: temporarySchedule}, nil
@@ -1770,7 +1804,7 @@ func (s *Service) ExpireTemporary(ctx context.Context, channelID int64, generati
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			if _, err := executionReserveAllUsers(execution, candidate, events); err != nil {
+			if _, err := s.executionReserveAllUsers(execution, candidate, events); err != nil {
 				return realtime.CommandOutput{}, err
 			}
 			if _, err := execution.Commit(tx); err != nil {
@@ -1785,7 +1819,12 @@ func (s *Service) ExpireTemporary(ctx context.Context, channelID int64, generati
 // executionReserveAllUsers reserves the candidate, canonical mutation events,
 // and every persisted user as a visibility-diff candidate before transaction
 // commit. Its caller is always inside one CommandExecution callback.
-func executionReserveAllUsers(execution *realtime.CommandExecution, candidate *realtime.StateCandidate, events []realtime.StateEventTemplate) (realtime.PublicationResult, error) {
+func (s *Service) executionReserveAllUsers(execution *realtime.CommandExecution, candidate *realtime.StateCandidate, events []realtime.StateEventTemplate) (realtime.PublicationResult, error) {
+	voiceEvents, voiceCommit, err := s.PrepareVoiceAccessLoss(candidate)
+	if err != nil {
+		return realtime.PublicationResult{}, err
+	}
+	events = append(events, voiceEvents...)
 	userIDs := make([]int64, 0, len(candidate.Version().Users()))
 	for _, user := range candidate.Version().Users() {
 		userIDs = append(userIDs, user.ID)
@@ -1794,6 +1833,7 @@ func executionReserveAllUsers(execution *realtime.CommandExecution, candidate *r
 		Candidate:         candidate,
 		Events:            events,
 		VisibilityUserIDs: userIDs,
+		CommitRuntime:     voiceCommit,
 	})
 }
 

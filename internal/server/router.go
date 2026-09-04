@@ -42,6 +42,7 @@ func (a *App) routes(e *echo.Echo) error {
 	authz := rbac.NewAuthorizer(a.stores.Roles)
 	rbacSvc := rbaccontrol.NewService(a.stores, a.principals)
 	rbacSvc.SetStateMutationGate(a.mutationGate)
+	rbacSvc.SetVoiceAccessLossPreparation(a.channels.PrepareVoiceAccessLoss)
 	state, sequencer, ok := a.realtimeComponents()
 	if !ok {
 		return fmt.Errorf("server: RBAC command runtime unavailable")
@@ -72,6 +73,8 @@ func (a *App) routes(e *echo.Echo) error {
 	api.DELETE("/groups/:id", channel.DeleteGroupHandler(a.channels), authed()...)
 	api.GET("/channels", channel.ListChannelsHandler(a.channels), authed()...)
 	api.POST("/channels", channel.CreateChannelHandler(a.channels), authed()...)
+	api.POST("/channels/current/leave", channel.VoiceLeaveHandler(a.channels), authed()...)
+	api.POST("/channels/:id/join", channel.VoiceJoinHandler(a.channels), authed()...)
 	api.GET("/channels/:id/access", channel.ListChannelAccessHandler(a.channels), authed()...)
 	api.POST("/channels/:id/access", channel.AddChannelAccessHandler(a.channels), authed()...)
 	api.DELETE("/channels/:id/access/:access_id", channel.DeleteChannelAccessHandler(a.channels), authed()...)

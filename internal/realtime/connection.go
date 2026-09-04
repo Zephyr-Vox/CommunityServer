@@ -112,6 +112,7 @@ type VoiceAuthorityStage struct {
 	expected    *VoiceAuthority
 	channelID   int64
 	prepared    *protocol.PreparedSession
+	generation  uint64
 	joinedAt    int64
 }
 
@@ -124,13 +125,15 @@ type VoiceAuthorityCommit struct {
 	Cleanup  protocol.ActivationCleanup
 }
 
-// AccountTeardownPlan contains the state events and post-commit lifecycle
-// action needed when an account-wide mutation revokes a user's access. Events
-// are included in the account mutation's candidate; BeforePublish runs after
-// the database commit but before that candidate becomes visible.
+// AccountTeardownPlan contains the state events and lifecycle actions needed
+// when an account-wide mutation revokes a user's access. Events are included in
+// the account mutation's candidate; BeforePublish runs after the database
+// commit but before that candidate becomes visible, while AfterPublish runs
+// after StatePublication releases its visibility boundary.
 type AccountTeardownPlan struct {
 	Events        []StateEventTemplate
 	BeforePublish func(context.Context) error
+	AfterPublish  func(context.Context) error
 }
 
 // ConnectionTransport accepts non-blocking terminal-close and forced-close
@@ -213,6 +216,7 @@ type ConnectionCoordinator struct {
 	wg                 sync.WaitGroup
 	voiceAuthorityStop atomic.Pointer[voiceAuthorityStopValue]
 	voiceObserver      atomic.Pointer[voiceAuthorityObserverValue]
+	voiceProjection    atomic.Pointer[voiceAuthorityProjectionValue]
 	closeObserver      atomic.Pointer[connectionCloseObserver]
 }
 
@@ -222,6 +226,10 @@ type voiceAuthorityStopValue struct {
 
 type voiceAuthorityObserverValue struct {
 	observe VoiceAuthorityObserver
+}
+
+type voiceAuthorityProjectionValue struct {
+	project VoiceAuthorityProjection
 }
 
 type connectionCloseObserver struct {
@@ -294,6 +302,20 @@ func (c *ConnectionCoordinator) SetVoiceAuthorityObserver(observer VoiceAuthorit
 		return
 	}
 	c.voiceObserver.Store(&voiceAuthorityObserverValue{observe: observer})
+}
+
+// SetVoiceAuthorityProjection installs the application hook used when an
+// account-wide teardown must also remove channel membership and arm a temporary
+// channel's empty timer. It must be configured before account mutations run.
+func (c *ConnectionCoordinator) SetVoiceAuthorityProjection(projection VoiceAuthorityProjection) {
+	if c == nil {
+		return
+	}
+	if projection == nil {
+		c.voiceProjection.Store(nil)
+		return
+	}
+	c.voiceProjection.Store(&voiceAuthorityProjectionValue{project: projection})
 }
 
 // SetCloseObserver installs the runtime state callback invoked after a control
@@ -588,8 +610,42 @@ func (c *ConnectionCoordinator) StageVoiceReplacement(owner ControlConnectionRef
 		expected:    cloneVoiceAuthority(expected),
 		channelID:   channelID,
 		prepared:    prepared,
+		generation:  user.nextVoice + 1,
 		joinedAt:    joinedAt,
 	}, nil
+}
+
+// ProposedAuthority returns the exact authority tuple that Apply will install.
+// It performs no mutation and is used by application adapters to build the
+// immutable StateStore candidate and event plan before StatePublication owns
+// the commit boundary.
+func (s *VoiceAuthorityStage) ProposedAuthority() (VoiceAuthority, error) {
+	if s == nil || s.coordinator == nil || !validConnectionRef(s.owner) || s.channelID <= 0 || s.generation == 0 || s.joinedAt < 0 {
+		return VoiceAuthority{}, ErrVoiceAuthorityPrecondition
+	}
+	var sessionID [16]byte
+	if s.prepared != nil {
+		info := s.prepared.Info()
+		if info.ID == [16]byte{} || info.UserID != s.owner.UserID {
+			return VoiceAuthority{}, ErrVoiceAuthorityPrecondition
+		}
+		sessionID = info.ID
+	} else if s.expected != nil {
+		sessionID = s.expected.VoiceSessionID
+	}
+	proposed := VoiceAuthority{
+		UserID:                   s.owner.UserID,
+		ChannelID:                s.channelID,
+		ControlConnectionID:      s.owner.ControlConnectionID,
+		ConnectionGeneration:     s.owner.Generation,
+		VoiceSessionID:           sessionID,
+		VoiceAuthorityGeneration: s.generation,
+		JoinedAt:                 s.joinedAt,
+	}
+	if !proposed.Valid() {
+		return VoiceAuthority{}, ErrVoiceAuthorityPrecondition
+	}
+	return proposed, nil
 }
 
 // Apply commits the staged authority under the coordinator user lock. When a
@@ -598,6 +654,21 @@ func (c *ConnectionCoordinator) StageVoiceReplacement(owner ControlConnectionRef
 // preserves the required publication -> coordinator -> Manager lock order
 // without allowing network I/O or sendMu waiting under coordinator ownership.
 func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCommit, error) {
+	return s.apply(manager, true)
+}
+
+// ApplyForPublication commits the staged authority without enqueueing the
+// coordinator's asynchronous observer. The caller must include the resulting
+// authority transition in the same StatePublication request; doing both would
+// publish duplicate or stale runtime projections.
+func (s *VoiceAuthorityStage) ApplyForPublication(manager *protocol.Manager) (VoiceAuthorityCommit, error) {
+	return s.apply(manager, false)
+}
+
+// apply performs the single coordinator/Manager runtime commit point. notify
+// remains enabled for legacy lifecycle callers that publish the projection via
+// the coordinator observer after Apply returns.
+func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, notify bool) (VoiceAuthorityCommit, error) {
 	if s == nil || s.coordinator == nil || !validConnectionRef(s.owner) {
 		return VoiceAuthorityCommit{}, ErrVoiceAuthorityPrecondition
 	}
@@ -609,12 +680,12 @@ func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCo
 	user.mu.Lock()
 	var notifyPrevious, notifyCurrent *VoiceAuthority
 	defer func() {
-		if notifyCurrent != nil {
+		if notify && notifyCurrent != nil {
 			s.coordinator.notifyVoiceAuthority(notifyPrevious, notifyCurrent, "session_replaced")
 		}
 	}()
 	defer user.mu.Unlock()
-	if !user.connectionActiveLocked(s.owner) || !sameVoiceAuthority(user.voice, s.expected) {
+	if !user.connectionActiveLocked(s.owner) || !sameVoiceAuthority(user.voice, s.expected) || user.nextVoice+1 != s.generation {
 		return VoiceAuthorityCommit{}, ErrVoiceAuthorityPrecondition
 	}
 
@@ -636,14 +707,14 @@ func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCo
 	} else {
 		sessionID = s.expected.VoiceSessionID
 	}
-	user.nextVoice++
+	user.nextVoice = s.generation
 	current := VoiceAuthority{
 		UserID:                   s.owner.UserID,
 		ChannelID:                s.channelID,
 		ControlConnectionID:      s.owner.ControlConnectionID,
 		ConnectionGeneration:     s.owner.Generation,
 		VoiceSessionID:           sessionID,
-		VoiceAuthorityGeneration: user.nextVoice,
+		VoiceAuthorityGeneration: s.generation,
 		JoinedAt:                 s.joinedAt,
 	}
 	user.voice = &current
@@ -662,6 +733,44 @@ func (c *ConnectionCoordinator) BeginVoiceDisconnect(expected VoiceAuthority, ma
 // BeginVoiceDisconnectReason conditionally clears one complete voice authority
 // tuple and records the lifecycle reason for the ordered StatePublication.
 func (c *ConnectionCoordinator) BeginVoiceDisconnectReason(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, error) {
+	return c.beginVoiceDisconnectReason(expected, manager, reason, true)
+}
+
+// BeginVoiceDisconnectForPublication clears one exact authority and suppresses
+// the asynchronous observer. Application commands use it when their candidate
+// and lifecycle events are already reserved in the same StatePublication.
+func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, error) {
+	return c.beginVoiceDisconnectReason(expected, manager, reason, false)
+}
+
+// BeginVoiceRevokeForPublication clears one exact authority without the
+// observer and returns staged UDP revocation cleanup for the caller to run
+// after StatePublication releases its locks. It is used for access-loss and
+// forced teardown paths; voluntary leave deliberately uses Delete instead.
+func (c *ConnectionCoordinator) BeginVoiceRevokeForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.RevocationCleanup, error) {
+	if c == nil || !expected.Valid() || manager == nil {
+		return VoiceAuthority{}, false, nil, ErrVoiceAuthorityPrecondition
+	}
+	user := c.acquireUser(expected.UserID)
+	defer c.releaseUser(expected.UserID, user)
+	user.mu.Lock()
+	defer user.mu.Unlock()
+	if !sameVoiceAuthority(user.voice, &expected) {
+		return VoiceAuthority{}, false, nil, nil
+	}
+	cleanup, err := manager.RevokeStaged(expected.VoiceSessionID, expected.UserID)
+	if err != nil && !errors.Is(err, protocol.ErrSessionNotFound) {
+		return VoiceAuthority{}, false, nil, err
+	}
+	removed := *user.voice
+	user.voice = nil
+	return removed, true, cleanup, nil
+}
+
+// beginVoiceDisconnectReason conditionally clears one exact authority and
+// optionally emits the legacy observer callback after coordinator ownership is
+// released.
+func (c *ConnectionCoordinator) beginVoiceDisconnectReason(expected VoiceAuthority, manager *protocol.Manager, reason string, notify bool) (VoiceAuthority, bool, error) {
 	if c == nil || !expected.Valid() {
 		return VoiceAuthority{}, false, ErrVoiceAuthorityPrecondition
 	}
@@ -670,7 +779,7 @@ func (c *ConnectionCoordinator) BeginVoiceDisconnectReason(expected VoiceAuthori
 	user.mu.Lock()
 	var notification *VoiceAuthority
 	defer func() {
-		if notification != nil {
+		if notify && notification != nil {
 			c.notifyVoiceAuthority(notification, nil, reason)
 		}
 	}()
@@ -788,8 +897,25 @@ func (c *ConnectionCoordinator) PrepareAccountTeardown(userID int64, reason stri
 	if err != nil {
 		return AccountTeardownPlan{}, err
 	}
+	var afterPublish func()
+	if previous != nil {
+		if projection := c.voiceProjection.Load(); projection != nil && projection.project != nil {
+			membershipEvents, cleanup, projectionErr := projection.project(candidate, previous, nil, reason)
+			if projectionErr != nil {
+				return AccountTeardownPlan{}, projectionErr
+			}
+			events = append(membershipEvents, events...)
+			afterPublish = cleanup
+		}
+	}
 	return AccountTeardownPlan{
 		Events: events,
+		AfterPublish: func(context.Context) error {
+			if afterPublish != nil {
+				afterPublish()
+			}
+			return nil
+		},
 		BeforePublish: func(context.Context) error {
 			c.DisconnectUser(userID, reason)
 			return nil

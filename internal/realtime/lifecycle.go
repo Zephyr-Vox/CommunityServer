@@ -63,11 +63,12 @@ type RuntimeMutationAdmission interface {
 // runtime control-connection presence and the EventBus ring in one sequenced
 // command stream.
 type ConnectionStatePublisher struct {
-	state         *StateStore
-	sequencer     *PostCommitSequencer
-	coordinator   *ConnectionCoordinator
-	validateLease ConnectionLeaseValidator
-	mutationGate  RuntimeMutationAdmission
+	state           *StateStore
+	sequencer       *PostCommitSequencer
+	coordinator     *ConnectionCoordinator
+	validateLease   ConnectionLeaseValidator
+	mutationGate    RuntimeMutationAdmission
+	voiceProjection VoiceAuthorityProjection
 
 	rateMu         sync.Mutex
 	rates          map[int64]presenceRateState
@@ -86,6 +87,12 @@ type voiceAuthorityTransition struct {
 	reason   string
 }
 
+// VoiceAuthorityProjection enriches coordinator-owned terminal teardown with
+// application membership events and runtime timer bookkeeping. It runs while
+// the voice command is building its candidate; the returned callback runs only
+// after StatePublication has made that candidate visible.
+type VoiceAuthorityProjection func(candidate *StateCandidate, previous, current *VoiceAuthority, reason string) ([]StateEventTemplate, func(), error)
+
 // SetConnectionLeaseValidator installs the application auth revalidation hook.
 // It must be configured before websocket admission; replacing it concurrently
 // with command execution is unsupported.
@@ -100,6 +107,16 @@ func (p *ConnectionStatePublisher) SetConnectionLeaseValidator(validator Connect
 func (p *ConnectionStatePublisher) SetRuntimeMutationAdmission(admission RuntimeMutationAdmission) {
 	if p != nil {
 		p.mutationGate = admission
+	}
+}
+
+// SetVoiceAuthorityProjection installs the application hook that extends the
+// generic authority projection with channel membership lifecycle work. It must
+// be configured before the WebSocket route is reachable.
+func (p *ConnectionStatePublisher) SetVoiceAuthorityProjection(projection VoiceAuthorityProjection) {
+	if p != nil {
+		p.voiceProjection = projection
+		p.coordinator.SetVoiceAuthorityProjection(projection)
 	}
 }
 
@@ -201,17 +218,31 @@ func (p *ConnectionStatePublisher) voiceCommand(transition voiceAuthorityTransit
 				}
 				return CommandOutput{Value: false}, nil
 			}
-			events, err := voiceAuthorityEventTemplates(previous, current, reason)
+			var applicationEvents []StateEventTemplate
+			var afterPublish func()
+			if p.voiceProjection != nil {
+				applicationEvents, afterPublish, err = p.voiceProjection(candidate, previous, current, reason)
+				if err != nil {
+					return CommandOutput{}, err
+				}
+			}
+			authorityEvents, err := voiceAuthorityEventTemplates(previous, current, reason)
 			if err != nil {
 				return CommandOutput{}, err
 			}
+			events := append(applicationEvents, authorityEvents...)
 			if _, err := execution.Reserve(PublicationRequest{Candidate: candidate, Events: events}); err != nil {
 				return CommandOutput{}, err
 			}
 			if err := execution.MarkRuntimeReady(); err != nil {
 				return CommandOutput{}, err
 			}
-			return CommandOutput{Value: true}, nil
+			return CommandOutput{Value: true, AfterPublish: func(context.Context) error {
+				if afterPublish != nil {
+					afterPublish()
+				}
+				return nil
+			}}, nil
 		},
 	}
 }
@@ -226,27 +257,37 @@ func voiceAuthorityEventTemplates(previous, current *VoiceAuthority, reason stri
 	userID := currentUserID(previous, current)
 	authority := snapshotVoiceAuthorityValue(current)
 	authorityData, err := json.Marshal(struct {
-		Authority *SnapshotVoiceAuthority `json:"authority"`
-	}{Authority: authority})
+		Authority              *SnapshotVoiceAuthority `json:"authority"`
+		PreviousVoiceSessionID string                  `json:"previous_voice_session_id,omitempty"`
+		Reason                 string                  `json:"reason,omitempty"`
+	}{
+		Authority:              authority,
+		PreviousVoiceSessionID: previousVoiceSessionID(previous),
+		Reason:                 authorityReason(previous, current, reason),
+	})
 	if err != nil {
 		return nil, err
 	}
 	events := make([]StateEventTemplate, 0, 2)
 	if previous != nil && current == nil {
-		lifecycleType := "voice.revoked"
-		wireReason := voiceRevocationReason(reason)
-		if wireReason == "udp_timeout" {
-			lifecycleType = "voice.disconnected"
+		// Voluntary leave is represented solely by authority.updated(null). It
+		// must not look like a transport revoke or UDP timeout to clients.
+		if reason != "left" {
+			lifecycleType := "voice.revoked"
+			wireReason := voiceRevocationReason(reason)
+			if wireReason == "udp_timeout" {
+				lifecycleType = "voice.disconnected"
+			}
+			data, err := json.Marshal(struct {
+				VoiceSessionID string `json:"voice_session_id"`
+				ChannelID      string `json:"channel_id"`
+				Reason         string `json:"reason"`
+			}{VoiceSessionID: fmt.Sprintf("%x", previous.VoiceSessionID), ChannelID: fmt.Sprint(previous.ChannelID), Reason: wireReason})
+			if err != nil {
+				return nil, err
+			}
+			events = append(events, StateEventTemplate{EventType: lifecycleType, Scope: Scope{Type: "server"}, Data: data, DeliveryPolicy: StateDeliveryUserTargeted, RecipientUserID: userID})
 		}
-		data, err := json.Marshal(struct {
-			VoiceSessionID string `json:"voice_session_id"`
-			ChannelID      string `json:"channel_id"`
-			Reason         string `json:"reason"`
-		}{VoiceSessionID: fmt.Sprintf("%x", previous.VoiceSessionID), ChannelID: fmt.Sprint(previous.ChannelID), Reason: wireReason})
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, StateEventTemplate{EventType: lifecycleType, Scope: Scope{Type: "server"}, Data: data, DeliveryPolicy: StateDeliveryUserTargeted, RecipientUserID: userID})
 	} else if previous != nil && current != nil && previous.VoiceSessionID != current.VoiceSessionID {
 		data, err := json.Marshal(struct {
 			VoiceSessionID string `json:"voice_session_id"`
@@ -260,6 +301,36 @@ func voiceAuthorityEventTemplates(previous, current *VoiceAuthority, reason stri
 	}
 	events = append(events, StateEventTemplate{EventType: "voice.authority.updated", Scope: Scope{Type: "server"}, Data: authorityData, DeliveryPolicy: StateDeliveryUserTargeted, RecipientUserID: userID})
 	return events, nil
+}
+
+// VoiceAuthorityEventTemplates exposes the canonical authority event builder
+// to channel and other application adapters that commit the coordinator and
+// immutable runtime projection in one StatePublication.
+func VoiceAuthorityEventTemplates(previous, current *VoiceAuthority, reason string) ([]StateEventTemplate, error) {
+	return voiceAuthorityEventTemplates(previous, current, reason)
+}
+
+// previousVoiceSessionID returns the prior session ID only for a real
+// authority transition. The empty string keeps initial bind payloads compact.
+func previousVoiceSessionID(previous *VoiceAuthority) string {
+	if previous == nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", previous.VoiceSessionID)
+}
+
+// authorityReason normalizes the reason carried by voice.authority.updated.
+func authorityReason(previous, current *VoiceAuthority, reason string) string {
+	if reason != "" {
+		if reason == "left" || reason == "channel_moved" || reason == "joined" || reason == "session_replaced" {
+			return reason
+		}
+		return voiceRevocationReason(reason)
+	}
+	if previous != nil && current != nil && previous.VoiceSessionID != current.VoiceSessionID {
+		return "session_replaced"
+	}
+	return ""
 }
 
 // voiceRevocationReason maps internal close reasons to the fixed wire vocabulary.

@@ -75,3 +75,30 @@ func ReplayDurable(c *echo.Context, replay realtime.DurableReplay) error {
 	}
 	return c.Blob(replay.Status, echo.MIMEApplicationJSONCharsetUTF8, replay.Body)
 }
+
+// ReplayRuntime writes a completed in-process command result byte-for-byte.
+// Runtime retries use the same response envelope and checkpoint headers as
+// durable commands, while their short-lived cache may also retain secrets such
+// as a freshly-created voice session key.
+func ReplayRuntime(c *echo.Context, result realtime.RuntimeCommandResult) error {
+	if result.Headers.ETag != "" {
+		c.Response().Header().Set("ETag", result.Headers.ETag)
+	}
+	if result.Headers.ParentETag != "" {
+		c.Response().Header().Set("X-Zephyr-Parent-ETag", result.Headers.ParentETag)
+	}
+	if result.Headers.Location != "" {
+		c.Response().Header().Set("Location", result.Headers.Location)
+	}
+	if result.Headers.CacheControl != "" {
+		c.Response().Header().Set("Cache-Control", result.Headers.CacheControl)
+	}
+	if result.Headers.Pragma != "" {
+		c.Response().Header().Set("Pragma", result.Headers.Pragma)
+	}
+	SetStateCommandHeaders(c, result.CommandID, result.Checkpoint, result.StateCursor)
+	if result.Status == http.StatusNoContent {
+		return c.NoContent(result.Status)
+	}
+	return c.Blob(result.Status, echo.MIMEApplicationJSONCharsetUTF8, result.Body)
+}

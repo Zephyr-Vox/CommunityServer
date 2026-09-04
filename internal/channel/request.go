@@ -73,3 +73,16 @@ type accessRequest struct {
 	RoleKey       *string `json:"role_key" validate:"omitempty,min=1,max=64"`
 	GrantParent   bool    `json:"grant_parent"`
 }
+
+// VoiceJoinInput is the validated body of POST /channels/:id/join. The control
+// connection and idempotency key are authenticated headers, not body fields.
+type VoiceJoinInput struct {
+	DeviceID               string `json:"device_id" validate:"omitempty,max=64"`
+	ForceNew               bool   `json:"force_new"`
+	ExpectedVoiceSessionID string `json:"expected_voice_session_id" validate:"omitempty,len=32"`
+}
+
+// VoiceLeaveInput is the validated body of POST /channels/current/leave.
+type VoiceLeaveInput struct {
+	VoiceSessionID string `json:"voice_session_id" validate:"required,len=32"`
+}
