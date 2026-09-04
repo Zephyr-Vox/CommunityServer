@@ -42,7 +42,12 @@ func (v *voiceRuntime) Start(ctx context.Context, host string, port int, supervi
 		v.closeMu.Unlock()
 		return fmt.Errorf("server: start voice: %w", err)
 	}
-	v.stopPurge = v.server.StartPurge(protocol.PurgeInterval)
+	purgeCtx, purgeCancel := context.WithCancel(supervisor.Context())
+	purgeDone := make(chan struct{})
+	v.stopPurge = func() {
+		purgeCancel()
+		<-purgeDone
+	}
 	v.fatal = supervisor.Fatal
 	v.started = true
 	v.closeMu.Unlock()
@@ -50,6 +55,10 @@ func (v *voiceRuntime) Start(ctx context.Context, host string, port int, supervi
 	// UDPServer owns PacketConn after Start. Its non-close return is fatal; the
 	// supervisor cancels the process root and owns the subsequent stop sequence.
 	supervisor.Go("udp read", func(context.Context) error { return <-errCh })
+	supervisor.Go("udp purge", func(context.Context) error {
+		defer close(purgeDone)
+		return v.server.RunPurge(purgeCtx, protocol.PurgeInterval)
+	})
 	supervisor.Go("udp revocation", func(ctx context.Context) error {
 		for {
 			select {

@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"context"
 	"crypto/cipher"
 	"errors"
 	"net"
@@ -378,6 +379,22 @@ func (s *UDPServer) StartPurge(interval time.Duration) (stop func()) {
 			<-done
 		})
 	}
+}
+
+// RunPurge drives the periodic expiry sweep until ctx is canceled. The caller
+// owns the goroutine, so process supervisors can track purge liveness and wait
+// for it alongside the UDP read loop during shutdown.
+func (s *UDPServer) RunPurge(ctx context.Context, interval time.Duration) error {
+	if s == nil || ctx == nil {
+		return errors.New("protocol: invalid purge runtime")
+	}
+	if interval <= 0 {
+		interval = PurgeInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	s.PurgeLoop(interval, ticker.C, ctx.Done())
+	return nil
 }
 
 // PurgeLoop consumes ticks until stop is closed. It is exported so tests can

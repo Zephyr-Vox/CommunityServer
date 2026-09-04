@@ -2,6 +2,7 @@ package protocol_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"sync"
@@ -812,6 +813,27 @@ func TestPurgeLoopRunsOnInjectedTicks(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("purge loop did not stop")
+	}
+}
+
+func TestRunPurgeStopsWithContext(t *testing.T) {
+	srv, err := protocol.NewUDPServer(protocol.NewManager(time.Now), protocol.NewChannelTypeRegistry(), nil, protocol.DefaultIngressLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.RunPurge(ctx, time.Millisecond)
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunPurge() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunPurge did not stop after context cancellation")
 	}
 }
 
