@@ -90,6 +90,21 @@ func TestManagerGetExpiresLazily(t *testing.T) {
 	}
 }
 
+func TestManagerActivationRejectsExpiredPreparedSession(t *testing.T) {
+	m, clock := newTestManager(t)
+	prepared, err := m.Prepare(1, "dev", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(protocol.SessionTTL)
+	if _, err := m.ActivatePrepared(prepared, nil); !errors.Is(err, protocol.ErrSessionExpired) {
+		t.Fatalf("expired prepared activation = %v, want ErrSessionExpired", err)
+	}
+	if m.Len() != 0 {
+		t.Fatalf("expired prepared session was published, Len=%d", m.Len())
+	}
+}
+
 func TestManagerPurgeRemovesExpired(t *testing.T) {
 	m, clock := newTestManager(t)
 	_, err := activateSession(t, m, 1, "", false)

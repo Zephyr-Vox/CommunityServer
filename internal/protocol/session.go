@@ -389,6 +389,18 @@ func (m *Manager) activatePreparedStaged(prepared *PreparedSession, expectedOldI
 		}
 		old.mu.Unlock()
 	}
+	// Prepare allocates the session before the caller acquires the application
+	// publication slot. If that wait crosses the transport TTL, do not install
+	// a session whose deadline has already passed; the caller can retry while
+	// the old application authority remains unchanged.
+	prepared.session.mu.Lock()
+	preparedExpired := prepared.session.expiredLocked(nowMS)
+	prepared.session.mu.Unlock()
+	if preparedExpired {
+		m.mu.Unlock()
+		prepared.mu.Unlock()
+		return SessionInfo{}, nil, nil, ErrSessionExpired
+	}
 	// Mark used before publishing indexes. Every successful activation has one
 	// linearization point, so a repeated call cannot deactivate and reinsert the
 	// same live session.
@@ -472,6 +484,13 @@ func (m *Manager) Get(id [16]byte) (SessionSnapshot, bool) {
 		return SessionSnapshot{}, false
 	}
 	sess.mu.Lock()
+	// getSession releases Manager.mu before returning the pointer, so an
+	// explicit disconnect can deactivate this session in the meantime. Never
+	// expose that inactive snapshot to callers that use Get as a live check.
+	if !sess.active {
+		sess.mu.Unlock()
+		return SessionSnapshot{}, false
+	}
 	snap := SessionSnapshot{ID: sess.ID, UserID: sess.UserID, DeviceID: sess.DeviceID, CreatedAt: sess.CreatedAt, ExpiresAt: sess.ExpiresAt, Encrypted: sess.encrypted, RemotePresent: sess.remote != nil}
 	sess.mu.Unlock()
 	return snap, true
