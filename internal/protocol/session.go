@@ -56,6 +56,10 @@ var (
 	// ErrSessionPrecondition is returned when activation's expected old session
 	// does not match the user's current session.
 	ErrSessionPrecondition = errors.New("protocol: session activation precondition failed")
+	// ErrSessionExpired is returned when the expected old session expires at the
+	// activation boundary. The caller must let natural-expiry teardown win
+	// instead of publishing an explicit replacement transition.
+	ErrSessionExpired = errors.New("protocol: expected session expired during activation")
 )
 
 // Limits controls per-session transport budgets. SessionPacketsPerSec is the
@@ -358,6 +362,32 @@ func (m *Manager) activatePreparedStaged(prepared *PreparedSession, expectedOldI
 		m.mu.Unlock()
 		prepared.mu.Unlock()
 		return SessionInfo{}, nil, nil, ErrSessionPrecondition
+	}
+	if expectedOldID != nil && exists {
+		old, ok := m.sessions[currentID]
+		if !ok {
+			m.mu.Unlock()
+			prepared.mu.Unlock()
+			return SessionInfo{}, nil, nil, ErrSessionPrecondition
+		}
+		old.mu.Lock()
+		if old.expiredLocked(nowMS) {
+			old.deactivateLocked()
+			delete(m.sessions, currentID)
+			delete(m.byUser, userID)
+			barrierHandler := m.onExpireBarrier
+			expiryHandler := m.onExpire
+			old.mu.Unlock()
+			m.mu.Unlock()
+			prepared.mu.Unlock()
+			if barrierHandler != nil {
+				barrierHandler(userID, currentID, SessionSendDrain(func() { drainSessionSends(old) }))
+			} else if expiryHandler != nil {
+				expiryHandler(userID, currentID)
+			}
+			return SessionInfo{}, nil, nil, ErrSessionExpired
+		}
+		old.mu.Unlock()
 	}
 	// Mark used before publishing indexes. Every successful activation has one
 	// linearization point, so a repeated call cannot deactivate and reinsert the

@@ -125,6 +125,43 @@ func TestVoiceJoinPublishesAuthorityAndReplaysSensitiveResult(t *testing.T) {
 	if second.Code != http.StatusOK || !bytes.Equal(first.Body.Bytes(), second.Body.Bytes()) {
 		t.Fatalf("replay status/body = %d/%s, want exact first response %s", second.Code, second.Body.String(), first.Body.String())
 	}
+	targetSnapshot, _, err := fixture.service.CreateChannel(context.Background(), fixture.adminID, channel.CreateChannelInput{
+		Name:       "Voice move target",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID := mustID(t, targetSnapshot.ID)
+	moveBody := []byte(`{"expected_voice_session_id":"` + envelope.Data.Voice.SessionID + `"}`)
+	moveReq := httptest.NewRequest(http.MethodPost, "/api/v0/channels/"+strconv.FormatInt(targetID, 10)+"/join", bytes.NewReader(moveBody))
+	moveReq.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	moveReq.Header.Set("X-Zephyr-Control-Connection", ref.IDHex())
+	moveReq.Header.Set("Idempotency-Key", "voice-move-key-01")
+	moveRec := httptest.NewRecorder()
+	e.ServeHTTP(moveRec, moveReq)
+	if moveRec.Code != http.StatusOK {
+		t.Fatalf("reuse move status = %d, body = %s", moveRec.Code, moveRec.Body.String())
+	}
+	var moveEnvelope struct {
+		Code int `json:"code"`
+		Data struct {
+			Voice struct {
+				Created   bool   `json:"created"`
+				SessionID string `json:"session_id"`
+				ExpiresAt int64  `json:"expires_at"`
+			} `json:"voice"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(moveRec.Body.Bytes(), &moveEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	if moveEnvelope.Code != 0 || moveEnvelope.Data.Voice.Created || moveEnvelope.Data.Voice.SessionID != envelope.Data.Voice.SessionID || moveEnvelope.Data.Voice.ExpiresAt <= 0 {
+		t.Fatalf("reuse move envelope = %+v", moveEnvelope)
+	}
 
 	leaveKey := "voice-leave-key-01"
 	leaveBody := []byte(`{"voice_session_id":"` + envelope.Data.Voice.SessionID + `"}`)
@@ -165,6 +202,109 @@ func TestVoiceJoinPublishesAuthorityAndReplaysSensitiveResult(t *testing.T) {
 	leaveReplay := leave()
 	if leaveReplay.Code != http.StatusNoContent || leaveReplay.Body.Len() != 0 {
 		t.Fatalf("leave replay status/body = %d/%s", leaveReplay.Code, leaveReplay.Body.String())
+	}
+}
+
+// TestVoiceJoinRejectsExpiryAtActivationBoundary verifies that an old session
+// expiring after command planning cannot be published as an explicit
+// replacement with the wrong lifecycle event.
+func TestVoiceJoinRejectsExpiryAtActivationBoundary(t *testing.T) {
+	fixture := newFixture(t)
+	ctx := context.Background()
+	source, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		Name:       "Expiry source",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
+		Name:       "Expiry target",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID := mustID(t, source.ID)
+	targetID := mustID(t, target.ID)
+	now := time.UnixMilli(1_000)
+	manager := protocol.NewManager(func() time.Time { return now })
+	expired := make(chan struct{}, 1)
+	manager.SetExpiryHandler(func(int64, [16]byte) { expired <- struct{}{} })
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(fixture.adminID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := reservation.Activate(voiceJoinTransport{}, 100_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceRuntime(manager, coordinator, true)
+	fixture.service.SetVoiceClock(func() int64 { return now.UnixMilli() })
+	signer, err := realtime.NewRequestIdentitySigner([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceIdempotency(realtime.NewRuntimeIdempotencyCache(), signer)
+	if _, err := fixture.service.JoinVoice(ctx, fixture.adminID, sourceID, ref.ControlConnectionID, "expiry-boundary-source", channel.VoiceJoinInput{DeviceID: "desktop"}, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	authority, ok := coordinator.VoiceAuthority(fixture.adminID)
+	if !ok {
+		t.Fatal("source join did not create voice authority")
+	}
+	beforeEvents := len(fixture.publication.Capture().Events)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	fixture.publication.SetHook(func(stage realtime.PublicationStage) {
+		if stage != realtime.PublicationBeforeRingAppend {
+			return
+		}
+		close(entered)
+		<-release
+	})
+	defer fixture.publication.SetHook(nil)
+	result := make(chan error, 1)
+	go func() {
+		_, joinErr := fixture.service.JoinVoice(ctx, fixture.adminID, targetID, ref.ControlConnectionID, "expiry-boundary-replace", channel.VoiceJoinInput{
+			DeviceID:               "desktop-2",
+			ForceNew:               true,
+			ExpectedVoiceSessionID: fmt.Sprintf("%x", authority.VoiceSessionID),
+		}, "127.0.0.1")
+		result <- joinErr
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not reach publication boundary")
+	}
+	now = now.Add(protocol.SessionTTL + time.Millisecond)
+	close(release)
+	select {
+	case err := <-result:
+		if !errors.Is(err, channel.ErrVoiceStale) {
+			t.Fatalf("expiry-boundary replacement error = %v, want ErrVoiceStale", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not finish")
+	}
+	select {
+	case <-expired:
+	case <-time.After(time.Second):
+		t.Fatal("activation expiry did not notify the expiry handler")
+	}
+	if got := len(fixture.publication.Capture().Events); got != beforeEvents {
+		t.Fatalf("expiry-boundary replacement published %d new events", got-beforeEvents)
+	}
+	if current, ok := coordinator.VoiceAuthority(fixture.adminID); !ok || current != authority {
+		t.Fatalf("authority after rejected replacement = %+v, ok=%t", current, ok)
 	}
 }
 

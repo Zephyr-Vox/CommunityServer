@@ -563,8 +563,15 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 				Candidate: candidate,
 				Events:    events,
 				CommitRuntime: func() (func(), error) {
-					commit, commitErr := stage.ApplyForPublication(s.voiceManager)
+					commit, commitErr := stage.ApplyForPublication(s.voiceManager, naturalExpiry)
 					if commitErr != nil {
+						if errors.Is(commitErr, protocol.ErrSessionPrecondition) || errors.Is(commitErr, protocol.ErrSessionExpired) {
+							// A runtime command has already reserved its publication. Mark
+							// this exact-session race as a cancellable no-op so the
+							// sequencer releases the reservation without declaring the
+							// publication subsystem failed.
+							return nil, fmt.Errorf("%w: %w", context.Canceled, ErrVoiceStale)
+						}
 						return nil, commitErr
 					}
 					if commit.Current != proposed {
@@ -581,9 +588,20 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 			if err := execution.MarkRuntimeReady(); err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			info := protocol.SessionInfo{ID: proposed.VoiceSessionID, UserID: actorID, Encrypted: s.voiceEncrypted}
+			info := protocol.SessionInfo{
+				ID:        proposed.VoiceSessionID,
+				UserID:    actorID,
+				Encrypted: s.voiceEncrypted,
+			}
 			if prepared != nil {
 				info = prepared.Info()
+			} else if hasCurrent {
+				snapshot, snapshotOK := s.voiceManager.Get(current.VoiceSessionID)
+				if !snapshotOK || snapshot.UserID != actorID {
+					return realtime.CommandOutput{}, ErrVoiceStale
+				}
+				info.Encrypted = snapshot.Encrypted
+				info.ExpiresAt = snapshot.ExpiresAt
 			}
 			return realtime.CommandOutput{Value: voiceJoinPlan{channel: snapshotChannel(channel), channelID: channel.ID, info: info, created: created, schedules: schedules, cancellations: cancellations}}, nil
 		},

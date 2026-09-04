@@ -698,7 +698,7 @@ func (s *VoiceAuthorityStage) ProposedAuthority() (VoiceAuthority, error) {
 // preserves the required publication -> coordinator -> Manager lock order
 // without allowing network I/O or sendMu waiting under coordinator ownership.
 func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCommit, error) {
-	commit, err := s.apply(manager)
+	commit, err := s.apply(manager, true)
 	if err != nil {
 		return VoiceAuthorityCommit{}, err
 	}
@@ -712,19 +712,23 @@ func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCo
 // ApplyForPublication commits the staged authority without enqueueing the
 // coordinator's asynchronous observer. The caller must include the resulting
 // authority transition in the same StatePublication request; doing both would
-// publish duplicate or stale runtime projections.
-func (s *VoiceAuthorityStage) ApplyForPublication(manager *protocol.Manager) (VoiceAuthorityCommit, error) {
-	return s.apply(manager)
+// publish duplicate or stale runtime projections. allowNaturalExpiry is true
+// only when the caller already observed the expected Manager session missing.
+func (s *VoiceAuthorityStage) ApplyForPublication(manager *protocol.Manager, allowNaturalExpiry bool) (VoiceAuthorityCommit, error) {
+	return s.apply(manager, allowNaturalExpiry)
 }
 
 // apply performs the single coordinator/Manager runtime commit point. Apply
 // publishes the observer transition after draining, while ApplyForPublication
 // leaves that transition for the enclosing StatePublication.
-func (s *VoiceAuthorityStage) apply(manager *protocol.Manager) (VoiceAuthorityCommit, error) {
+func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, allowNaturalExpiry bool) (VoiceAuthorityCommit, error) {
 	if s == nil || s.coordinator == nil || !validConnectionRef(s.owner) {
 		return VoiceAuthorityCommit{}, ErrVoiceAuthorityPrecondition
 	}
 	if s.prepared != nil && manager == nil {
+		return VoiceAuthorityCommit{}, ErrVoiceAuthorityPrecondition
+	}
+	if s.prepared == nil && (manager == nil || s.expected == nil) {
 		return VoiceAuthorityCommit{}, ErrVoiceAuthorityPrecondition
 	}
 	user := s.coordinator.acquireUser(s.owner.UserID)
@@ -745,13 +749,17 @@ func (s *VoiceAuthorityStage) apply(manager *protocol.Manager) (VoiceAuthorityCo
 			id := s.expected.VoiceSessionID
 			expectedSessionID = &id
 		}
-		info, stagedDrain, stagedCleanup, err := manager.ActivatePreparedStaged(s.prepared, expectedSessionID)
-		if errors.Is(err, protocol.ErrSessionPrecondition) && expectedSessionID != nil {
+		var info protocol.SessionInfo
+		var stagedDrain protocol.SessionSendDrain
+		var stagedCleanup protocol.ActivationCleanup
+		var err error
+		if allowNaturalExpiry {
 			// UDP natural expiry removes the Manager index before its asynchronous
-			// coordinator cleanup. Let Manager accept only a missing expected index
-			// atomically, so this normal race cannot turn a runtime publication into
-			// a process-fatal sequencer failure or preempt a newer session.
+			// coordinator cleanup. Allow only that already-observed missing index;
+			// a different current session still fails the exact precondition.
 			info, stagedDrain, stagedCleanup, err = manager.ActivatePreparedStagedAfterNaturalExpiry(s.prepared, expectedSessionID)
+		} else {
+			info, stagedDrain, stagedCleanup, err = manager.ActivatePreparedStaged(s.prepared, expectedSessionID)
 		}
 		if err != nil {
 			return VoiceAuthorityCommit{}, err
@@ -760,6 +768,10 @@ func (s *VoiceAuthorityStage) apply(manager *protocol.Manager) (VoiceAuthorityCo
 		drain = stagedDrain
 		cleanup = stagedCleanup
 	} else {
+		snapshot, ok := manager.Get(s.expected.VoiceSessionID)
+		if !ok || snapshot.UserID != s.owner.UserID {
+			return VoiceAuthorityCommit{}, protocol.ErrSessionPrecondition
+		}
 		sessionID = s.expected.VoiceSessionID
 	}
 	user.nextVoice = s.generation
