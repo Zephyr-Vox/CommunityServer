@@ -558,6 +558,17 @@ func (c *StateCandidate) SetPresence(userID int64, presence Presence) error {
 	return nil
 }
 
+// ClearPresence removes one user's runtime presence entry. It is used when an
+// account-wide access revocation must publish offline before its user event;
+// missing entries are intentionally a no-op.
+func (c *StateCandidate) ClearPresence(userID int64) error {
+	if c == nil || c.version == nil || userID <= 0 {
+		return ErrInvalidProjection
+	}
+	delete(c.version.runtime.presences, userID)
+	return nil
+}
+
 // IncrementModerationEpoch advances the server-global mute enforcement epoch
 // for a persistent moderation mutation. Relay workers use this value to reject
 // queued media validated before the new mute state was published.

@@ -15,10 +15,14 @@ DELETE FROM command_idempotency WHERE expires_at <= ?;
 -- name: CountDurableIdempotency :one
 SELECT
     (SELECT COUNT(*) FROM command_idempotency) +
-    (SELECT COUNT(*) FROM activation_idempotency);
+    (SELECT COUNT(*) FROM activation_idempotency) +
+    (SELECT COUNT(*) FROM registration_idempotency);
 
 -- name: DeleteExpiredActivationIdempotency :execrows
 DELETE FROM activation_idempotency WHERE expires_at <= ?;
+
+-- name: DeleteExpiredRegistrationIdempotency :execrows
+DELETE FROM registration_idempotency WHERE expires_at <= ?;
 
 -- name: GetActivationIdempotency :one
 SELECT installation_id, idempotency_key, activation_code_hash, request_hmac,
@@ -33,3 +37,14 @@ INSERT INTO activation_idempotency (
     command_id, status, result_body, etag, location, cache_control, pragma,
     created_at, expires_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- name: GetRegistrationIdempotency :one
+SELECT * FROM registration_idempotency
+WHERE installation_id = ? AND idempotency_key = ? AND expires_at > ?;
+
+-- name: InsertRegistrationIdempotency :exec
+INSERT INTO registration_idempotency (
+    installation_id, idempotency_key, request_hmac, command_id, status,
+    result_body, etag, parent_etag, location, cache_control, pragma,
+    stream_epoch, geid, state_cursor, created_at, expires_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);

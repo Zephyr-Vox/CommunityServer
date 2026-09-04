@@ -139,11 +139,11 @@ func RegisterHandler(svc *RegisterService) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		identity, err := realtime.NewPublicHTTPCommandIdentity(installation.InstallationID, http.MethodPost, "/api/v0/auth/register", req)
+		identity, err := realtime.NewRegistrationHTTPCommandIdentity(installation.InstallationID, http.MethodPost, "/api/v0/auth/register", req)
 		if err != nil {
 			return err
 		}
-		ctx, state, replayed, err := preparePublicAccountHTTPMutation(c, svc.runtime, key, identity)
+		ctx, state, replayed, err := prepareRegistrationHTTPMutation(c, svc.runtime, key, identity)
 		if err != nil {
 			return err
 		}
@@ -954,17 +954,17 @@ func prepareAccountHTTPMutation(c *echo.Context, runtime *StateMutationRuntime, 
 	return realtime.WithHTTPMutationState(ctx, state), state, false, nil
 }
 
-// preparePublicAccountHTTPMutation performs completed replay for registration,
+// prepareRegistrationHTTPMutation performs completed replay for registration,
 // whose installation-scoped identity is established before a principal exists.
-func preparePublicAccountHTTPMutation(c *echo.Context, runtime *StateMutationRuntime, key string, identity realtime.InstallationCommandIdentity) (context.Context, *realtime.HTTPMutationState, bool, error) {
+func prepareRegistrationHTTPMutation(c *echo.Context, runtime *StateMutationRuntime, key string, identity realtime.RegistrationCommandIdentity) (context.Context, *realtime.HTTPMutationState, bool, error) {
 	if runtime == nil {
 		return c.Request().Context(), nil, false, nil
 	}
-	command, err := realtime.NewPublicHTTPMutationCommand(identity, key)
+	command, err := realtime.NewRegistrationHTTPMutationCommand(identity, key)
 	if err != nil {
 		return nil, nil, false, err
 	}
-	ctx, replay, found, err := runtime.PreparePublicHTTPMutation(c.Request().Context(), command)
+	ctx, replay, found, err := runtime.PrepareRegistrationHTTPMutation(c.Request().Context(), command)
 	if errors.Is(err, realtime.ErrIdempotencyMismatch) {
 		return nil, nil, false, api.NewError(9, http.StatusConflict, "idempotency key reused with different request")
 	}

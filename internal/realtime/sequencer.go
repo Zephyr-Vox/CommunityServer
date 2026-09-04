@@ -66,6 +66,10 @@ type PostCommitCommand struct {
 // released.
 type CommandOutput struct {
 	Value any
+	// BeforePublish runs after a persistent transaction has committed and before
+	// its reserved StatePublication becomes visible. It is for in-process
+	// authority teardown that must be linearized with the candidate state.
+	BeforePublish func(context.Context) error
 	// AfterPublish runs after the publication commit and before Acquire's
 	// release function runs. It is for in-process side effects that must share
 	// the command's linearization barrier, such as closing revoked sockets.
@@ -249,17 +253,17 @@ func (e *CommandExecution) publicationState() (*PublicationReservation, bool, bo
 	return e.reservation, e.persistent, e.runtimeReady, e.noop
 }
 
-// abort releases an uncommitted publication reservation after an ordinary
-// pre-commit or runtime-ready command error. A persistent committed reservation
-// is deliberately retained for fail-fast recovery rather than silently
-// discarding durable state.
+// abort releases an unpublished reservation after an ordinary pre-commit or
+// runtime-ready error. A persistent reservation that has already published is
+// left alone; a fatal error between database commit and publication may release
+// only the publication lock because the process is already in fail-fast recovery.
 func (e *CommandExecution) abort() {
 	if e == nil {
 		return
 	}
 	e.mu.Lock()
 	reservation := e.reservation
-	committed := e.committing || e.persistent || e.published
+	committed := e.committing || (e.persistent && e.published)
 	e.mu.Unlock()
 	if reservation != nil && !committed {
 		reservation.Abort()
@@ -658,6 +662,18 @@ func (s *PostCommitSequencer) execute(pending *queuedCommand) (completion Comman
 	if runtimeReady && !persistent {
 		if err := pending.ctx.Err(); err != nil {
 			execution.abort()
+			return CommandCompletion{}, err
+		}
+	}
+	if output.BeforePublish != nil {
+		if !persistent {
+			execution.abort()
+			return CommandCompletion{}, ErrCommandNotCommitted
+		}
+		if err := output.BeforePublish(execution.completionCtx); err != nil {
+			execution.abort()
+			err = fmt.Errorf("%w: %v", ErrSequencerFailed, err)
+			s.fail(err)
 			return CommandCompletion{}, err
 		}
 	}

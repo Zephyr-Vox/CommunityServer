@@ -201,42 +201,10 @@ func (p *ConnectionStatePublisher) voiceCommand(transition voiceAuthorityTransit
 				}
 				return CommandOutput{Value: false}, nil
 			}
-			userID := currentUserID(previous, current)
-			authority := snapshotVoiceAuthorityFor(userID, candidate.Version())
-			authorityData, err := json.Marshal(struct {
-				Authority *SnapshotVoiceAuthority `json:"authority"`
-			}{Authority: authority})
+			events, err := voiceAuthorityEventTemplates(previous, current, reason)
 			if err != nil {
 				return CommandOutput{}, err
 			}
-			events := make([]StateEventTemplate, 0, 2)
-			if previous != nil && current == nil {
-				lifecycleType := "voice.revoked"
-				wireReason := voiceRevocationReason(reason)
-				if wireReason == "udp_timeout" {
-					lifecycleType = "voice.disconnected"
-				}
-				data, err := json.Marshal(struct {
-					VoiceSessionID string `json:"voice_session_id"`
-					ChannelID      string `json:"channel_id"`
-					Reason         string `json:"reason"`
-				}{VoiceSessionID: fmt.Sprintf("%x", previous.VoiceSessionID), ChannelID: fmt.Sprint(previous.ChannelID), Reason: wireReason})
-				if err != nil {
-					return CommandOutput{}, err
-				}
-				events = append(events, StateEventTemplate{EventType: lifecycleType, Scope: Scope{Type: "server"}, Data: data, DeliveryPolicy: StateDeliveryUserTargeted, RecipientUserID: userID})
-			} else if previous != nil && current != nil && previous.VoiceSessionID != current.VoiceSessionID {
-				data, err := json.Marshal(struct {
-					VoiceSessionID string `json:"voice_session_id"`
-					ChannelID      string `json:"channel_id"`
-					Reason         string `json:"reason"`
-				}{VoiceSessionID: fmt.Sprintf("%x", previous.VoiceSessionID), ChannelID: fmt.Sprint(previous.ChannelID), Reason: "session_replaced"})
-				if err != nil {
-					return CommandOutput{}, err
-				}
-				events = append(events, StateEventTemplate{EventType: "voice.revoked", Scope: Scope{Type: "server"}, Data: data, DeliveryPolicy: StateDeliveryUserTargeted, RecipientUserID: userID})
-			}
-			events = append(events, StateEventTemplate{EventType: "voice.authority.updated", Scope: Scope{Type: "server"}, Data: authorityData, DeliveryPolicy: StateDeliveryUserTargeted, RecipientUserID: userID})
 			if _, err := execution.Reserve(PublicationRequest{Candidate: candidate, Events: events}); err != nil {
 				return CommandOutput{}, err
 			}
@@ -246,6 +214,52 @@ func (p *ConnectionStatePublisher) voiceCommand(transition voiceAuthorityTransit
 			return CommandOutput{Value: true}, nil
 		},
 	}
+}
+
+// voiceAuthorityEventTemplates creates the ordered lifecycle events for one
+// authority transition. Account-wide teardown reuses this builder so its
+// authority revoke is published before user.updated/user.deleted.
+func voiceAuthorityEventTemplates(previous, current *VoiceAuthority, reason string) ([]StateEventTemplate, error) {
+	if previous == nil && current == nil {
+		return nil, nil
+	}
+	userID := currentUserID(previous, current)
+	authority := snapshotVoiceAuthorityValue(current)
+	authorityData, err := json.Marshal(struct {
+		Authority *SnapshotVoiceAuthority `json:"authority"`
+	}{Authority: authority})
+	if err != nil {
+		return nil, err
+	}
+	events := make([]StateEventTemplate, 0, 2)
+	if previous != nil && current == nil {
+		lifecycleType := "voice.revoked"
+		wireReason := voiceRevocationReason(reason)
+		if wireReason == "udp_timeout" {
+			lifecycleType = "voice.disconnected"
+		}
+		data, err := json.Marshal(struct {
+			VoiceSessionID string `json:"voice_session_id"`
+			ChannelID      string `json:"channel_id"`
+			Reason         string `json:"reason"`
+		}{VoiceSessionID: fmt.Sprintf("%x", previous.VoiceSessionID), ChannelID: fmt.Sprint(previous.ChannelID), Reason: wireReason})
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, StateEventTemplate{EventType: lifecycleType, Scope: Scope{Type: "server"}, Data: data, DeliveryPolicy: StateDeliveryUserTargeted, RecipientUserID: userID})
+	} else if previous != nil && current != nil && previous.VoiceSessionID != current.VoiceSessionID {
+		data, err := json.Marshal(struct {
+			VoiceSessionID string `json:"voice_session_id"`
+			ChannelID      string `json:"channel_id"`
+			Reason         string `json:"reason"`
+		}{VoiceSessionID: fmt.Sprintf("%x", previous.VoiceSessionID), ChannelID: fmt.Sprint(previous.ChannelID), Reason: "session_replaced"})
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, StateEventTemplate{EventType: "voice.revoked", Scope: Scope{Type: "server"}, Data: data, DeliveryPolicy: StateDeliveryUserTargeted, RecipientUserID: userID})
+	}
+	events = append(events, StateEventTemplate{EventType: "voice.authority.updated", Scope: Scope{Type: "server"}, Data: authorityData, DeliveryPolicy: StateDeliveryUserTargeted, RecipientUserID: userID})
+	return events, nil
 }
 
 // voiceRevocationReason maps internal close reasons to the fixed wire vocabulary.

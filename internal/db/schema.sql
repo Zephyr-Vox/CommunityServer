@@ -252,3 +252,26 @@ CREATE TABLE IF NOT EXISTS activation_idempotency (
 
 CREATE INDEX IF NOT EXISTS idx_activation_idempotency_expires
     ON activation_idempotency(expires_at, created_at);
+
+CREATE TABLE IF NOT EXISTS registration_idempotency (
+    installation_id     TEXT    NOT NULL REFERENCES installation_state(installation_id) ON DELETE CASCADE,
+    idempotency_key     TEXT    NOT NULL CHECK (length(idempotency_key) BETWEEN 16 AND 64),
+    request_hmac        TEXT    NOT NULL CHECK (length(request_hmac) = 64 AND request_hmac NOT GLOB '*[^0-9a-f]*'),
+    command_id          INTEGER NOT NULL UNIQUE CHECK (command_id > 0),
+    status              INTEGER NOT NULL CHECK (status BETWEEN 100 AND 599),
+    result_body         TEXT    NOT NULL CHECK (json_valid(result_body)),
+    etag                TEXT,
+    parent_etag         TEXT,
+    location            TEXT,
+    cache_control       TEXT,
+    pragma              TEXT,
+    stream_epoch        TEXT    NOT NULL CHECK (length(stream_epoch) = 32 AND stream_epoch NOT GLOB '*[^0-9a-f]*'),
+    geid                INTEGER NOT NULL CHECK (geid >= 0),
+    state_cursor        TEXT    NOT NULL CHECK (length(state_cursor) > 0),
+    created_at          INTEGER NOT NULL CHECK (created_at >= 0),
+    expires_at          INTEGER NOT NULL CHECK (expires_at > created_at),
+    PRIMARY KEY (installation_id, idempotency_key)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_registration_idempotency_expires
+    ON registration_idempotency(expires_at, created_at);

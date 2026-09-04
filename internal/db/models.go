@@ -127,6 +127,25 @@ type Object struct {
 	CreatedAt    int64  `json:"created_at"`
 }
 
+type RegistrationIdempotency struct {
+	InstallationID string         `json:"installation_id"`
+	IdempotencyKey string         `json:"idempotency_key"`
+	RequestHmac    string         `json:"request_hmac"`
+	CommandID      int64          `json:"command_id"`
+	Status         int64          `json:"status"`
+	ResultBody     string         `json:"result_body"`
+	Etag           sql.NullString `json:"etag"`
+	ParentEtag     sql.NullString `json:"parent_etag"`
+	Location       sql.NullString `json:"location"`
+	CacheControl   sql.NullString `json:"cache_control"`
+	Pragma         sql.NullString `json:"pragma"`
+	StreamEpoch    string         `json:"stream_epoch"`
+	Geid           int64          `json:"geid"`
+	StateCursor    string         `json:"state_cursor"`
+	CreatedAt      int64          `json:"created_at"`
+	ExpiresAt      int64          `json:"expires_at"`
+}
+
 type Role struct {
 	Key         string `json:"key"`
 	DisplayName string `json:"display_name"`

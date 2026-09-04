@@ -70,16 +70,25 @@ type HTTPCommandIdentity struct {
 	ControlConnectionID string
 }
 
-// InstallationCommandIdentity is the stable identity of an unauthenticated
-// installation-scoped mutation. Activation uses the SHA-256 activation-code
-// digest; other public mutations use the fixed public namespace in
-// http_mutation.go and rely on the keyed request HMAC to bind their full DTO.
+// InstallationCommandIdentity is the stable identity of the first-owner
+// activation exception. The SHA-256 activation-code digest is part of the
+// identity and is never replaced by a generic public-command namespace.
 type InstallationCommandIdentity struct {
 	InstallationID     string
 	ActivationCodeHash string
 	Method             string
 	RouteTemplate      string
 	CanonicalDTO       json.RawMessage
+}
+
+// RegistrationCommandIdentity is the stable identity of unauthenticated user
+// registration. It deliberately has no activation-code field; registration
+// retries use a separate durable table and request-HMAC namespace.
+type RegistrationCommandIdentity struct {
+	InstallationID string
+	Method         string
+	RouteTemplate  string
+	CanonicalDTO   json.RawMessage
 }
 
 // RequestIdentitySigner computes the HMAC of canonical authenticated request
@@ -127,6 +136,14 @@ type DurableIdempotency struct {
 // first-owner activation exception. It uses a separate store shape because the
 // command creates the principal referenced by ordinary durable records.
 type DurableActivationIdempotency struct {
+	stores *store.Stores
+	signer *RequestIdentitySigner
+}
+
+// DurableRegistrationIdempotency provides restart-safe deduplication for the
+// public registration command. It is separate from activation because only
+// first-owner activation may use the bootstrap exception's storage contract.
+type DurableRegistrationIdempotency struct {
 	stores *store.Stores
 	signer *RequestIdentitySigner
 }
@@ -206,12 +223,22 @@ func NewDurableIdempotency(stores *store.Stores, signer *RequestIdentitySigner) 
 	return &DurableIdempotency{stores: stores, signer: signer}, nil
 }
 
-// NewDurableActivationIdempotency creates installation-scoped retry support.
+// NewDurableActivationIdempotency creates retry support for first-owner
+// activation's installation-scoped exception.
 func NewDurableActivationIdempotency(stores *store.Stores, signer *RequestIdentitySigner) (*DurableActivationIdempotency, error) {
 	if stores == nil || stores.ActivationIdempotency == nil || signer == nil {
 		return nil, ErrInvalidRequestIdentity
 	}
 	return &DurableActivationIdempotency{stores: stores, signer: signer}, nil
+}
+
+// NewDurableRegistrationIdempotency creates installation-scoped retry support
+// for registration using its dedicated durable store.
+func NewDurableRegistrationIdempotency(stores *store.Stores, signer *RequestIdentitySigner) (*DurableRegistrationIdempotency, error) {
+	if stores == nil || stores.RegistrationIdempotency == nil || signer == nil {
+		return nil, ErrInvalidRequestIdentity
+	}
+	return &DurableRegistrationIdempotency{stores: stores, signer: signer}, nil
 }
 
 // Lookup returns a completed matching activation result or found=false. A
@@ -252,27 +279,6 @@ func (d *DurableActivationIdempotency) Lookup(ctx context.Context, identity Inst
 		Checkpoint:  result.Checkpoint,
 		StateCursor: result.StateCursor,
 	}, true, nil
-}
-
-// LookupPublic returns a completed installation-scoped public mutation and
-// suppresses checkpoint metadata when the record belongs to an older process
-// epoch. Public identities use the same durable table as activation because
-// both commands run before an authenticated principal is available.
-func (d *DurableActivationIdempotency) LookupPublic(ctx context.Context, identity InstallationCommandIdentity, idempotencyKey, currentEpoch string) (DurableReplay, bool, error) {
-	replay, found, err := d.Lookup(ctx, identity, idempotencyKey)
-	if err != nil || !found {
-		return DurableReplay{}, found, err
-	}
-	result := DurableReplay{
-		CommandID: replay.CommandID, Status: replay.Status, Body: replay.Body, Headers: replay.Headers,
-		Checkpoint: replay.Checkpoint, StateCursor: replay.StateCursor,
-	}
-	if currentEpoch != "" && result.Checkpoint.StreamEpoch != "" && result.Checkpoint.StreamEpoch != currentEpoch {
-		result.SyncRequired = true
-		result.Checkpoint = Checkpoint{}
-		result.StateCursor = ""
-	}
-	return result, true, nil
 }
 
 // Admit reserves a shared durable retry slot in the activation transaction.
@@ -319,13 +325,78 @@ func (d *DurableActivationIdempotency) Save(ctx context.Context, txStores *store
 	})
 }
 
-// SavePublic persists one public mutation response in the same transaction as
-// its domain change. The installation-scoped record remains replayable even
-// though the mutation creates or changes no authenticated principal.
-func (d *DurableActivationIdempotency) SavePublic(ctx context.Context, txStores *store.Stores, identity InstallationCommandIdentity, idempotencyKey string, result CanonicalCommandResult) error {
-	return d.Save(ctx, txStores, identity, idempotencyKey, ActivationCommandResult{
-		CommandID: result.CommandID, Status: result.Status, Body: result.Body,
-		Headers: result.Headers, Checkpoint: result.Checkpoint, StateCursor: result.StateCursor,
+// Lookup returns a completed matching registration result or found=false. A
+// matching key from another canonical request is reported as a mismatch.
+func (d *DurableRegistrationIdempotency) Lookup(ctx context.Context, identity RegistrationCommandIdentity, idempotencyKey, currentEpoch string) (DurableReplay, bool, error) {
+	if d == nil || !IdempotencyKeyValid(idempotencyKey) || validateStreamEpoch(currentEpoch) != nil {
+		return DurableReplay{}, false, ErrInvalidRequestIdentity
+	}
+	requestHMAC, err := d.signer.SumRegistration(identity)
+	if err != nil {
+		return DurableReplay{}, false, err
+	}
+	record, err := d.stores.RegistrationIdempotency.Lookup(ctx, identity.InstallationID, idempotencyKey)
+	if errors.Is(err, store.ErrNotFound) {
+		return DurableReplay{}, false, nil
+	}
+	if err != nil {
+		return DurableReplay{}, false, err
+	}
+	if !equalRequestHMAC(record.RequestHMAC, requestHMAC) {
+		return DurableReplay{}, true, ErrIdempotencyMismatch
+	}
+	result, err := canonicalCommandResultFromRegistrationRecord(*record)
+	if err != nil {
+		return DurableReplay{}, true, err
+	}
+	replay := DurableReplay{
+		CommandID: result.CommandID,
+		Status:    result.Status,
+		Body:      append(json.RawMessage(nil), result.Body...),
+		Headers:   result.Headers,
+	}
+	if result.Checkpoint.StreamEpoch != currentEpoch {
+		replay.SyncRequired = true
+		return replay, true, nil
+	}
+	replay.Checkpoint = result.Checkpoint
+	replay.StateCursor = result.StateCursor
+	return replay, true, nil
+}
+
+// Admit reserves a shared durable retry slot in the registration transaction.
+func (d *DurableRegistrationIdempotency) Admit(ctx context.Context, txStores *store.Stores) error {
+	if d == nil || txStores == nil || txStores.RegistrationIdempotency == nil {
+		return ErrInvalidRequestIdentity
+	}
+	return txStores.RegistrationIdempotency.Admit(ctx)
+}
+
+// Save persists one registration response in the same transaction as the
+// account mutation, including the exact publication checkpoint and cursor.
+func (d *DurableRegistrationIdempotency) Save(ctx context.Context, txStores *store.Stores, identity RegistrationCommandIdentity, idempotencyKey string, result CanonicalCommandResult) error {
+	if d == nil || txStores == nil || txStores.RegistrationIdempotency == nil || !IdempotencyKeyValid(idempotencyKey) {
+		return ErrInvalidRequestIdentity
+	}
+	requestHMAC, err := d.signer.SumRegistration(identity)
+	if err != nil {
+		return err
+	}
+	result, err = canonicalizeCommandResult(result)
+	if err != nil {
+		return err
+	}
+	return txStores.RegistrationIdempotency.Save(ctx, store.RegistrationIdempotencyRecord{
+		InstallationID: identity.InstallationID,
+		IdempotencyKey: idempotencyKey,
+		RequestHMAC:    requestHMAC,
+		CommandID:      result.CommandID,
+		Status:         int64(result.Status),
+		ResultBody:     result.Body,
+		Headers:        result.Headers,
+		StreamEpoch:    result.Checkpoint.StreamEpoch,
+		GEID:           result.Checkpoint.GEID,
+		StateCursor:    result.StateCursor,
 	})
 }
 
@@ -424,6 +495,19 @@ func canonicalCommandResultFromRecord(record store.CommandIdempotencyRecord) (Ca
 	})
 }
 
+// canonicalCommandResultFromRegistrationRecord converts a registration store
+// record through the same replay validation as authenticated commands.
+func canonicalCommandResultFromRegistrationRecord(record store.RegistrationIdempotencyRecord) (CanonicalCommandResult, error) {
+	return canonicalizeCommandResult(CanonicalCommandResult{
+		CommandID:   record.CommandID,
+		Status:      int(record.Status),
+		Body:        record.ResultBody,
+		Headers:     record.Headers,
+		Checkpoint:  Checkpoint{StreamEpoch: record.StreamEpoch, GEID: record.GEID},
+		StateCursor: record.StateCursor,
+	})
+}
+
 // canonicalizeCommandResult normalizes the JSON response and validates the
 // state fields that future HTTP adapters copy into response headers.
 func canonicalizeCommandResult(result CanonicalCommandResult) (CanonicalCommandResult, error) {
@@ -477,8 +561,8 @@ func canonicalHTTPCommandIdentity(identity HTTPCommandIdentity) ([]byte, error) 
 	return []byte(builder.String()), nil
 }
 
-// canonicalInstallationCommandIdentity normalizes the bootstrap identity while
-// keeping its code/password values out of durable storage.
+// canonicalInstallationCommandIdentity normalizes the bootstrap activation
+// identity while keeping its code/password values out of durable storage.
 func canonicalInstallationCommandIdentity(identity InstallationCommandIdentity) ([]byte, error) {
 	if !installationIdentityPattern.MatchString(identity.InstallationID) || !activationCodeHashPattern.MatchString(identity.ActivationCodeHash) || identity.Method == "" || identity.Method != strings.ToUpper(identity.Method) || identity.RouteTemplate == "" || len(identity.RouteTemplate) > 256 || hasControlCharacters(identity.RouteTemplate) {
 		return nil, ErrInvalidRequestIdentity
@@ -496,6 +580,24 @@ func canonicalInstallationCommandIdentity(identity InstallationCommandIdentity) 
 	return []byte(builder.String()), nil
 }
 
+// canonicalRegistrationCommandIdentity normalizes an installation-scoped
+// registration identity without introducing an activation-code namespace.
+func canonicalRegistrationCommandIdentity(identity RegistrationCommandIdentity) ([]byte, error) {
+	if !installationIdentityPattern.MatchString(identity.InstallationID) || identity.Method == "" || identity.Method != strings.ToUpper(identity.Method) || identity.RouteTemplate == "" || len(identity.RouteTemplate) > 256 || hasControlCharacters(identity.RouteTemplate) {
+		return nil, ErrInvalidRequestIdentity
+	}
+	dto, err := canonicalJSONValue(identity.CanonicalDTO)
+	if err != nil {
+		return nil, ErrInvalidRequestIdentity
+	}
+	var builder strings.Builder
+	appendIdentityPart(&builder, "installation", identity.InstallationID)
+	appendIdentityPart(&builder, "method", identity.Method)
+	appendIdentityPart(&builder, "route", identity.RouteTemplate)
+	appendIdentityPart(&builder, "dto", string(dto))
+	return []byte(builder.String()), nil
+}
+
 // SumInstallation returns the HMAC of an installation-scoped activation
 // identity. The canonical bytes include the activation-code digest and
 // validated account DTO; durable storage receives only the keyed digest.
@@ -504,6 +606,22 @@ func (s *RequestIdentitySigner) SumInstallation(identity InstallationCommandIden
 		return "", ErrInvalidRequestIdentity
 	}
 	canonical, err := canonicalInstallationCommandIdentity(identity)
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, s.key)
+	_, _ = mac.Write(canonical)
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+// SumRegistration returns the HMAC of an installation-scoped registration
+// identity. Its canonical representation is independent from first-owner
+// activation and its activation-code digest.
+func (s *RequestIdentitySigner) SumRegistration(identity RegistrationCommandIdentity) (string, error) {
+	if s == nil || len(s.key) < sha256.Size {
+		return "", ErrInvalidRequestIdentity
+	}
+	canonical, err := canonicalRegistrationCommandIdentity(identity)
 	if err != nil {
 		return "", err
 	}

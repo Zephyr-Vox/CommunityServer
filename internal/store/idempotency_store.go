@@ -120,6 +120,9 @@ func admitDurableIdempotency(ctx context.Context, q *db.Queries, now func() int6
 	if _, err := q.DeleteExpiredActivationIdempotency(ctx, current); err != nil {
 		return mapError(err)
 	}
+	if _, err := q.DeleteExpiredRegistrationIdempotency(ctx, current); err != nil {
+		return mapError(err)
+	}
 	count, err := q.CountDurableIdempotency(ctx)
 	if err != nil {
 		return mapError(err)
@@ -185,7 +188,11 @@ func (s *IdempotencyStore) Prune(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, mapError(err)
 	}
-	return commands + activations, nil
+	registrations, err := s.q.DeleteExpiredRegistrationIdempotency(ctx, now)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return commands + activations + registrations, nil
 }
 
 // commandIdempotencyRecordFromDB converts generated nullable resource headers

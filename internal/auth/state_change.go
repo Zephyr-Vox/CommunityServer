@@ -25,14 +25,21 @@ type StateChange struct {
 // been reserved but before the database transaction commits; it is used for
 // durable response records that must share the same commit.
 type AccountMutationResult struct {
-	Value        any
-	Change       StateChange
-	Noop         bool
-	BeforeCommit func(context.Context, *store.Stores, int64, realtime.PublicationResult) error
+	Value              any
+	Change             StateChange
+	Noop               bool
+	BeforeCommit       func(context.Context, *store.Stores, int64, realtime.PublicationResult) error
+	PreparePublication AccountPublicationPreparation
 	// AfterPublish runs while the principal barriers and mutation gate are
 	// still held, immediately after StatePublication becomes visible.
 	AfterPublish func(context.Context) error
 }
+
+// AccountPublicationPreparation adjusts the unpublished account candidate and
+// returns any in-process teardown that must run after the database commit but
+// before StatePublication. It is used for account-wide access loss so sockets,
+// UDP authority and the published account event share one linearization point.
+type AccountPublicationPreparation func(context.Context, *realtime.StateCandidate) (realtime.AccountTeardownPlan, error)
 
 // AccountMutation is one account-domain transaction executed by the ordered
 // realtime writer. The callback must perform only rollbackable persistence and
@@ -44,14 +51,14 @@ type AccountMutation func(context.Context, *store.Stores) (AccountMutationResult
 // projection mutation follows the same commit boundary as channel and RBAC
 // commands.
 type StateMutationRuntime struct {
-	stores        *store.Stores
-	principals    *PrincipalCache
-	state         *realtime.StateStore
-	sequencer     *realtime.PostCommitSequencer
-	gate          MutationGate
-	durable       *realtime.DurableIdempotency
-	publicDurable *realtime.DurableActivationIdempotency
-	cursors       realtime.StateCursorIssuer
+	stores              *store.Stores
+	principals          *PrincipalCache
+	state               *realtime.StateStore
+	sequencer           *realtime.PostCommitSequencer
+	gate                MutationGate
+	durable             *realtime.DurableIdempotency
+	registrationDurable *realtime.DurableRegistrationIdempotency
+	cursors             realtime.StateCursorIssuer
 }
 
 // SetDurableIdempotency installs restart-safe HTTP command persistence for
@@ -61,10 +68,10 @@ func (r *StateMutationRuntime) SetDurableIdempotency(durable *realtime.DurableId
 	r.durable = durable
 }
 
-// SetPublicDurableIdempotency installs installation-scoped durable persistence
-// for public account creation before an authenticated principal exists.
-func (r *StateMutationRuntime) SetPublicDurableIdempotency(durable *realtime.DurableActivationIdempotency) {
-	r.publicDurable = durable
+// SetRegistrationDurableIdempotency installs installation-scoped durable
+// persistence for registration before an authenticated principal exists.
+func (r *StateMutationRuntime) SetRegistrationDurableIdempotency(durable *realtime.DurableRegistrationIdempotency) {
+	r.registrationDurable = durable
 }
 
 // SetStateCursorIssuer installs the process-local signer used to return the
@@ -74,8 +81,8 @@ func (r *StateMutationRuntime) SetStateCursorIssuer(cursors realtime.StateCursor
 }
 
 // CurrentCheckpoint returns the current immutable state checkpoint for
-// activation replay epoch checks. A zero checkpoint means the runtime is not
-// fully assembled.
+// installation-scoped replay epoch checks. A zero checkpoint means the runtime
+// is not fully assembled.
 func (r *StateMutationRuntime) CurrentCheckpoint() realtime.Checkpoint {
 	if r == nil || r.state == nil {
 		return realtime.Checkpoint{}
@@ -104,21 +111,21 @@ func (r *StateMutationRuntime) PrepareHTTPMutation(ctx context.Context, command 
 	return realtime.WithHTTPMutationCommand(ctx, command), realtime.DurableReplay{}, false, nil
 }
 
-// PreparePublicHTTPMutation checks completed installation-scoped public
-// account mutations before registration enters the sequencer.
-func (r *StateMutationRuntime) PreparePublicHTTPMutation(ctx context.Context, command realtime.PublicHTTPMutationCommand) (context.Context, realtime.DurableReplay, bool, error) {
-	if r == nil || r.publicDurable == nil || r.state == nil {
-		return nil, realtime.DurableReplay{}, false, errors.New("auth: public durable mutation runtime unavailable")
+// PrepareRegistrationHTTPMutation checks completed installation-scoped
+// registration results before registration enters the sequencer.
+func (r *StateMutationRuntime) PrepareRegistrationHTTPMutation(ctx context.Context, command realtime.RegistrationHTTPMutationCommand) (context.Context, realtime.DurableReplay, bool, error) {
+	if r == nil || r.registrationDurable == nil || r.state == nil {
+		return nil, realtime.DurableReplay{}, false, errors.New("auth: registration durable mutation runtime unavailable")
 	}
 	version := r.state.Current()
 	if version == nil {
 		return nil, realtime.DurableReplay{}, false, errors.New("auth: account state unavailable")
 	}
-	replay, found, err := r.publicDurable.LookupPublic(ctx, command.Identity, command.IdempotencyKey, version.Checkpoint().StreamEpoch)
+	replay, found, err := r.registrationDurable.Lookup(ctx, command.Identity, command.IdempotencyKey, version.Checkpoint().StreamEpoch)
 	if err != nil || found {
 		return nil, replay, found, err
 	}
-	return realtime.WithPublicHTTPMutationCommand(ctx, command), realtime.DurableReplay{}, false, nil
+	return realtime.WithRegistrationHTTPMutationCommand(ctx, command), realtime.DurableReplay{}, false, nil
 }
 
 // NewStateMutationRuntime creates the account command runtime. All supplied
@@ -145,14 +152,14 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 		return nil, errors.New("auth: state mutation runtime unavailable")
 	}
 	command, durableCommand := realtime.HTTPMutationCommandFromContext(ctx)
-	publicCommand, publicDurableCommand := realtime.PublicHTTPMutationCommandFromContext(ctx)
+	registrationCommand, registrationDurableCommand := realtime.RegistrationHTTPMutationCommandFromContext(ctx)
 	responseBuilder, hasResponseBuilder := realtime.HTTPMutationResponseBuilderFromContext(ctx)
 	stateResult, _ := realtime.HTTPMutationStateFromContext(ctx)
-	if durableCommand && publicDurableCommand {
+	if durableCommand && registrationDurableCommand {
 		return nil, errors.New("auth: multiple durable HTTP mutation identities")
 	}
-	durableMutation := durableCommand || publicDurableCommand
-	if (durableCommand && r.durable == nil) || (publicDurableCommand && r.publicDurable == nil) || (durableMutation && (!hasResponseBuilder || responseBuilder == nil)) {
+	durableMutation := durableCommand || registrationDurableCommand
+	if (durableCommand && r.durable == nil) || (registrationDurableCommand && r.registrationDurable == nil) || (durableMutation && (!hasResponseBuilder || responseBuilder == nil)) {
 		return nil, errors.New("auth: durable HTTP mutation dependencies unavailable")
 	}
 	completion, err := r.sequencer.Submit(ctx, realtime.PostCommitCommand{
@@ -178,8 +185,8 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 				var replay realtime.DurableReplay
 				var found bool
 				var err error
-				if publicDurableCommand {
-					replay, found, err = r.publicDurable.LookupPublic(commandCtx, publicCommand.Identity, publicCommand.IdempotencyKey, version.Checkpoint().StreamEpoch)
+				if registrationDurableCommand {
+					replay, found, err = r.registrationDurable.Lookup(commandCtx, registrationCommand.Identity, registrationCommand.IdempotencyKey, version.Checkpoint().StreamEpoch)
 				} else {
 					replay, found, err = r.durable.Lookup(commandCtx, command.Identity, command.IdempotencyKey, version.Checkpoint().StreamEpoch)
 				}
@@ -213,8 +220,8 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 			txStores := r.stores.WithTx(tx)
 			if durableMutation {
 				var err error
-				if publicDurableCommand {
-					err = r.publicDurable.Admit(commandCtx, txStores)
+				if registrationDurableCommand {
+					err = r.registrationDurable.Admit(commandCtx, txStores)
 				} else {
 					err = r.durable.Admit(commandCtx, txStores)
 				}
@@ -254,8 +261,8 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 						Checkpoint: checkpoint, StateCursor: cursor,
 					}
 					var saveErr error
-					if publicDurableCommand {
-						saveErr = r.publicDurable.SavePublic(commandCtx, txStores, publicCommand.Identity, publicCommand.IdempotencyKey, canonical)
+					if registrationDurableCommand {
+						saveErr = r.registrationDurable.Save(commandCtx, txStores, registrationCommand.Identity, registrationCommand.IdempotencyKey, canonical)
 					} else {
 						saveErr = r.durable.Save(commandCtx, txStores, command.Identity, command.IdempotencyKey, canonical)
 					}
@@ -282,10 +289,21 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			events, err := accountStateEvents(result.Change, candidate.Version())
+			var beforePublish func(context.Context) error
+			var preparationEvents []realtime.StateEventTemplate
+			if result.PreparePublication != nil {
+				plan, err := result.PreparePublication(commandCtx, candidate)
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				beforePublish = plan.BeforePublish
+				preparationEvents = plan.Events
+			}
+			accountEvents, err := accountStateEvents(result.Change, candidate.Version())
 			if err != nil {
 				return realtime.CommandOutput{}, err
 			}
+			events := append(preparationEvents, accountEvents...)
 			visibilityUserIDs := make([]int64, 0, len(candidate.Version().Users()))
 			for _, user := range candidate.Version().Users() {
 				visibilityUserIDs = append(visibilityUserIDs, user.ID)
@@ -329,8 +347,8 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 					Checkpoint: reserved.Checkpoint, StateCursor: cursor,
 				}
 				var saveErr error
-				if publicDurableCommand {
-					saveErr = r.publicDurable.SavePublic(commandCtx, txStores, publicCommand.Identity, publicCommand.IdempotencyKey, canonical)
+				if registrationDurableCommand {
+					saveErr = r.registrationDurable.Save(commandCtx, txStores, registrationCommand.Identity, registrationCommand.IdempotencyKey, canonical)
 				} else {
 					saveErr = r.durable.Save(commandCtx, txStores, command.Identity, command.IdempotencyKey, canonical)
 				}
@@ -356,7 +374,7 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 					r.principals.Invalidate(userID)
 				}
 			}
-			return realtime.CommandOutput{Value: result.Value, AfterPublish: result.AfterPublish}, nil
+			return realtime.CommandOutput{Value: result.Value, BeforePublish: beforePublish, AfterPublish: result.AfterPublish}, nil
 		},
 	})
 	if err != nil {
@@ -400,6 +418,36 @@ func acquireMutation(ctx context.Context, gate MutationGate) (func(), error) {
 		return func() {}, nil
 	}
 	return gate.Acquire(ctx)
+}
+
+type accountTeardownPreparer interface {
+	PrepareAccountTeardown(int64, string, *realtime.StateCandidate) (realtime.AccountTeardownPlan, error)
+}
+
+// accountTeardownPreparation adapts the optional realtime coordinator plan to
+// account services. Focused service tests may provide only ConnectionRevoker;
+// that fallback still clears the candidate and defers disconnection until the
+// transaction has committed.
+func accountTeardownPreparation(revoker ConnectionRevoker, userID int64, reason string) AccountPublicationPreparation {
+	return func(_ context.Context, candidate *realtime.StateCandidate) (realtime.AccountTeardownPlan, error) {
+		if preparer, ok := revoker.(accountTeardownPreparer); ok {
+			return preparer.PrepareAccountTeardown(userID, reason, candidate)
+		}
+		if err := candidate.ClearPresence(userID); err != nil {
+			return realtime.AccountTeardownPlan{}, err
+		}
+		if err := candidate.SetVoiceAuthority(userID, nil); err != nil {
+			return realtime.AccountTeardownPlan{}, err
+		}
+		plan := realtime.AccountTeardownPlan{}
+		if revoker != nil {
+			plan.BeforePublish = func(context.Context) error {
+				revoker.DisconnectUser(userID, reason)
+				return nil
+			}
+		}
+		return plan, nil
+	}
 }
 
 // accountStateEvents creates the canonical user events from the exact

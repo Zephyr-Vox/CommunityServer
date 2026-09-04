@@ -58,8 +58,9 @@ func (s *UserService) SetStateCommandRuntime(runtime *StateMutationRuntime) {
 	s.runtime = runtime
 }
 
-// SetConnectionRevoker installs the lifecycle owner notified after kick, ban,
-// and account deletion. Server assembly calls it before routes accept requests.
+// SetConnectionRevoker installs the lifecycle owner used to linearize kick,
+// ban, and account-deletion teardown with their account publications. Server
+// assembly calls it before routes accept requests.
 func (s *UserService) SetConnectionRevoker(revoker ConnectionRevoker) {
 	s.connections = revoker
 }
@@ -317,8 +318,8 @@ func (s *UserService) Kick(ctx context.Context, actorID, userID int64) error {
 				return AccountMutationResult{}, err
 			}
 			return AccountMutationResult{
-				Change:       StateChange{EventType: "user.updated", UserID: userID},
-				AfterPublish: func(context.Context) error { s.disconnectUser(userID, "kicked"); return nil },
+				Change:             StateChange{EventType: "user.updated", UserID: userID},
+				PreparePublication: accountTeardownPreparation(s.connections, userID, "kicked"),
 			}, nil
 		})
 		if err != nil {
@@ -390,8 +391,8 @@ func (s *UserService) Ban(ctx context.Context, actorID, userID int64) error {
 				return AccountMutationResult{}, err
 			}
 			return AccountMutationResult{
-				Change:       StateChange{EventType: "user.updated", UserID: userID},
-				AfterPublish: func(context.Context) error { s.disconnectUser(userID, "banned"); return nil },
+				Change:             StateChange{EventType: "user.updated", UserID: userID},
+				PreparePublication: accountTeardownPreparation(s.connections, userID, "banned"),
 			}, nil
 		})
 		if err != nil {
@@ -515,8 +516,9 @@ func (s *UserService) Delete(ctx context.Context, actorID, userID int64) error {
 				avatarName = user.Avatar.String
 			}
 			return AccountMutationResult{
-				Value: avatarName, Change: StateChange{EventType: "user.deleted", UserID: userID},
-				AfterPublish: func(context.Context) error { s.disconnectUser(userID, "account_deleted"); return nil },
+				Value:              avatarName,
+				Change:             StateChange{EventType: "user.deleted", UserID: userID},
+				PreparePublication: accountTeardownPreparation(s.connections, userID, "account_deleted"),
 			}, nil
 		})
 		if state, ok := realtime.HTTPMutationStateFromContext(ctx); ok && state.Replay != nil {

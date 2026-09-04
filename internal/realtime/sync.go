@@ -551,6 +551,15 @@ func snapshotVoiceAuthorityFor(userID int64, version *StateVersion) *SnapshotVoi
 	if !ok {
 		return nil
 	}
+	return snapshotVoiceAuthorityValue(&authority)
+}
+
+// snapshotVoiceAuthorityValue converts one complete authority tuple to the
+// recipient-owned wire projection without consulting mutable coordinator state.
+func snapshotVoiceAuthorityValue(authority *VoiceAuthority) *SnapshotVoiceAuthority {
+	if authority == nil {
+		return nil
+	}
 	return &SnapshotVoiceAuthority{
 		ChannelID:                strconv.FormatInt(authority.ChannelID, 10),
 		ControlConnectionID:      fmt.Sprintf("%x", authority.ControlConnectionID),

@@ -53,7 +53,7 @@ type AuthService struct {
 	runtime     *StateMutationRuntime
 }
 
-// SetConnectionRevoker installs the lifecycle owner notified by session and
+// SetConnectionRevoker installs the lifecycle owner used by session and
 // account revocations. Server assembly calls it before routes accept requests;
 // a nil value leaves the service usable for HTTP-only tests.
 func (s *AuthService) SetConnectionRevoker(revoker ConnectionRevoker) {
@@ -219,8 +219,8 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID int64, newPassw
 				return AccountMutationResult{}, err
 			}
 			return AccountMutationResult{
-				Change:       StateChange{EventType: "user.updated", UserID: userID},
-				AfterPublish: func(context.Context) error { s.disconnectUser(userID, "password_changed"); return nil },
+				Change:             StateChange{EventType: "user.updated", UserID: userID},
+				PreparePublication: accountTeardownPreparation(s.connections, userID, "password_changed"),
 			}, nil
 		})
 		if err != nil {
@@ -279,8 +279,8 @@ func (s *AuthService) ResetPassword(ctx context.Context, actorID, userID int64, 
 				return AccountMutationResult{}, err
 			}
 			return AccountMutationResult{
-				Change:       StateChange{EventType: "user.updated", UserID: userID},
-				AfterPublish: func(context.Context) error { s.disconnectUser(userID, "password_reset"); return nil },
+				Change:             StateChange{EventType: "user.updated", UserID: userID},
+				PreparePublication: accountTeardownPreparation(s.connections, userID, "password_reset"),
 			}, nil
 		})
 		if err != nil {

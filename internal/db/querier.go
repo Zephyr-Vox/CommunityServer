@@ -33,6 +33,7 @@ type Querier interface {
 	DeleteChannelPermissionConfig(ctx context.Context, channelID sql.NullInt64) (sql.NullInt64, error)
 	DeleteExpiredActivationIdempotency(ctx context.Context, expiresAt int64) (int64, error)
 	DeleteExpiredCommandIdempotency(ctx context.Context, expiresAt int64) (int64, error)
+	DeleteExpiredRegistrationIdempotency(ctx context.Context, expiresAt int64) (int64, error)
 	DeleteExpiredSessions(ctx context.Context, expiresAt int64) (int64, error)
 	DeleteGroupAccess(ctx context.Context, arg DeleteGroupAccessParams) (GroupAccess, error)
 	DeleteGroupPermissionConfig(ctx context.Context, groupID sql.NullInt64) (sql.NullInt64, error)
@@ -59,6 +60,7 @@ type Querier interface {
 	GetMute(ctx context.Context, id int64) (ModerationMute, error)
 	GetObject(ctx context.Context, arg GetObjectParams) (Object, error)
 	GetOwnerBinding(ctx context.Context) (UserRoleBinding, error)
+	GetRegistrationIdempotency(ctx context.Context, arg GetRegistrationIdempotencyParams) (RegistrationIdempotency, error)
 	GetRoleBindingByID(ctx context.Context, id int64) (UserRoleBinding, error)
 	GetRoleByKey(ctx context.Context, key string) (Role, error)
 	GetServerPermissionConfig(ctx context.Context) (string, error)
@@ -73,6 +75,7 @@ type Querier interface {
 	InsertCommandIdempotency(ctx context.Context, arg InsertCommandIdempotencyParams) error
 	InsertGroupAccess(ctx context.Context, arg InsertGroupAccessParams) (GroupAccess, error)
 	InsertMute(ctx context.Context, arg InsertMuteParams) (ModerationMute, error)
+	InsertRegistrationIdempotency(ctx context.Context, arg InsertRegistrationIdempotencyParams) error
 	InsertRoleBinding(ctx context.Context, arg InsertRoleBindingParams) (UserRoleBinding, error)
 	ListAllChannelAccess(ctx context.Context) ([]ChannelAccess, error)
 	ListAllGroupAccess(ctx context.Context) ([]GroupAccess, error)

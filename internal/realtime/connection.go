@@ -124,6 +124,15 @@ type VoiceAuthorityCommit struct {
 	Cleanup  protocol.ActivationCleanup
 }
 
+// AccountTeardownPlan contains the state events and post-commit lifecycle
+// action needed when an account-wide mutation revokes a user's access. Events
+// are included in the account mutation's candidate; BeforePublish runs after
+// the database commit but before that candidate becomes visible.
+type AccountTeardownPlan struct {
+	Events        []StateEventTemplate
+	BeforePublish func(context.Context) error
+}
+
 // ConnectionTransport accepts non-blocking terminal-close and forced-close
 // requests. Its implementation owns normal socket writes; ForceClose exists
 // only for a shutdown deadline that has already exhausted graceful delivery.
@@ -753,6 +762,39 @@ func (c *ConnectionCoordinator) DisconnectUser(userID int64, reason string) {
 		return
 	}
 	c.disconnectMatching(userID, reason, func(ControlConnectionRef) bool { return true })
+}
+
+// PrepareAccountTeardown removes the target user's runtime presence and voice
+// authority from candidate, then returns a lifecycle action that revokes every
+// current control connection after the database transaction commits. The caller
+// must hold the target principal mutation barrier until BeforePublish returns.
+func (c *ConnectionCoordinator) PrepareAccountTeardown(userID int64, reason string, candidate *StateCandidate) (AccountTeardownPlan, error) {
+	if c == nil || userID <= 0 || candidate == nil || candidate.Version() == nil {
+		return AccountTeardownPlan{}, ErrInvalidConnection
+	}
+	var previous *VoiceAuthority
+	if authority, ok := c.VoiceAuthority(userID); ok {
+		previous = &authority
+	} else if authority, ok := candidate.Version().VoiceAuthority(userID); ok {
+		previous = &authority
+	}
+	if err := candidate.ClearPresence(userID); err != nil {
+		return AccountTeardownPlan{}, err
+	}
+	if err := candidate.SetVoiceAuthority(userID, nil); err != nil {
+		return AccountTeardownPlan{}, err
+	}
+	events, err := voiceAuthorityEventTemplates(previous, nil, reason)
+	if err != nil {
+		return AccountTeardownPlan{}, err
+	}
+	return AccountTeardownPlan{
+		Events: events,
+		BeforePublish: func(context.Context) error {
+			c.DisconnectUser(userID, reason)
+			return nil
+		},
+	}, nil
 }
 
 // DisconnectAll marks every opening or active control connection closing. It

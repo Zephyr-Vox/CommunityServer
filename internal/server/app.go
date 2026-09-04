@@ -144,10 +144,10 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		conn.Close()
 		return nil, fmt.Errorf("server: durable command idempotency: %w", err)
 	}
-	publicDurableCommands, err := realtime.NewDurableActivationIdempotency(stores, requestSigner)
+	registrationDurableCommands, err := realtime.NewDurableRegistrationIdempotency(stores, requestSigner)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("server: public durable command idempotency: %w", err)
+		return nil, fmt.Errorf("server: registration durable command idempotency: %w", err)
 	}
 	channels := channel.NewService(stores, principals)
 	moderationSvc := moderation.NewService(stores, principals)
@@ -222,7 +222,7 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	register.SetStateMutationGate(app.mutationGate)
 	register.SetStateCommandRuntime(accountRuntime)
 	accountRuntime.SetDurableIdempotency(durableCommands)
-	accountRuntime.SetPublicDurableIdempotency(publicDurableCommands)
+	accountRuntime.SetRegistrationDurableIdempotency(registrationDurableCommands)
 	if cursors, ok := app.syncStrategy.(realtime.StateCursorIssuer); ok {
 		accountRuntime.SetStateCursorIssuer(cursors)
 		activate.SetStateCursorIssuer(cursors)

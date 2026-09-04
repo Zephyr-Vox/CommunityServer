@@ -81,6 +81,88 @@ func TestStaleVoiceTransitionCompletesWithoutFatal(t *testing.T) {
 	}
 }
 
+// TestAccountTeardownClearsRuntimeBeforePublication proves account-wide access
+// loss prepares the candidate before disconnecting connections, while the
+// coordinator/socket teardown itself waits until the database commit boundary.
+func TestAccountTeardownClearsRuntimeBeforePublication(t *testing.T) {
+	state := newLifecycleTestState(t)
+	publication := newLifecycleTestPublication(t, state)
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := reservation.Activate(lifecycleTransport{}, time.Now().Add(time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := protocol.NewManager(time.Now)
+	prepared, err := manager.Prepare(1, "desktop", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := coordinator.StageVoiceReplacement(owner, nil, 10, prepared, time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stage.Apply(manager); err != nil {
+		t.Fatal(err)
+	}
+	authority, ok := coordinator.VoiceAuthority(1)
+	if !ok {
+		t.Fatal("voice authority was not installed")
+	}
+	runtimeCandidate, err := state.BuildRuntimeCandidate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimeCandidate.SetPresence(1, realtime.Presence{Status: "online"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimeCandidate.SetVoiceAuthority(1, &authority); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publication.Commit(realtime.PublicationRequest{Candidate: runtimeCandidate}); err != nil {
+		t.Fatal(err)
+	}
+
+	candidate, err := state.BuildPersistentCandidate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := coordinator.PrepareAccountTeardown(1, "banned", candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Version().Presence(1).Status != "offline" {
+		t.Fatalf("candidate presence = %+v, want offline default", candidate.Version().Presence(1))
+	}
+	if _, ok := candidate.Version().VoiceAuthority(1); ok {
+		t.Fatal("candidate retained revoked voice authority")
+	}
+	if len(plan.Events) != 2 || plan.Events[0].EventType != "voice.revoked" || plan.Events[1].EventType != "voice.authority.updated" {
+		t.Fatalf("teardown events = %+v", plan.Events)
+	}
+	if _, ok := state.Current().VoiceAuthority(1); !ok {
+		t.Fatal("preparation published runtime state before commit")
+	}
+	if err := plan.BeforePublish(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := coordinator.VoiceAuthority(1); ok {
+		t.Fatal("connection teardown did not clear coordinator authority")
+	}
+	if _, ok := coordinator.State(owner); !ok {
+		t.Fatal("connection teardown removed lifecycle record before close completion")
+	}
+	if _, err := publication.Commit(realtime.PublicationRequest{Candidate: candidate, Events: plan.Events}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := state.Current().VoiceAuthority(1); ok {
+		t.Fatal("published account teardown retained voice authority")
+	}
+}
+
 // TestPresenceCommandRequiresUnexpiredLeaseAtCommit proves a command whose
 // auth lease expires after admission but before publication is rejected with
 // no runtime side effect.

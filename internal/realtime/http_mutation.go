@@ -14,11 +14,11 @@ type HTTPMutationCommand struct {
 	IdempotencyKey string
 }
 
-// PublicHTTPMutationCommand identifies a durable unauthenticated mutation
-// whose identity is installation-scoped. Registration uses this shape because
-// no principal exists until its transaction creates the new user.
-type PublicHTTPMutationCommand struct {
-	Identity       InstallationCommandIdentity
+// RegistrationHTTPMutationCommand identifies the durable unauthenticated
+// registration mutation. Its dedicated identity and store are separate from
+// the first-owner activation exception because no principal exists yet.
+type RegistrationHTTPMutationCommand struct {
+	Identity       RegistrationCommandIdentity
 	IdempotencyKey string
 }
 
@@ -48,10 +48,8 @@ type HTTPMutationState struct {
 	Replay    *DurableReplay
 }
 
-const publicCommandNamespace = "0000000000000000000000000000000000000000000000000000000000000000"
-
 type httpMutationCommandContextKey struct{}
-type publicHTTPMutationCommandContextKey struct{}
+type registrationHTTPMutationCommandContextKey struct{}
 type httpMutationResponseBuilderContextKey struct{}
 type httpMutationStateContextKey struct{}
 
@@ -67,36 +65,34 @@ func NewHTTPMutationCommand(identity HTTPCommandIdentity, idempotencyKey string)
 	return HTTPMutationCommand{Identity: identity, IdempotencyKey: idempotencyKey}, nil
 }
 
-// NewPublicHTTPCommandIdentity creates the installation-scoped identity for a
-// public mutation. It keeps the activation-code column in a fixed namespace;
-// the keyed request HMAC still covers the complete canonical DTO, including
-// any sensitive fields, without persisting an unkeyed digest of them.
-func NewPublicHTTPCommandIdentity(installationID, method, route string, dto any) (InstallationCommandIdentity, error) {
+// NewRegistrationHTTPCommandIdentity creates the installation-scoped identity
+// for registration. The request HMAC covers the complete canonical DTO,
+// including sensitive fields, without persisting an activation-code digest.
+func NewRegistrationHTTPCommandIdentity(installationID, method, route string, dto any) (RegistrationCommandIdentity, error) {
 	raw, err := json.Marshal(dto)
 	if err != nil {
-		return InstallationCommandIdentity{}, err
+		return RegistrationCommandIdentity{}, err
 	}
-	identity := InstallationCommandIdentity{
-		InstallationID:     installationID,
-		ActivationCodeHash: publicCommandNamespace,
-		Method:             method, RouteTemplate: route, CanonicalDTO: raw,
+	identity := RegistrationCommandIdentity{
+		InstallationID: installationID,
+		Method:         method, RouteTemplate: route, CanonicalDTO: raw,
 	}
-	if _, err := canonicalInstallationCommandIdentity(identity); err != nil {
-		return InstallationCommandIdentity{}, err
+	if _, err := canonicalRegistrationCommandIdentity(identity); err != nil {
+		return RegistrationCommandIdentity{}, err
 	}
 	return identity, nil
 }
 
-// NewPublicHTTPMutationCommand validates one installation-scoped public
-// mutation before its adapter performs durable replay lookup.
-func NewPublicHTTPMutationCommand(identity InstallationCommandIdentity, idempotencyKey string) (PublicHTTPMutationCommand, error) {
+// NewRegistrationHTTPMutationCommand validates registration before its adapter
+// performs durable replay lookup.
+func NewRegistrationHTTPMutationCommand(identity RegistrationCommandIdentity, idempotencyKey string) (RegistrationHTTPMutationCommand, error) {
 	if !IdempotencyKeyValid(idempotencyKey) {
-		return PublicHTTPMutationCommand{}, ErrInvalidIdempotencyKey
+		return RegistrationHTTPMutationCommand{}, ErrInvalidIdempotencyKey
 	}
-	if _, err := canonicalInstallationCommandIdentity(identity); err != nil {
-		return PublicHTTPMutationCommand{}, err
+	if _, err := canonicalRegistrationCommandIdentity(identity); err != nil {
+		return RegistrationHTTPMutationCommand{}, err
 	}
-	return PublicHTTPMutationCommand{Identity: identity, IdempotencyKey: idempotencyKey}, nil
+	return RegistrationHTTPMutationCommand{Identity: identity, IdempotencyKey: idempotencyKey}, nil
 }
 
 // WithHTTPMutationCommand attaches one already validated durable command to a
@@ -105,10 +101,10 @@ func WithHTTPMutationCommand(ctx context.Context, command HTTPMutationCommand) c
 	return context.WithValue(ctx, httpMutationCommandContextKey{}, command)
 }
 
-// WithPublicHTTPMutationCommand attaches an installation-scoped public
-// mutation to a request context.
-func WithPublicHTTPMutationCommand(ctx context.Context, command PublicHTTPMutationCommand) context.Context {
-	return context.WithValue(ctx, publicHTTPMutationCommandContextKey{}, command)
+// WithRegistrationHTTPMutationCommand attaches registration to a request
+// context before the account service enters the sequencer.
+func WithRegistrationHTTPMutationCommand(ctx context.Context, command RegistrationHTTPMutationCommand) context.Context {
+	return context.WithValue(ctx, registrationHTTPMutationCommandContextKey{}, command)
 }
 
 // HTTPMutationCommandFromContext returns the durable command attached by an
@@ -121,13 +117,13 @@ func HTTPMutationCommandFromContext(ctx context.Context) (HTTPMutationCommand, b
 	return command, ok
 }
 
-// PublicHTTPMutationCommandFromContext returns a public mutation attached by
+// RegistrationHTTPMutationCommandFromContext returns registration attached by
 // an unauthenticated HTTP adapter, if any.
-func PublicHTTPMutationCommandFromContext(ctx context.Context) (PublicHTTPMutationCommand, bool) {
+func RegistrationHTTPMutationCommandFromContext(ctx context.Context) (RegistrationHTTPMutationCommand, bool) {
 	if ctx == nil {
-		return PublicHTTPMutationCommand{}, false
+		return RegistrationHTTPMutationCommand{}, false
 	}
-	command, ok := ctx.Value(publicHTTPMutationCommandContextKey{}).(PublicHTTPMutationCommand)
+	command, ok := ctx.Value(registrationHTTPMutationCommandContextKey{}).(RegistrationHTTPMutationCommand)
 	return command, ok
 }
 

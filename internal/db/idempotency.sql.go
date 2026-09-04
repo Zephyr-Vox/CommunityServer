@@ -13,7 +13,8 @@ import (
 const countDurableIdempotency = `-- name: CountDurableIdempotency :one
 SELECT
     (SELECT COUNT(*) FROM command_idempotency) +
-    (SELECT COUNT(*) FROM activation_idempotency)
+    (SELECT COUNT(*) FROM activation_idempotency) +
+    (SELECT COUNT(*) FROM registration_idempotency)
 `
 
 func (q *Queries) CountDurableIdempotency(ctx context.Context) (int64, error) {
@@ -41,6 +42,18 @@ DELETE FROM command_idempotency WHERE expires_at <= ?
 
 func (q *Queries) DeleteExpiredCommandIdempotency(ctx context.Context, expiresAt int64) (int64, error) {
 	result, err := q.db.ExecContext(ctx, deleteExpiredCommandIdempotency, expiresAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const deleteExpiredRegistrationIdempotency = `-- name: DeleteExpiredRegistrationIdempotency :execrows
+DELETE FROM registration_idempotency WHERE expires_at <= ?
+`
+
+func (q *Queries) DeleteExpiredRegistrationIdempotency(ctx context.Context, expiresAt int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteExpiredRegistrationIdempotency, expiresAt)
 	if err != nil {
 		return 0, err
 	}
@@ -100,6 +113,41 @@ func (q *Queries) GetCommandIdempotency(ctx context.Context, arg GetCommandIdemp
 		&i.PrincipalID,
 		&i.IdempotencyKey,
 		&i.Endpoint,
+		&i.RequestHmac,
+		&i.CommandID,
+		&i.Status,
+		&i.ResultBody,
+		&i.Etag,
+		&i.ParentEtag,
+		&i.Location,
+		&i.CacheControl,
+		&i.Pragma,
+		&i.StreamEpoch,
+		&i.Geid,
+		&i.StateCursor,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+	)
+	return i, err
+}
+
+const getRegistrationIdempotency = `-- name: GetRegistrationIdempotency :one
+SELECT installation_id, idempotency_key, request_hmac, command_id, status, result_body, etag, parent_etag, location, cache_control, "pragma", stream_epoch, geid, state_cursor, created_at, expires_at FROM registration_idempotency
+WHERE installation_id = ? AND idempotency_key = ? AND expires_at > ?
+`
+
+type GetRegistrationIdempotencyParams struct {
+	InstallationID string `json:"installation_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	ExpiresAt      int64  `json:"expires_at"`
+}
+
+func (q *Queries) GetRegistrationIdempotency(ctx context.Context, arg GetRegistrationIdempotencyParams) (RegistrationIdempotency, error) {
+	row := q.db.QueryRowContext(ctx, getRegistrationIdempotency, arg.InstallationID, arg.IdempotencyKey, arg.ExpiresAt)
+	var i RegistrationIdempotency
+	err := row.Scan(
+		&i.InstallationID,
+		&i.IdempotencyKey,
 		&i.RequestHmac,
 		&i.CommandID,
 		&i.Status,
@@ -194,6 +242,55 @@ func (q *Queries) InsertCommandIdempotency(ctx context.Context, arg InsertComman
 		arg.PrincipalID,
 		arg.IdempotencyKey,
 		arg.Endpoint,
+		arg.RequestHmac,
+		arg.CommandID,
+		arg.Status,
+		arg.ResultBody,
+		arg.Etag,
+		arg.ParentEtag,
+		arg.Location,
+		arg.CacheControl,
+		arg.Pragma,
+		arg.StreamEpoch,
+		arg.Geid,
+		arg.StateCursor,
+		arg.CreatedAt,
+		arg.ExpiresAt,
+	)
+	return err
+}
+
+const insertRegistrationIdempotency = `-- name: InsertRegistrationIdempotency :exec
+INSERT INTO registration_idempotency (
+    installation_id, idempotency_key, request_hmac, command_id, status,
+    result_body, etag, parent_etag, location, cache_control, pragma,
+    stream_epoch, geid, state_cursor, created_at, expires_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`
+
+type InsertRegistrationIdempotencyParams struct {
+	InstallationID string         `json:"installation_id"`
+	IdempotencyKey string         `json:"idempotency_key"`
+	RequestHmac    string         `json:"request_hmac"`
+	CommandID      int64          `json:"command_id"`
+	Status         int64          `json:"status"`
+	ResultBody     string         `json:"result_body"`
+	Etag           sql.NullString `json:"etag"`
+	ParentEtag     sql.NullString `json:"parent_etag"`
+	Location       sql.NullString `json:"location"`
+	CacheControl   sql.NullString `json:"cache_control"`
+	Pragma         sql.NullString `json:"pragma"`
+	StreamEpoch    string         `json:"stream_epoch"`
+	Geid           int64          `json:"geid"`
+	StateCursor    string         `json:"state_cursor"`
+	CreatedAt      int64          `json:"created_at"`
+	ExpiresAt      int64          `json:"expires_at"`
+}
+
+func (q *Queries) InsertRegistrationIdempotency(ctx context.Context, arg InsertRegistrationIdempotencyParams) error {
+	_, err := q.db.ExecContext(ctx, insertRegistrationIdempotency,
+		arg.InstallationID,
+		arg.IdempotencyKey,
 		arg.RequestHmac,
 		arg.CommandID,
 		arg.Status,

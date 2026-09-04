@@ -199,36 +199,92 @@ func TestActivationIdempotencyUsesInstallationIdentityWithoutPlaintext(t *testin
 	}
 }
 
-func TestPublicHTTPIdentityDoesNotHashDTOIntoActivationNamespace(t *testing.T) {
-	const installationID = "0123456789abcdef0123456789abcdef"
-	type request struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	first, err := realtime.NewPublicHTTPCommandIdentity(installationID, "POST", "/api/v0/auth/register", request{
-		Username: "alice", Password: "secret123",
-	})
+func TestRegistrationIdempotencyUsesDedicatedStore(t *testing.T) {
+	stores := newStores(t)
+	ctx := context.Background()
+	installation, err := stores.Installation.Get(ctx)
 	if err != nil {
 		t.Fatal(err)
-	}
-	second, err := realtime.NewPublicHTTPCommandIdentity(installationID, "POST", "/api/v0/auth/register", request{
-		Username: "alice", Password: "other123",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.ActivationCodeHash != strings.Repeat("0", 64) || second.ActivationCodeHash != first.ActivationCodeHash {
-		t.Fatalf("public namespace hashes = %q and %q", first.ActivationCodeHash, second.ActivationCodeHash)
 	}
 	signer, err := realtime.NewRequestIdentitySigner([]byte(strings.Repeat("s", 32)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstHMAC, err := signer.SumInstallation(first)
+	durable, err := realtime.NewDurableRegistrationIdempotency(stores, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondHMAC, err := signer.SumInstallation(second)
+	identity, err := realtime.NewRegistrationHTTPCommandIdentity(installation.InstallationID, "POST", "/api/v0/auth/register", map[string]string{
+		"username": "alice", "password": "secret123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "registration-key-01"
+	result := realtime.CanonicalCommandResult{
+		CommandID:   78,
+		Status:      201,
+		Body:        []byte(`{"user":{"username":"alice"}}`),
+		Headers:     store.IdempotencyHeaders{Location: "/api/v0/users/42"},
+		Checkpoint:  realtime.Checkpoint{StreamEpoch: testEpoch, GEID: 10},
+		StateCursor: "registration-cursor",
+	}
+	tx, err := stores.BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txStores := stores.WithTx(tx)
+	if err := durable.Admit(ctx, txStores); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.Save(ctx, txStores, identity, key, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	replay, found, err := durable.Lookup(ctx, identity, key, testEpoch)
+	if err != nil || !found || replay.CommandID != result.CommandID || replay.StateCursor != result.StateCursor {
+		t.Fatalf("registration replay=%+v found=%t err=%v", replay, found, err)
+	}
+	changed := identity
+	changed.CanonicalDTO = []byte(`{"username":"alice","password":"different"}`)
+	if _, found, err := durable.Lookup(ctx, changed, key, testEpoch); !found || !errors.Is(err, realtime.ErrIdempotencyMismatch) {
+		t.Fatalf("registration identity mismatch found=%t err=%v", found, err)
+	}
+	if _, err := stores.ActivationIdempotency.Lookup(ctx, installation.InstallationID, key); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("registration result leaked into activation store: %v", err)
+	}
+}
+
+func TestRegistrationHTTPIdentityUsesDedicatedNamespace(t *testing.T) {
+	const installationID = "0123456789abcdef0123456789abcdef"
+	type request struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	first, err := realtime.NewRegistrationHTTPCommandIdentity(installationID, "POST", "/api/v0/auth/register", request{
+		Username: "alice", Password: "secret123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := realtime.NewRegistrationHTTPCommandIdentity(installationID, "POST", "/api/v0/auth/register", request{
+		Username: "alice", Password: "other123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := realtime.NewRequestIdentitySigner([]byte(strings.Repeat("s", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstHMAC, err := signer.SumRegistration(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondHMAC, err := signer.SumRegistration(second)
 	if err != nil {
 		t.Fatal(err)
 	}
