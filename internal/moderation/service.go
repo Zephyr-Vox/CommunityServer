@@ -92,6 +92,7 @@ type Service struct {
 	cursors    realtime.StateCursorIssuer
 	scheduler  *realtime.DeadlineScheduler
 	durable    *realtime.DurableIdempotency
+	voiceRelay *realtime.ConnectionCoordinator
 }
 
 // NewService creates a moderation service. Server assembly installs its command
@@ -120,6 +121,12 @@ func (s *Service) SetStateCursorIssuer(cursors realtime.StateCursorIssuer) { s.c
 // SetDurableIdempotency installs restart-safe completed HTTP command storage.
 func (s *Service) SetDurableIdempotency(durable *realtime.DurableIdempotency) {
 	s.durable = durable
+}
+
+// SetVoiceRelayCoordinator installs the per-user media gate used to serialize
+// mute publication with the final relay worker validation and fanout.
+func (s *Service) SetVoiceRelayCoordinator(coordinator *realtime.ConnectionCoordinator) {
+	s.voiceRelay = coordinator
 }
 
 // PrepareHTTPMutation checks durable completion before sequenced scope and rank
@@ -454,7 +461,14 @@ func (s *Service) runMutation(ctx context.Context, actorID, targetID int64, resp
 				unlock()
 				return nil, err
 			}
+			var releaseRelay func()
+			if s.voiceRelay != nil {
+				releaseRelay = s.voiceRelay.AcquireVoiceRelayGate(targetID)
+			} else {
+				releaseRelay = func() {}
+			}
 			return func() {
+				releaseRelay()
 				release()
 				unlock()
 			}, nil
@@ -711,7 +725,13 @@ func (s *Service) Expire(ctx context.Context, muteID int64, generation uint64, d
 				unlock()
 				return nil, err
 			}
-			return func() { release(); unlock() }, nil
+			var releaseRelay func()
+			if s.voiceRelay != nil {
+				releaseRelay = s.voiceRelay.AcquireVoiceRelayGate(targetID)
+			} else {
+				releaseRelay = func() {}
+			}
+			return func() { releaseRelay(); release(); unlock() }, nil
 		},
 		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
 			version, err := s.currentState()

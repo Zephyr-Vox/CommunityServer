@@ -71,6 +71,12 @@ type StatsSample struct {
 // StatsHandler receives transport observability samples.
 type StatsHandler func(sample StatsSample)
 
+var (
+	// ErrUDPServerStarted reports that a startup-only handler was changed after
+	// the UDP read loop was published.
+	ErrUDPServerStarted = errors.New("protocol: udp server already started")
+)
+
 // UDPServer owns the datagram read loop, s2c Send path and best-effort
 // revocation notifications. It never logs: every packet-level failure is
 // silent by design (garbage datagrams must not be able to flood the log), and
@@ -82,6 +88,7 @@ type UDPServer struct {
 	statsHandler StatsHandler
 	ingress      *IngressLimiter
 	receiveGate  func()
+	handlerMu    sync.RWMutex
 
 	connMu  sync.Mutex
 	conn    net.PacketConn
@@ -99,6 +106,41 @@ func WithStatsHandler(handler StatsHandler) UDPOption {
 	return func(s *UDPServer) {
 		s.statsHandler = handler
 	}
+}
+
+// SetFrameHandler installs the validated-media callback before Start. The
+// callback is read under a short handler lock and invoked outside protocol
+// locks; changing it after Start is rejected so startup wiring is immutable.
+func (s *UDPServer) SetFrameHandler(handler FrameHandler) error {
+	if s == nil {
+		return errors.New("protocol: nil udp server")
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.started {
+		return ErrUDPServerStarted
+	}
+	s.handlerMu.Lock()
+	s.onFrame = handler
+	s.handlerMu.Unlock()
+	return nil
+}
+
+// SetStatsHandler installs the non-blocking transport observability callback
+// before Start. It shares the same startup barrier as SetFrameHandler.
+func (s *UDPServer) SetStatsHandler(handler StatsHandler) error {
+	if s == nil {
+		return errors.New("protocol: nil udp server")
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.started {
+		return ErrUDPServerStarted
+	}
+	s.handlerMu.Lock()
+	s.statsHandler = handler
+	s.handlerMu.Unlock()
+	return nil
 }
 
 // WithReceiveGate installs a test synchronization callback immediately after
@@ -235,8 +277,11 @@ func (s *UDPServer) isClosed() bool {
 
 // reportStats delivers a transport sample when observability is configured.
 func (s *UDPServer) reportStats(sample StatsSample) {
-	if s.statsHandler != nil {
-		s.statsHandler(sample)
+	s.handlerMu.RLock()
+	handler := s.statsHandler
+	s.handlerMu.RUnlock()
+	if handler != nil {
+		handler(sample)
 	}
 }
 
@@ -570,8 +615,11 @@ func (s *UDPServer) handleDatagram(p []byte, addr net.Addr) {
 		return
 	}
 
-	if s.onFrame != nil {
-		s.onFrame(InboundFrame{
+	s.handlerMu.RLock()
+	handler := s.onFrame
+	s.handlerMu.RUnlock()
+	if handler != nil {
+		handler(InboundFrame{
 			UserID:       sess.UserID,
 			SessionID:    sessionID,
 			ChannelType:  ch.ChannelType,

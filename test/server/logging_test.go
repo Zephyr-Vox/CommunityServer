@@ -47,7 +47,7 @@ func TestServerLogsToConfiguredFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("live log missing after server.New: %v", err)
 	}
-	if !strings.Contains(string(data), "registered 59 routes") {
+	if !strings.Contains(string(data), "registered 60 routes") {
 		t.Fatalf("live log does not contain the route summary:\n%s", data)
 	}
 }

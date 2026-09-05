@@ -23,6 +23,7 @@ import (
 	"zephyr.vox/server/ce/internal/moderation"
 	"zephyr.vox/server/ce/internal/oss"
 	"zephyr.vox/server/ce/internal/realtime"
+	"zephyr.vox/server/ce/internal/relay"
 	"zephyr.vox/server/ce/internal/snowflake"
 	"zephyr.vox/server/ce/internal/store"
 	"zephyr.vox/server/ce/internal/validation"
@@ -46,6 +47,9 @@ type App struct {
 	avatar         *image.AvatarService
 	connections    *realtime.ConnectionCoordinator
 	voice          *voiceRuntime
+	relay          *relay.Relay
+	load           *relay.LoadController
+	metrics        *serverMetrics
 	connectionAuth *auth.ConnectionAuthenticator
 	upgrades       *realtime.UpgradeLimiter
 	metadata       realtime.Metadata
@@ -185,6 +189,7 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		avatar:          avatarSvc,
 		connections:     connections,
 		voice:           voice,
+		metrics:         newServerMetrics(),
 		connectionAuth:  connectionAuth,
 		upgrades:        upgrades,
 		metadata:        metadata,
@@ -194,6 +199,10 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		echo:            e,
 		logger:          logger,
 	}
+	app.metrics.connections = connections
+	app.metrics.voice = voice
+	app.voice.diagnostics = newVoiceDiagnostics()
+	app.metrics.diagnostics = app.voice.diagnostics
 	app.realtimeFatal = func(fatal error) {
 		logger.Error("realtime sequencer failed before server run", "module", "realtime", "err", fatal)
 	}
@@ -261,6 +270,7 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	channels.SetVoiceIdempotency(voiceIdempotency, requestSigner)
 	app.connectionState.SetVoiceAuthorityProjection(channels.VoiceAuthorityProjection())
 	moderationSvc.SetStateMutationGate(app.mutationGate)
+	moderationSvc.SetVoiceRelayCoordinator(connections)
 	moderationSvc.SetDurableIdempotency(durableCommands)
 	moderationSvc.SetStateCommandRuntime(app.state, app.sequencer)
 	moderationSvc.SetDeadlineScheduler(app.deadlines)
@@ -278,6 +288,47 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 		conn.Close()
 		return nil, fmt.Errorf("server: restore temporary channel schedules: %w", err)
 	}
+	loadController, err := relay.NewLoadController(relay.HardLimits{
+		GlobalPacketsPerSec:  voice.globalPacketsPerSec,
+		SessionPacketsPerSec: voice.sessionPacketsPerSec,
+	}, time.Now)
+	if err != nil {
+		_ = app.stopRealtime(context.Background())
+		conn.Close()
+		return nil, fmt.Errorf("server: load controller: %w", err)
+	}
+	app.load = loadController
+	app.metrics.load = loadController
+	app.voice.load = loadController
+	loadController.SetUpdateFunc(func(limits relay.SoftLimits) {
+		if app.relay != nil {
+			app.relay.SetSoftLimits(limits)
+		}
+	})
+	mediaRelay, err := newApplicationRelay(app)
+	if err != nil {
+		_ = app.stopRealtime(context.Background())
+		conn.Close()
+		return nil, fmt.Errorf("server: relay: %w", err)
+	}
+	app.relay = mediaRelay
+	app.metrics.relay = mediaRelay
+	app.voice.relay = mediaRelay
+	app.metrics.publication = app.publication
+	if strategy, ok := app.syncStrategy.(*realtime.FullSnapshotSyncStrategy); ok {
+		app.metrics.syncStrategy = strategy
+	}
+	if err := voice.server.SetFrameHandler(mediaRelay.Handle); err != nil {
+		_ = app.stopRealtime(context.Background())
+		conn.Close()
+		return nil, fmt.Errorf("server: relay frame handler: %w", err)
+	}
+	if err := voice.server.SetStatsHandler(app.metrics.observeProtocol); err != nil {
+		_ = app.stopRealtime(context.Background())
+		conn.Close()
+		return nil, fmt.Errorf("server: voice metrics handler: %w", err)
+	}
+	voice.loadInput = app.metrics.loadInput
 	if err := app.routes(e); err != nil {
 		_ = app.stopRealtime(context.Background())
 		conn.Close()

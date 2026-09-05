@@ -335,6 +335,40 @@ func (v *StateVersion) Mutes() []Mute {
 	return mutes
 }
 
+// EffectiveMute reports whether a user is muted for one media kind at a
+// channel, considering server, parent-group, and exact-channel scopes. It reads
+// only the immutable version and treats an expiry at or before nowMillis as
+// inactive; relay workers can therefore call it without taking a state lock.
+func (v *StateVersion) EffectiveMute(userID, channelID int64, kind string, nowMillis int64) bool {
+	if v == nil || userID <= 0 || channelID <= 0 || kind == "" || nowMillis <= 0 {
+		return false
+	}
+	channel, ok := v.persistent.channels[channelID]
+	if !ok {
+		return false
+	}
+	for _, mute := range v.persistent.mutes {
+		if mute.UserID != userID || mute.Kind != kind || (mute.ExpiresAt != nil && *mute.ExpiresAt <= nowMillis) {
+			continue
+		}
+		switch mute.Scope.Type {
+		case "server":
+			if mute.Scope.ID == 0 {
+				return true
+			}
+		case "group":
+			if channel.GroupID != nil && mute.Scope.ID == *channel.GroupID {
+				return true
+			}
+		case "channel":
+			if mute.Scope.ID == channelID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // VisibilityEpoch returns userID's monotonic visible-scope-set epoch. It is
 // zero until a later StatePublication records that user's first transition.
 func (v *StateVersion) VisibilityEpoch(userID int64) uint64 {

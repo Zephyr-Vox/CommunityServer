@@ -11,7 +11,7 @@ import (
 // endpoints alongside empty-path routes such as PATCH /api/v0/me.
 func TestRouteTable(t *testing.T) {
 	app := newTestApp(t)
-	got := make([]string, 0, 59)
+	got := make([]string, 0, 60)
 	for _, r := range app.Echo().Router().Routes() {
 		got = append(got, r.Method+" "+r.Path)
 	}
@@ -29,6 +29,7 @@ func TestRouteTable(t *testing.T) {
 		"DELETE /api/v0/rbac/roles/:key",
 		"DELETE /api/v0/users/:id",
 		"GET /api/v0/admin/invites",
+		"GET /api/v0/admin/metrics",
 		"GET /api/v0/auth/me",
 		"GET /api/v0/auth/status",
 		"GET /api/v0/channels",

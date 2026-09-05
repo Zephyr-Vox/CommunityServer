@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"zephyr.vox/server/ce/internal/protocol"
+	"zephyr.vox/server/ce/internal/relay"
 )
 
 // Start binds the process-wide UDP listener and registers its read loop and
@@ -37,8 +38,20 @@ func (v *voiceRuntime) Start(ctx context.Context, host string, port int, supervi
 		v.closeMu.Unlock()
 		return fmt.Errorf("server: listen voice %s: %w", addr, err)
 	}
+	var relayDone <-chan error
+	if v.relay != nil {
+		relayDone, err = v.relay.Start(supervisor.Context())
+		if err != nil {
+			_ = packetConn.Close()
+			v.closeMu.Unlock()
+			return fmt.Errorf("server: start voice relay: %w", err)
+		}
+	}
 	errCh, err := v.server.Start(packetConn)
 	if err != nil {
+		if v.relay != nil {
+			_ = v.relay.Close(context.Background())
+		}
 		v.closeMu.Unlock()
 		return fmt.Errorf("server: start voice: %w", err)
 	}
@@ -56,6 +69,27 @@ func (v *voiceRuntime) Start(ctx context.Context, host string, port int, supervi
 	// Keep closeMu held until all stopPurge dependencies are registered: a
 	// concurrent App.Close must not wait on purgeDone before its worker exists.
 	supervisor.Go("udp read", func(context.Context) error { return <-errCh })
+	if relayDone != nil {
+		supervisor.Go("voice relay", func(ctx context.Context) error {
+			select {
+			case err, ok := <-relayDone:
+				if !ok || ctx.Err() != nil {
+					return nil
+				}
+				return err
+			case <-ctx.Done():
+				return nil
+			}
+		})
+	}
+	if v.load != nil && v.loadInput != nil {
+		supervisor.Go("voice load controller", func(ctx context.Context) error {
+			return v.load.Run(ctx, v.loadInput)
+		})
+	}
+	if v.diagnostics != nil {
+		supervisor.Go("voice stats", v.runVoiceStats)
+	}
 	supervisor.Go("udp purge", func(context.Context) error {
 		defer close(purgeDone)
 		return v.server.RunPurge(purgeCtx, protocol.PurgeInterval)
@@ -103,6 +137,7 @@ func (v *voiceRuntime) Close() error {
 		return nil
 	}
 	v.closeOnce.Do(func() {
+		relayErr := v.stopRelay(context.Background())
 		v.closeMu.Lock()
 		v.closed = true
 		stopPurge := v.stopPurge
@@ -111,9 +146,23 @@ func (v *voiceRuntime) Close() error {
 		if stopPurge != nil {
 			stopPurge()
 		}
-		v.closeErr = v.server.Close()
+		v.closeErr = errors.Join(relayErr, v.server.Close())
 	})
 	return v.closeErr
+}
+
+// stopRelay closes the bounded media queue and waits for all fanout workers.
+// It is separate from UDPServer.Close so shutdown can stop new media work
+// before it tears down the socket that owns active sessions.
+func (v *voiceRuntime) stopRelay(ctx context.Context) error {
+	if v == nil || v.relay == nil {
+		return nil
+	}
+	err := v.relay.Close(ctx)
+	if errors.Is(err, relay.ErrRelayNotStarted) {
+		return nil
+	}
+	return err
 }
 
 // Manager returns the voice session registry for staged authority commands.

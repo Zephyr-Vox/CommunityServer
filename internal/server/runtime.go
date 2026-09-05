@@ -12,6 +12,7 @@ import (
 	"zephyr.vox/server/ce/internal/config"
 	"zephyr.vox/server/ce/internal/protocol"
 	"zephyr.vox/server/ce/internal/realtime"
+	"zephyr.vox/server/ce/internal/relay"
 
 	"github.com/labstack/echo/v5"
 )
@@ -204,13 +205,17 @@ func (a *App) ShutdownConnections(ctx context.Context) error {
 	a.connections.SetCloseObserver(nil)
 	a.connections.SetVoiceAuthorityObserver(nil)
 	a.connections.DisconnectAll(4005, "server shutdown")
+	var relayErr error
+	if a.voice != nil {
+		relayErr = a.voice.stopRelay(ctx)
+	}
 	if err := a.connections.Wait(ctx); err == nil {
-		return commandsErr
+		return errors.Join(commandsErr, relayErr)
 	} else {
 		a.connections.ForceCloseAll()
 		forceCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		return errors.Join(commandsErr, err, a.connections.Wait(forceCtx))
+		return errors.Join(commandsErr, relayErr, err, a.connections.Wait(forceCtx))
 	}
 }
 
@@ -431,13 +436,19 @@ func (a *App) closeDatabase() error {
 // voiceRuntime owns transport-only voice dependencies assembled at the
 // application boundary. Channel authority remains outside protocol.Manager.
 type voiceRuntime struct {
-	manager     *protocol.Manager
-	registry    *protocol.ChannelTypeRegistry
-	server      *protocol.UDPServer
-	revocations chan protocol.RevocationCleanup
-	expiries    chan voiceExpiry
-	connections *realtime.ConnectionCoordinator
-	fatal       func(error)
+	manager              *protocol.Manager
+	registry             *protocol.ChannelTypeRegistry
+	server               *protocol.UDPServer
+	relay                *relay.Relay
+	load                 *relay.LoadController
+	loadInput            func() relay.LoadInput
+	diagnostics          *voiceDiagnostics
+	globalPacketsPerSec  int
+	sessionPacketsPerSec int
+	revocations          chan protocol.RevocationCleanup
+	expiries             chan voiceExpiry
+	connections          *realtime.ConnectionCoordinator
+	fatal                func(error)
 
 	closeMu   sync.Mutex
 	started   bool
@@ -541,12 +552,14 @@ func newVoiceRuntime(cfg config.VoiceConfig, connections *realtime.ConnectionCoo
 	}
 	manager.SetRevocationHandler(server.HandleRevocation)
 	runtime := &voiceRuntime{
-		manager:     manager,
-		registry:    registry,
-		server:      server,
-		revocations: make(chan protocol.RevocationCleanup, realtime.MaxControlTeardownQueueItems),
-		expiries:    make(chan voiceExpiry, realtime.MaxControlTeardownQueueItems),
-		connections: connections,
+		manager:              manager,
+		registry:             registry,
+		server:               server,
+		revocations:          make(chan protocol.RevocationCleanup, realtime.MaxControlTeardownQueueItems),
+		expiries:             make(chan voiceExpiry, realtime.MaxControlTeardownQueueItems),
+		connections:          connections,
+		globalPacketsPerSec:  limits.GlobalIngressPacketsPerSec,
+		sessionPacketsPerSec: limits.SessionPacketsPerSec,
 	}
 	connections.SetVoiceAuthorityDeactivator(func(authority realtime.VoiceAuthority, _ string) {
 		drain, cleanup, err := manager.RevokeStagedForPublication(authority.VoiceSessionID, authority.UserID)

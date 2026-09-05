@@ -67,6 +67,7 @@ type Service struct {
 	cursors         realtime.StateCursorIssuer
 	durable         *realtime.DurableIdempotency
 	voiceAccessLoss VoiceAccessLossPreparation
+	voiceRelay      *realtime.ConnectionCoordinator
 }
 
 // StateChange identifies a committed RBAC mutation requiring an immutable
@@ -130,6 +131,13 @@ func (s *Service) SetDurableIdempotency(durable *realtime.DurableIdempotency) {
 // It must be configured before the RBAC routes become reachable.
 func (s *Service) SetVoiceAccessLossPreparation(preparation VoiceAccessLossPreparation) {
 	s.voiceAccessLoss = preparation
+}
+
+// SetVoiceRelayCoordinator installs the source-gate coordinator used to
+// serialize RBAC visibility mutations with relay workers. It must be set before
+// state-changing RBAC requests are admitted.
+func (s *Service) SetVoiceRelayCoordinator(coordinator *realtime.ConnectionCoordinator) {
+	s.voiceRelay = coordinator
 }
 
 // StateCommand identifies the exact command and state checkpoint completed by

@@ -65,7 +65,17 @@ func (s *Service) runMutation(ctx context.Context, userIDs []int64, response mut
 				unlock()
 				return nil, err
 			}
+			var releaseRelay func()
+			if s.voiceRelay != nil {
+				// ACL, role, and config candidates can revoke any authority in
+				// the current projection. Acquire all source gates before the
+				// publication reservation establishes its lock boundary.
+				releaseRelay = s.voiceRelay.AcquireCurrentVoiceRelayGates()
+			} else {
+				releaseRelay = func() {}
+			}
 			return func() {
+				releaseRelay()
 				release()
 				unlock()
 			}, nil

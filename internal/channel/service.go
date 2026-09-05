@@ -1306,7 +1306,17 @@ func (s *Service) runMutation(ctx context.Context, actorID int64, response mutat
 				unlock()
 				return nil, err
 			}
+			var releaseRelay func()
+			if s.connections != nil {
+				// Access-loss projection may revoke any currently active voice
+				// authority. Establish all source gates before Reserve takes the
+				// StatePublication lock so publication never waits on relay state.
+				releaseRelay = s.connections.AcquireCurrentVoiceRelayGates()
+			} else {
+				releaseRelay = func() {}
+			}
 			return func() {
+				releaseRelay()
 				release()
 				unlock()
 			}, nil
@@ -1817,7 +1827,22 @@ func (s *Service) RestoreTemporarySchedules(ctx context.Context) error {
 func (s *Service) ExpireTemporary(ctx context.Context, channelID int64, generation uint64, deadline int64) error {
 	_, err := s.sequencer.SubmitControl(ctx, realtime.PostCommitCommand{
 		QueueBytes: 1,
-		Acquire:    func(commandCtx context.Context) (func(), error) { return s.gate.Acquire(commandCtx) },
+		Acquire: func(commandCtx context.Context) (func(), error) {
+			release, err := s.gate.Acquire(commandCtx)
+			if err != nil {
+				return nil, err
+			}
+			var releaseRelay func()
+			if s.connections != nil {
+				releaseRelay = s.connections.AcquireCurrentVoiceRelayGates()
+			} else {
+				releaseRelay = func() {}
+			}
+			return func() {
+				releaseRelay()
+				release()
+			}, nil
+		},
 		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
 			version, err := s.currentVersion()
 			if err != nil {

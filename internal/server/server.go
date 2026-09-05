@@ -217,7 +217,11 @@ func (a *App) serve(running *appRun, ln net.Listener, tlsInfo func(), timeouts H
 	// module, file sink). The reserved color attr makes it stand out in
 	// magenta on terminals; files and pipes render it plain.
 	log.Info("System initialization finished, LINK START!", "color", "magenta")
-	srv := newHTTPServer(addr, a.echo, a.logger, timeouts)
+	var httpTracker *httpConnectionTracker
+	if a.metrics != nil {
+		httpTracker = a.metrics.http
+	}
+	srv := newHTTPServer(addr, a.echo, a.logger, timeouts, httpTracker)
 	a.setRunServer(running, srv)
 	supervisor.Go("http serve", func(context.Context) error {
 		err := srv.Serve(ln)
@@ -273,6 +277,10 @@ func (a *App) fatalShutdown(srv *http.Server, supervisor *ProcessSupervisor, cau
 	a.connections.SetVoiceAuthorityObserver(nil)
 	a.connections.DisconnectAll(4005, "server failure")
 	a.connections.ForceCloseAll()
+	relayErr := error(nil)
+	if a.voice != nil {
+		relayErr = a.voice.stopRelay(context.Background())
+	}
 	voiceErr := a.stopVoice()
 	httpErr := srv.Close()
 	supervisor.BeginShutdown()
@@ -285,14 +293,14 @@ func (a *App) fatalShutdown(srv *http.Server, supervisor *ProcessSupervisor, cau
 	if connectionsErr == nil && realtimeErr == nil && workersErr == nil {
 		dbErr = a.closeDatabase()
 	}
-	return errors.Join(cause, voiceErr, httpErr, connectionsErr, workersErr, realtimeErr, dbErr)
+	return errors.Join(cause, relayErr, voiceErr, httpErr, connectionsErr, workersErr, realtimeErr, dbErr)
 }
 
 // newHTTPServer builds the ordinary HTTP server with the fixed deadline and
 // logging policy. WebSocket deadline ownership belongs to the future realtime
 // layer once it hijacks a connection.
-func newHTTPServer(addr string, handler http.Handler, logger *slog.Logger, timeouts HTTPTimeouts) *http.Server {
-	return &http.Server{
+func newHTTPServer(addr string, handler http.Handler, logger *slog.Logger, timeouts HTTPTimeouts, tracker *httpConnectionTracker) *http.Server {
+	server := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
 		ErrorLog:          slog.NewLogLogger(logger.With("module", "http").Handler(), slog.LevelError),
@@ -301,6 +309,10 @@ func newHTTPServer(addr string, handler http.Handler, logger *slog.Logger, timeo
 		WriteTimeout:      timeouts.Write,
 		IdleTimeout:       timeouts.Idle,
 	}
+	if tracker != nil {
+		server.ConnState = tracker.state
+	}
+	return server
 }
 
 // shutdownHTTPServer drains ordinary HTTP connections, then force-closes any

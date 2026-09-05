@@ -125,6 +125,10 @@ type VoiceAuthorityCommit struct {
 	Current  VoiceAuthority
 	Drain    protocol.SessionSendDrain
 	Cleanup  protocol.ActivationCleanup
+	// Release closes the fixed per-user relay gate after Drain and before the
+	// enclosing StatePublication becomes visible. It is nil only for an invalid
+	// or pre-existing commit.
+	Release func()
 }
 
 // AccountTeardownPlan contains the state events and lifecycle actions needed
@@ -220,6 +224,7 @@ type ConnectionCoordinator struct {
 	voiceObserver      atomic.Pointer[voiceAuthorityObserverValue]
 	voiceProjection    atomic.Pointer[voiceAuthorityProjectionValue]
 	closeObserver      atomic.Pointer[connectionCloseObserver]
+	voiceRelayGates    *voiceRelayGateSet
 }
 
 type voiceAuthorityStopValue struct {
@@ -284,9 +289,10 @@ type connectionClosePlan struct {
 // admission enabled.
 func NewConnectionCoordinator() *ConnectionCoordinator {
 	return &ConnectionCoordinator{
-		accepting: true,
-		users:     make(map[int64]*connectionUser),
-		sources:   make(map[netip.Addr]int),
+		accepting:       true,
+		users:           make(map[int64]*connectionUser),
+		sources:         make(map[netip.Addr]int),
+		voiceRelayGates: newVoiceRelayGateSet(),
 	}
 }
 
@@ -698,12 +704,15 @@ func (s *VoiceAuthorityStage) ProposedAuthority() (VoiceAuthority, error) {
 // preserves the required publication -> coordinator -> Manager lock order
 // without allowing network I/O or sendMu waiting under coordinator ownership.
 func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCommit, error) {
-	commit, err := s.apply(manager, true)
+	commit, err := s.apply(manager, true, true)
 	if err != nil {
 		return VoiceAuthorityCommit{}, err
 	}
 	if commit.Drain != nil {
 		commit.Drain()
+	}
+	if commit.Release != nil {
+		commit.Release()
 	}
 	s.coordinator.notifyVoiceAuthority(commit.Previous, &commit.Current, "session_replaced")
 	return commit, nil
@@ -715,13 +724,20 @@ func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCo
 // publish duplicate or stale runtime projections. allowNaturalExpiry is true
 // only when the caller already observed the expected Manager session missing.
 func (s *VoiceAuthorityStage) ApplyForPublication(manager *protocol.Manager, allowNaturalExpiry bool) (VoiceAuthorityCommit, error) {
-	return s.apply(manager, allowNaturalExpiry)
+	return s.apply(manager, allowNaturalExpiry, true)
+}
+
+// ApplyForPublicationWithGate commits the staged authority while the caller's
+// per-user relay gate is already held. It is the publication-safe variant used
+// by sequenced channel commands; no lock is reacquired under StatePublication.
+func (s *VoiceAuthorityStage) ApplyForPublicationWithGate(manager *protocol.Manager, allowNaturalExpiry bool) (VoiceAuthorityCommit, error) {
+	return s.apply(manager, allowNaturalExpiry, false)
 }
 
 // apply performs the single coordinator/Manager runtime commit point. Apply
 // publishes the observer transition after draining, while ApplyForPublication
 // leaves that transition for the enclosing StatePublication.
-func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, allowNaturalExpiry bool) (VoiceAuthorityCommit, error) {
+func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, allowNaturalExpiry, acquireRelay bool) (VoiceAuthorityCommit, error) {
 	if s == nil || s.coordinator == nil || !validConnectionRef(s.owner) {
 		return VoiceAuthorityCommit{}, ErrVoiceAuthorityPrecondition
 	}
@@ -731,6 +747,18 @@ func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, allowNaturalExpir
 	if s.prepared == nil && (manager == nil || s.expected == nil) {
 		return VoiceAuthorityCommit{}, ErrVoiceAuthorityPrecondition
 	}
+	var releaseRelay func()
+	if acquireRelay {
+		releaseRelay = s.coordinator.AcquireVoiceRelayGate(s.owner.UserID)
+	} else {
+		releaseRelay = func() {}
+	}
+	releaseOnError := acquireRelay
+	defer func() {
+		if acquireRelay && releaseOnError {
+			releaseRelay()
+		}
+	}()
 	user := s.coordinator.acquireUser(s.owner.UserID)
 	defer s.coordinator.releaseUser(s.owner.UserID, user)
 	user.mu.Lock()
@@ -786,7 +814,12 @@ func (s *VoiceAuthorityStage) apply(manager *protocol.Manager, allowNaturalExpir
 	}
 	user.voice = &current
 	user.voiceTombstone = nil
-	return VoiceAuthorityCommit{Previous: previous, Current: current, Drain: drain, Cleanup: cleanup}, nil
+	releaseOnError = false
+	var release func()
+	if acquireRelay {
+		release = releaseRelay
+	}
+	return VoiceAuthorityCommit{Previous: previous, Current: current, Drain: drain, Cleanup: cleanup, Release: release}, nil
 }
 
 // BeginVoiceDisconnect conditionally clears expected authority and deactivates
@@ -806,9 +839,35 @@ func (c *ConnectionCoordinator) BeginVoiceDisconnectReason(expected VoiceAuthori
 // the asynchronous observer. Application commands use it when their candidate
 // and lifecycle events are already reserved in the same StatePublication.
 func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.SessionSendDrain, error) {
+	return c.beginVoiceDisconnectForPublication(expected, manager, reason, true)
+}
+
+// BeginVoiceDisconnectForPublicationWithGate clears one exact authority while
+// the caller's relay gate is already held before StatePublication. It avoids a
+// publication -> relay lock inversion and returns only deferred send draining.
+func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublicationWithGate(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.SessionSendDrain, error) {
+	return c.beginVoiceDisconnectForPublication(expected, manager, reason, false)
+}
+
+// beginVoiceDisconnectForPublication clears one authority for a publication;
+// acquireRelay is true for standalone callers and false for sequenced commands
+// whose Acquire callback established the gate before reserving publication.
+func (c *ConnectionCoordinator) beginVoiceDisconnectForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string, acquireRelay bool) (VoiceAuthority, bool, protocol.SessionSendDrain, error) {
 	if c == nil || !expected.Valid() {
 		return VoiceAuthority{}, false, nil, ErrVoiceAuthorityPrecondition
 	}
+	var releaseRelay func()
+	if acquireRelay {
+		releaseRelay = c.AcquireVoiceRelayGate(expected.UserID)
+	} else {
+		releaseRelay = func() {}
+	}
+	releaseOnReturn := acquireRelay
+	defer func() {
+		if acquireRelay && releaseOnReturn {
+			releaseRelay()
+		}
+	}()
 	user := c.acquireUser(expected.UserID)
 	defer c.releaseUser(expected.UserID, user)
 	user.mu.Lock()
@@ -826,7 +885,17 @@ func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublication(expected Voic
 	}
 	removed := *user.voice
 	user.voice = nil
-	return removed, true, drain, nil
+	returnDrain := func() {
+		if drain != nil {
+			drain()
+		}
+		if acquireRelay {
+			releaseRelay()
+		}
+		releaseOnReturn = false
+	}
+	releaseOnReturn = false
+	return removed, true, returnDrain, nil
 }
 
 // BeginVoiceRevokeForPublication clears one exact authority without the
@@ -834,9 +903,34 @@ func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublication(expected Voic
 // after StatePublication releases its locks. It is used for access-loss and
 // forced teardown paths; voluntary leave deliberately uses Delete instead.
 func (c *ConnectionCoordinator) BeginVoiceRevokeForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.SessionSendDrain, protocol.RevocationCleanup, error) {
+	return c.beginVoiceRevokeForPublication(expected, manager, reason, true)
+}
+
+// BeginVoiceRevokeForPublicationWithGate clears one exact authority while the
+// caller's relay gate is already held before StatePublication. It is used for
+// ACL/role/channel access-loss cleanup.
+func (c *ConnectionCoordinator) BeginVoiceRevokeForPublicationWithGate(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.SessionSendDrain, protocol.RevocationCleanup, error) {
+	return c.beginVoiceRevokeForPublication(expected, manager, reason, false)
+}
+
+// beginVoiceRevokeForPublication clears one authority and stages Manager
+// revocation cleanup. acquireRelay selects standalone or gate-held operation.
+func (c *ConnectionCoordinator) beginVoiceRevokeForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string, acquireRelay bool) (VoiceAuthority, bool, protocol.SessionSendDrain, protocol.RevocationCleanup, error) {
 	if c == nil || !expected.Valid() || manager == nil {
 		return VoiceAuthority{}, false, nil, nil, ErrVoiceAuthorityPrecondition
 	}
+	var releaseRelay func()
+	if acquireRelay {
+		releaseRelay = c.AcquireVoiceRelayGate(expected.UserID)
+	} else {
+		releaseRelay = func() {}
+	}
+	releaseOnReturn := acquireRelay
+	defer func() {
+		if acquireRelay && releaseOnReturn {
+			releaseRelay()
+		}
+	}()
 	user := c.acquireUser(expected.UserID)
 	defer c.releaseUser(expected.UserID, user)
 	user.mu.Lock()
@@ -850,7 +944,17 @@ func (c *ConnectionCoordinator) BeginVoiceRevokeForPublication(expected VoiceAut
 	}
 	removed := *user.voice
 	user.voice = nil
-	return removed, true, drain, cleanup, nil
+	returnDrain := func() {
+		if drain != nil {
+			drain()
+		}
+		if acquireRelay {
+			releaseRelay()
+		}
+		releaseOnReturn = false
+	}
+	releaseOnReturn = false
+	return removed, true, returnDrain, cleanup, nil
 }
 
 // beginVoiceDisconnectReason conditionally clears one exact authority and
@@ -860,6 +964,8 @@ func (c *ConnectionCoordinator) beginVoiceDisconnectReason(expected VoiceAuthori
 	if c == nil || !expected.Valid() {
 		return VoiceAuthority{}, false, ErrVoiceAuthorityPrecondition
 	}
+	releaseRelay := c.AcquireVoiceRelayGate(expected.UserID)
+	defer releaseRelay()
 	user := c.acquireUser(expected.UserID)
 	user.mu.Lock()
 	if !sameVoiceAuthority(user.voice, &expected) {
@@ -1137,7 +1243,9 @@ func (c *ConnectionCoordinator) beginDisconnectLocked(user *connectionUser, ref 
 // is deliberately outside this low-level lifecycle callback.
 func (c *ConnectionCoordinator) runClosePlan(plan connectionClosePlan) {
 	if plan.voiceAuthorityStop != nil && plan.voiceAuthority != nil {
+		releaseRelay := c.AcquireVoiceRelayGate(plan.voiceAuthority.UserID)
 		plan.voiceAuthorityStop(*plan.voiceAuthority, plan.reason)
+		releaseRelay()
 	}
 	if plan.voiceObserver != nil {
 		plan.voiceObserver(plan.voiceAuthority, nil, plan.voiceReason)

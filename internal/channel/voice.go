@@ -288,8 +288,11 @@ func (s *Service) PrepareVoiceAccessLoss(candidate *realtime.StateCandidate) ([]
 		drains := make([]protocol.SessionSendDrain, 0, len(plans))
 		cleanups := make([]protocol.RevocationCleanup, 0, len(plans))
 		for _, plan := range plans {
-			_, removed, drain, cleanup, err := s.connections.BeginVoiceRevokeForPublication(plan.authority, s.voiceManager, plan.reason)
+			_, removed, drain, cleanup, err := s.connections.BeginVoiceRevokeForPublicationWithGate(plan.authority, s.voiceManager, plan.reason)
 			if err != nil {
+				for _, pending := range drains {
+					pending()
+				}
 				return nil, err
 			}
 			if removed && drain != nil {
@@ -631,12 +634,26 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 						return nil, commitErr
 					}
 					if commit.Current != proposed {
+						if commit.Drain != nil {
+							commit.Drain()
+						}
+						if commit.Release != nil {
+							commit.Release()
+						}
 						return nil, realtime.ErrVoiceAuthorityPrecondition
 					}
 					if commit.Drain != nil {
 						commit.Drain()
 					}
-					return commit.Cleanup, nil
+					cleanup := commit.Cleanup
+					return func() {
+						if commit.Release != nil {
+							commit.Release()
+						}
+						if cleanup != nil {
+							cleanup()
+						}
+					}, nil
 				},
 			}); err != nil {
 				return realtime.CommandOutput{}, err

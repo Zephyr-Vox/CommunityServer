@@ -128,6 +128,7 @@ type StatePublication struct {
 	mu          sync.RWMutex
 	hook        PublicationHook
 	captureHook atomic.Pointer[publicationCaptureHookValue]
+	lastLatency atomic.Int64
 }
 
 // BindEventBus attaches the process-local live delivery registry to p. It must
@@ -257,14 +258,16 @@ func (r *PublicationReservation) publish(runtimeCtx context.Context) (result Pub
 	}
 
 	p := r.publication
+	started := time.Now()
 	var slow []StateSyncConnection
 	var cleanup func()
 	defer func() {
+		p.lastLatency.Store(time.Since(started).Nanoseconds())
 		p.mu.Unlock()
 		for _, connection := range slow {
 			connection.DisconnectSlowConsumer()
 		}
-		if err == nil && cleanup != nil {
+		if cleanup != nil {
 			cleanup()
 		}
 	}()
@@ -294,6 +297,15 @@ func (r *PublicationReservation) publish(runtimeCtx context.Context) (result Pub
 		}
 	}
 	return clonePublicationResult(r.result), nil
+}
+
+// LastPublishLatency returns the most recent StatePublication critical-section
+// duration. It is a load-control signal and is not part of the replay state.
+func (p *StatePublication) LastPublishLatency() time.Duration {
+	if p == nil {
+		return 0
+	}
+	return time.Duration(p.lastLatency.Load())
 }
 
 // claimCompletion grants the one release operation for r. The corresponding

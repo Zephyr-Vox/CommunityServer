@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/labstack/echo/v5"
 
@@ -177,8 +179,9 @@ type FullSnapshotSyncStrategy struct {
 	visibility  *VisibilityResolver
 	eventBus    *EventBus
 
-	hookMu sync.RWMutex
-	hook   SyncHook
+	hookMu              sync.RWMutex
+	hook                SyncHook
+	lastSnapshotLatency atomic.Int64
 }
 
 // NewFullSnapshotSyncStrategy creates a v1 strategy backed by one process
@@ -210,6 +213,10 @@ func (s *FullSnapshotSyncStrategy) CaptureSnapshot(userID int64) (StateSnapshot,
 	if s == nil || userID <= 0 {
 		return StateSnapshot{}, ErrInvalidStateSync
 	}
+	started := time.Now()
+	defer func() {
+		s.lastSnapshotLatency.Store(time.Since(started).Nanoseconds())
+	}()
 	capture := s.publication.Capture()
 	if capture.Version == nil {
 		return StateSnapshot{}, ErrInvalidStateSync
@@ -229,6 +236,15 @@ func (s *FullSnapshotSyncStrategy) CaptureSnapshot(userID int64) (StateSnapshot,
 		StateVersion: strconv.FormatUint(capture.Version.Number(), 10),
 		State:        snapshotStateFor(userID, capture.Version, s.visibility),
 	}, nil
+}
+
+// SnapshotLatency returns the duration of the most recent HTTP snapshot
+// capture, including immutable projection serialization and cursor issuance.
+func (s *FullSnapshotSyncStrategy) SnapshotLatency() time.Duration {
+	if s == nil {
+		return 0
+	}
+	return time.Duration(s.lastSnapshotLatency.Load())
 }
 
 // IssueStateCursor returns a cursor bound to userID and version's final

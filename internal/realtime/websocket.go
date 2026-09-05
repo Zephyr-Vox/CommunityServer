@@ -26,6 +26,9 @@ const (
 	// this budget so a slow state consumer cannot strand a command ACK or close.
 	MaxWebSocketStateItems = 256
 	MaxWebSocketStateBytes = 1 << 20
+	// MaxWebSocketTelemetryBytes bounds the one latest-only voice.stats frame
+	// kept for a connection. Telemetry never consumes replay/control capacity.
+	MaxWebSocketTelemetryBytes = 16 << 10
 
 	websocketHelloTimeout   = 10 * time.Second
 	websocketResyncTimeout  = 30 * time.Second
@@ -846,6 +849,7 @@ type webSocketWritePump struct {
 	conn *websocket.Conn
 
 	state         *webSocketStateLane
+	telemetry     *webSocketTelemetryLane
 	responses     *webSocketResponseLane
 	pings         chan struct{}
 	pongs         chan []byte
@@ -936,6 +940,66 @@ type webSocketStateLane struct {
 type webSocketStateFrame struct {
 	item  StateQueueItem
 	bytes int
+}
+
+// webSocketTelemetryLane stores at most one latest-only droppable frame. A new
+// sample replaces an older one without waiting, so telemetry can never make a
+// slow connection retain an unbounded diagnostics backlog.
+type webSocketTelemetryLane struct {
+	mu     sync.Mutex
+	frame  []byte
+	ready  chan struct{}
+	closed bool
+}
+
+// newWebSocketTelemetryLane returns an empty bounded telemetry slot.
+func newWebSocketTelemetryLane() *webSocketTelemetryLane {
+	return &webSocketTelemetryLane{ready: make(chan struct{}, 1)}
+}
+
+// store replaces the pending telemetry frame if it fits the fixed byte limit.
+func (l *webSocketTelemetryLane) store(frame []byte) bool {
+	if l == nil || len(frame) == 0 || len(frame) > MaxWebSocketTelemetryBytes {
+		return false
+	}
+	copyFrame := append([]byte(nil), frame...)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return false
+	}
+	l.frame = copyFrame
+	select {
+	case l.ready <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// claim removes the newest pending telemetry frame from the slot.
+func (l *webSocketTelemetryLane) claim() ([]byte, bool) {
+	if l == nil {
+		return nil, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed || len(l.frame) == 0 {
+		return nil, false
+	}
+	frame := l.frame
+	l.frame = nil
+	return frame, true
+}
+
+// close rejects future telemetry and discards the pending frame.
+func (l *webSocketTelemetryLane) close() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.closed = true
+	l.frame = nil
+	l.mu.Unlock()
 }
 
 // newWebSocketStateLane returns the v1 regular state/control delivery lane.
@@ -1129,6 +1193,7 @@ func newWebSocketWritePump(conn *websocket.Conn) *webSocketWritePump {
 	pump := &webSocketWritePump{
 		conn:      conn,
 		state:     newWebSocketStateLane(),
+		telemetry: newWebSocketTelemetryLane(),
 		responses: newWebSocketResponseLane(),
 		pings:     make(chan struct{}, 1),
 		pongs:     make(chan []byte, 2),
@@ -1193,6 +1258,20 @@ func (p *webSocketWritePump) Enqueue(frame []byte) bool {
 	default:
 	}
 	return p.state.enqueue(frame)
+}
+
+// EnqueueVoiceStats implements VoiceStatsTransport by replacing the single
+// pending diagnostics frame without competing with state/control capacity.
+func (p *webSocketWritePump) EnqueueVoiceStats(frame []byte) bool {
+	if p == nil {
+		return false
+	}
+	select {
+	case <-p.done:
+		return false
+	default:
+	}
+	return p.telemetry.store(frame)
 }
 
 // ApplyStateBatch atomically prunes revoked scope work and appends a replay/live
@@ -1322,6 +1401,7 @@ func (p *webSocketWritePump) Done() <-chan struct{} {
 func (p *webSocketWritePump) run() {
 	defer func() {
 		p.state.close()
+		p.telemetry.close()
 		p.responses.releaseQueued()
 		p.releaseQueuedTerminal()
 		close(p.done)
@@ -1332,6 +1412,17 @@ func (p *webSocketWritePump) run() {
 			p.runTerminal(terminal)
 			return
 		default:
+		}
+		// Drain one queued state frame before entering the fair select. This
+		// keeps latest-only diagnostics from delaying replayable state/control
+		// delivery when both lanes are ready at the same time.
+		if frame, ok := p.state.claim(); ok {
+			if !p.writeFrame(frame.item.Frame) {
+				p.state.release(frame)
+				return
+			}
+			p.state.release(frame)
+			continue
 		}
 		select {
 		case terminal := <-p.terminal:
@@ -1361,6 +1452,14 @@ func (p *webSocketWritePump) run() {
 				return
 			}
 			p.state.release(frame)
+		case <-p.telemetry.ready:
+			frame, ok := p.telemetry.claim()
+			if !ok {
+				continue
+			}
+			if !p.writeFrame(frame) {
+				return
+			}
 		}
 	}
 }

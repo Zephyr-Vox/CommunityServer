@@ -42,6 +42,7 @@ func (a *App) routes(e *echo.Echo) error {
 	authz := rbac.NewAuthorizer(a.stores.Roles)
 	rbacSvc := rbaccontrol.NewService(a.stores, a.principals)
 	rbacSvc.SetStateMutationGate(a.mutationGate)
+	rbacSvc.SetVoiceRelayCoordinator(a.connections)
 	rbacSvc.SetVoiceAccessLossPreparation(a.channels.PrepareVoiceAccessLoss)
 	state, sequencer, ok := a.realtimeComponents()
 	if !ok {
@@ -129,6 +130,7 @@ func (a *App) routes(e *echo.Echo) error {
 
 	admin := api.Group("/admin")
 	admin.POST("/activate", auth.ActivateHandler(a.activate), auth.IPRateLimit(a.cfg.LoginRateLimit))
+	admin.GET("/metrics", a.metricsHandler(), authed(rbacecho.Require(authz, rbac.PermServerMetrics))...)
 	admin.GET("/invites", auth.InviteListHandler(a.invites), authed(rbacecho.Require(authz, rbac.PermInviteManage))...)
 	admin.POST("/invites", auth.InviteCreateHandler(a.invites), authed(rbacecho.Require(authz, rbac.PermInviteManage))...)
 	admin.DELETE("/invites/:id", auth.InviteDeleteHandler(a.invites), authed(rbacecho.Require(authz, rbac.PermInviteManage))...)
