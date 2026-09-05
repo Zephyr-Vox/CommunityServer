@@ -233,7 +233,7 @@ func (r *PublicationReservation) Abort() {
 // visible as one atomic publication. It must run only after the enclosing
 // persistent transaction commits; callers treat an error as process-fatal.
 func (r *PublicationReservation) Publish() (PublicationResult, error) {
-	return r.publish(nil)
+	return r.publish(context.TODO())
 }
 
 // PublishRuntime publishes a runtime-only reservation unless ctx was canceled
@@ -247,9 +247,10 @@ func (r *PublicationReservation) PublishRuntime(ctx context.Context) (Publicatio
 	return r.publish(ctx)
 }
 
-// publish completes one reservation. A non-nil runtimeCtx is checked after the
+// publish completes one reservation. The context is checked after the
 // before-append test hook and immediately before any externally observable
-// mutation; persistent publications pass nil because their DB commit is final.
+// mutation; persistent publications use a non-cancelable TODO context because
+// their database commit is already final.
 func (r *PublicationReservation) publish(runtimeCtx context.Context) (result PublicationResult, err error) {
 	if !r.claimCompletion() {
 		return PublicationResult{}, ErrInvalidPublication

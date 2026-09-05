@@ -1043,7 +1043,7 @@ func drainSessionSends(session *Session) {
 		return
 	}
 	session.sendMu.Lock()
-	session.sendMu.Unlock()
+	defer session.sendMu.Unlock()
 }
 
 // newRevokedSnapshotLocked captures everything needed for a best-effort
