@@ -136,7 +136,17 @@ type voiceTemporarySchedule struct {
 type voiceJoinResult struct {
 	response voiceJoinResponse
 	state    StateCommand
+	body     json.RawMessage
 	replay   *realtime.RuntimeCommandResult
+}
+
+// voiceJoinPreparedResult carries the response bytes and state cursor that
+// were derived from the reserved, still-unpublished version. Keeping these
+// facts in the command output makes post-publication replay completion
+// bookkeeping non-fallible.
+type voiceJoinPreparedResult struct {
+	plan   voiceJoinPlan
+	result voiceJoinResult
 }
 
 // voiceLeavePlan retains the exact empty-channel timer selected by the
@@ -152,6 +162,13 @@ type voiceLeavePlan struct {
 type voiceLeaveResult struct {
 	state  StateCommand
 	replay *realtime.RuntimeCommandResult
+}
+
+// voiceLeavePreparedResult carries the exact checkpoint for a published
+// runtime-only leave before the command crosses its publication boundary.
+type voiceLeavePreparedResult struct {
+	plan   voiceLeavePlan
+	result voiceLeaveResult
 }
 
 // VoiceAuthorityProjection returns the channel-specific part of a coordinator
@@ -577,6 +594,21 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 				return realtime.CommandOutput{}, err
 			}
 			events = append(events, authorityEvents...)
+			info := protocol.SessionInfo{
+				ID:        proposed.VoiceSessionID,
+				UserID:    actorID,
+				Encrypted: s.voiceEncrypted,
+			}
+			if prepared != nil {
+				info = prepared.Info()
+			} else if hasCurrent {
+				// The session was already validated before the runtime commit. Do not
+				// perform a second fallible Manager lookup here: natural expiry can
+				// otherwise turn a successful coordinator move into an unpublished
+				// runtime mutation after ApplyForPublication has completed.
+				info = reusedInfo
+			}
+			plan := voiceJoinPlan{channel: snapshotChannel(channel), channelID: channel.ID, info: info, created: created, schedules: schedules, cancellations: cancellations}
 			if _, err := execution.Reserve(realtime.PublicationRequest{
 				Candidate: candidate,
 				Events:    events,
@@ -609,36 +641,71 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 			}); err != nil {
 				return realtime.CommandOutput{}, err
 			}
+			reserved, err := execution.ReservedResult()
+			if err != nil || reserved.Version == nil {
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				return realtime.CommandOutput{}, ErrRealtimeUnavailable
+			}
+			state := StateCommand{CommandID: commandID, Checkpoint: reserved.Checkpoint}
+			state.Cursor, err = s.cursors.IssueStateCursor(actorID, reserved.Version)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			response, err := s.voiceJoinResponse(actorID, plan, reserved.Version, state)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			body, err := realtime.CanonicalSuccessBody(response)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			body, err = realtime.CanonicalJSON(body)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			preparedResult := voiceJoinResult{response: response, state: state, body: body}
 			if err := execution.MarkRuntimeReady(); err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			info := protocol.SessionInfo{
-				ID:        proposed.VoiceSessionID,
-				UserID:    actorID,
-				Encrypted: s.voiceEncrypted,
-			}
-			if prepared != nil {
-				info = prepared.Info()
-			} else if hasCurrent {
-				// The session was already validated before the runtime commit. Do not
-				// perform a second fallible Manager lookup here: natural expiry can
-				// otherwise turn a successful coordinator move into an unpublished
-				// runtime mutation after ApplyForPublication has completed.
-				info = reusedInfo
-			}
-			return realtime.CommandOutput{Value: voiceJoinPlan{channel: snapshotChannel(channel), channelID: channel.ID, info: info, created: created, schedules: schedules, cancellations: cancellations}}, nil
+			return realtime.CommandOutput{Value: voiceJoinPreparedResult{plan: plan, result: preparedResult}}, nil
 		},
 	})
 	if err != nil {
 		return voiceJoinResult{}, err
 	}
-	plan, ok := completion.Value.(voiceJoinPlan)
-	if !ok {
+	var plan voiceJoinPlan
+	var result voiceJoinResult
+	var prepared bool
+	switch value := completion.Value.(type) {
+	case voiceJoinPlan:
+		plan = value
+	case voiceJoinPreparedResult:
+		plan = value.plan
+		result = value.result
+		prepared = true
+	default:
 		return voiceJoinResult{}, ErrRealtimeUnavailable
 	}
 	s.cancelTemporaryExpiries(plan.cancellations)
 	for _, schedule := range plan.schedules {
 		s.scheduleTemporary(schedule.channelID, &schedule.schedule)
+	}
+	if prepared {
+		if err := claim.Complete(realtime.RuntimeCommandResult{
+			CommandID:   result.state.CommandID,
+			Status:      http.StatusOK,
+			Body:        result.body,
+			Headers:     store.IdempotencyHeaders{CacheControl: "no-store", Pragma: "no-cache"},
+			Checkpoint:  result.state.Checkpoint,
+			StateCursor: result.state.Cursor,
+			Value:       result,
+		}); err != nil {
+			return voiceJoinResult{}, err
+		}
+		completed = true
+		return result, nil
 	}
 	version := completion.Publication.Version
 	state := StateCommand{CommandID: completion.CommandID}
@@ -669,11 +736,11 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 	if err != nil {
 		return voiceJoinResult{}, err
 	}
-	result := voiceJoinResult{response: response, state: state}
+	result = voiceJoinResult{response: response, state: state, body: body}
 	if err := claim.Complete(realtime.RuntimeCommandResult{
 		CommandID:   state.CommandID,
 		Status:      http.StatusOK,
-		Body:        body,
+		Body:        result.body,
 		Headers:     store.IdempotencyHeaders{CacheControl: "no-store", Pragma: "no-cache"},
 		Checkpoint:  state.Checkpoint,
 		StateCursor: state.Cursor,
@@ -742,7 +809,7 @@ func (s *Service) LeaveVoice(ctx context.Context, actorID int64, controlConnecti
 				unlock()
 			}, nil
 		},
-		Execute: func(commandCtx context.Context, _ int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
+		Execute: func(commandCtx context.Context, commandID int64, execution *realtime.CommandExecution) (realtime.CommandOutput, error) {
 			nowMillis := s.voiceNowMillis()
 			version, err := s.currentVersion()
 			if err != nil {
@@ -793,6 +860,7 @@ func (s *Service) LeaveVoice(ctx context.Context, actorID int64, controlConnecti
 				}
 				schedule = &value
 			}
+			plan := voiceLeavePlan{version: version, channelID: channel.ID, schedule: schedule}
 			if _, err := execution.Reserve(realtime.PublicationRequest{
 				Candidate: candidate,
 				Events:    eventPlan,
@@ -815,21 +883,57 @@ func (s *Service) LeaveVoice(ctx context.Context, actorID int64, controlConnecti
 			}); err != nil {
 				return realtime.CommandOutput{}, err
 			}
+			reserved, err := execution.ReservedResult()
+			if err != nil || reserved.Version == nil {
+				if err != nil {
+					return realtime.CommandOutput{}, err
+				}
+				return realtime.CommandOutput{}, ErrRealtimeUnavailable
+			}
+			state := StateCommand{CommandID: commandID, Checkpoint: reserved.Checkpoint}
+			state.Cursor, err = s.cursors.IssueStateCursor(actorID, reserved.Version)
+			if err != nil {
+				return realtime.CommandOutput{}, err
+			}
+			preparedResult := voiceLeaveResult{state: state}
 			if err := execution.MarkRuntimeReady(); err != nil {
 				return realtime.CommandOutput{}, err
 			}
-			return realtime.CommandOutput{Value: voiceLeavePlan{version: version, channelID: channel.ID, schedule: schedule}}, nil
+			return realtime.CommandOutput{Value: voiceLeavePreparedResult{plan: plan, result: preparedResult}}, nil
 		},
 	})
 	if err != nil {
 		return voiceLeaveResult{}, err
 	}
-	plan, ok := completion.Value.(voiceLeavePlan)
-	if !ok {
+	var plan voiceLeavePlan
+	var result voiceLeaveResult
+	var prepared bool
+	switch value := completion.Value.(type) {
+	case voiceLeavePlan:
+		plan = value
+	case voiceLeavePreparedResult:
+		plan = value.plan
+		result = value.result
+		prepared = true
+	default:
 		return voiceLeaveResult{}, ErrRealtimeUnavailable
 	}
 	if plan.schedule != nil {
 		s.scheduleTemporary(plan.channelID, plan.schedule)
+	}
+	if prepared {
+		if err := claim.Complete(realtime.RuntimeCommandResult{
+			CommandID:   result.state.CommandID,
+			Status:      http.StatusNoContent,
+			Headers:     store.IdempotencyHeaders{CacheControl: "no-store", Pragma: "no-cache"},
+			Checkpoint:  result.state.Checkpoint,
+			StateCursor: result.state.Cursor,
+			Value:       result,
+		}); err != nil {
+			return voiceLeaveResult{}, err
+		}
+		completed = true
+		return result, nil
 	}
 	version := completion.Publication.Version
 	state := StateCommand{CommandID: completion.CommandID}
@@ -848,7 +952,7 @@ func (s *Service) LeaveVoice(ctx context.Context, actorID int64, controlConnecti
 	if err != nil {
 		return voiceLeaveResult{}, err
 	}
-	result := voiceLeaveResult{state: state}
+	result = voiceLeaveResult{state: state}
 	if err := claim.Complete(realtime.RuntimeCommandResult{
 		CommandID:   state.CommandID,
 		Status:      http.StatusNoContent,

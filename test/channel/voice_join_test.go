@@ -32,6 +32,97 @@ func (voiceJoinTransport) RequestClose(int, string) {}
 
 func (voiceJoinTransport) ForceClose() {}
 
+type failingVoiceCursorIssuer struct{ err error }
+
+func (i failingVoiceCursorIssuer) IssueStateCursor(int64, *realtime.StateVersion) (string, error) {
+	return "", i.err
+}
+
+// TestVoiceReplayMetadataFailureAbortsBeforeRuntimeCommit verifies that a
+// cursor failure is still rollbackable for both sensitive voice commands.
+// Once publication succeeds, replay completion only uses precomputed data.
+func TestVoiceReplayMetadataFailureAbortsBeforeRuntimeCommit(t *testing.T) {
+	fixture := newFixture(t)
+	channelSnapshot, _, err := fixture.service.CreateChannel(context.Background(), fixture.adminID, channel.CreateChannelInput{
+		Name:       "Voice replay rollback",
+		Mode:       "voice",
+		Visibility: "public",
+		Capacity:   2,
+		Position:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channelID := mustID(t, channelSnapshot.ID)
+	manager := protocol.NewManager(func() time.Time { return time.UnixMilli(1_000) })
+	coordinator := realtime.NewConnectionCoordinator()
+	reservation, err := coordinator.ReserveConnect(fixture.adminID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := reservation.Activate(voiceJoinTransport{}, 100_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceRuntime(manager, coordinator, true)
+	fixture.service.SetVoiceClock(func() int64 { return 1_000 })
+	requestSigner, err := realtime.NewRequestIdentitySigner([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.SetVoiceIdempotency(realtime.NewRuntimeIdempotencyCache(), requestSigner)
+	cursorSigner, err := realtime.NewCursorSignerWithKey(testEpoch, []byte("abcdef0123456789abcdef0123456789"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("cursor issuer unavailable")
+	fixture.service.SetStateCursorIssuer(failingVoiceCursorIssuer{err: failure})
+
+	if _, err := fixture.service.JoinVoice(context.Background(), fixture.adminID, channelID, ref.ControlConnectionID, "replay-rollback-join", channel.VoiceJoinInput{DeviceID: "desktop"}, "127.0.0.1"); !errors.Is(err, failure) {
+		t.Fatalf("join cursor failure = %v, want %v", err, failure)
+	}
+	if _, ok := coordinator.VoiceAuthority(fixture.adminID); ok {
+		t.Fatal("join cursor failure published a coordinator authority")
+	}
+	if _, ok := manager.SessionIDByUser(fixture.adminID); ok {
+		t.Fatal("join cursor failure activated a Manager session")
+	}
+	if _, ok := fixture.state.Current().VoiceAuthority(fixture.adminID); ok {
+		t.Fatal("join cursor failure published a state authority")
+	}
+
+	fixture.service.SetStateCursorIssuer(testCursorIssuer{signer: cursorSigner})
+	_, err = fixture.service.JoinVoice(context.Background(), fixture.adminID, channelID, ref.ControlConnectionID, "replay-rollback-join", channel.VoiceJoinInput{DeviceID: "desktop"}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("join retry after cursor failure = %v", err)
+	}
+	authority, ok := coordinator.VoiceAuthority(fixture.adminID)
+	if !ok || authority.VoiceSessionID == ([16]byte{}) {
+		t.Fatalf("successful join after cursor failure authority = %+v, ok=%t", authority, ok)
+	}
+
+	fixture.service.SetStateCursorIssuer(failingVoiceCursorIssuer{err: failure})
+	leaveInput := channel.VoiceLeaveInput{VoiceSessionID: fmt.Sprintf("%x", authority.VoiceSessionID)}
+	if _, err := fixture.service.LeaveVoice(context.Background(), fixture.adminID, ref.ControlConnectionID, "replay-rollback-leave", leaveInput); !errors.Is(err, failure) {
+		t.Fatalf("leave cursor failure = %v, want %v", err, failure)
+	}
+	if current, ok := coordinator.VoiceAuthority(fixture.adminID); !ok || current != authority {
+		t.Fatalf("leave cursor failure changed authority = %+v, ok=%t", current, ok)
+	}
+
+	fixture.service.SetStateCursorIssuer(testCursorIssuer{signer: cursorSigner})
+	_, err = fixture.service.LeaveVoice(context.Background(), fixture.adminID, ref.ControlConnectionID, "replay-rollback-leave", leaveInput)
+	if err != nil {
+		t.Fatalf("leave retry after cursor failure = %v", err)
+	}
+	if _, ok := coordinator.VoiceAuthority(fixture.adminID); ok {
+		t.Fatal("successful leave after cursor failure retained authority")
+	}
+	if _, err := fixture.service.LeaveVoice(context.Background(), fixture.adminID, ref.ControlConnectionID, "replay-rollback-leave", leaveInput); err != nil {
+		t.Fatalf("leave replay after cursor failure = %v", err)
+	}
+}
+
 // TestVoiceJoinPublishesAuthorityAndReplaysSensitiveResult verifies that one
 // join allocates and activates exactly one Manager session at the publication
 // boundary, while a retry returns the original response bytes and key.
