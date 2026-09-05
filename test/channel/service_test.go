@@ -13,12 +13,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v5"
 
 	"zephyr.vox/server/ce/internal/api"
 	"zephyr.vox/server/ce/internal/channel"
 	"zephyr.vox/server/ce/internal/db"
+	"zephyr.vox/server/ce/internal/protocol"
 	"zephyr.vox/server/ce/internal/rbac"
 	rbacecho "zephyr.vox/server/ce/internal/rbac/echo"
 	"zephyr.vox/server/ce/internal/realtime"
@@ -404,6 +406,10 @@ func TestChannelMoveFreezesInheritedConfigAndProtectsVoiceAuthority(t *testing.T
 	}
 	if _, err := fixture.service.DeleteChannel(ctx, fixture.adminID, channelID, channelETag); !errors.Is(err, channel.ErrChannelActive) {
 		t.Fatalf("active channel delete = %v, want active authority rejection", err)
+	}
+	fixture.service.SetVoiceRuntime(protocol.NewManager(func() time.Time { return time.UnixMilli(1_000) }), nil, false)
+	if _, err := fixture.service.DeleteChannel(ctx, fixture.adminID, channelID, channelETag); !errors.Is(err, channel.ErrChannelActive) {
+		t.Fatalf("partially wired active channel delete = %v, want active authority rejection", err)
 	}
 }
 

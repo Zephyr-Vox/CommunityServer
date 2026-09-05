@@ -1041,9 +1041,9 @@ func (s *Service) DeleteChannel(ctx context.Context, actorID, channelID int64, e
 		if !decision.Allow {
 			return mutationValue{}, ErrPermissionRequired
 		}
-		if s.voiceManager == nil && activeChannelMembers(channel.ID, version) != 0 {
-			// Focused service fixtures that do not install the voice runtime
-			// cannot safely perform the exact coordinator teardown.
+		if (s.voiceManager == nil || s.connections == nil) && activeChannelMembers(channel.ID, version) != 0 {
+			// A partial voice runtime cannot safely perform the exact Manager and
+			// coordinator teardown, so never delete an occupied channel through it.
 			return mutationValue{}, ErrChannelActive
 		}
 		beforeUsers := visibleChannelUsers(channel.ID, version, s.visibility)
