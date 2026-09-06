@@ -171,6 +171,24 @@ func newUDPEnvWithHandler(t *testing.T, encrypted bool, onFrame protocol.FrameHa
 	}
 }
 
+// TestUDPServerRejectsHandlerMutationAfterClose verifies that Close is a
+// terminal lifecycle transition for startup-only callback configuration.
+func TestUDPServerRejectsHandlerMutationAfterClose(t *testing.T) {
+	srv, err := protocol.NewUDPServer(protocol.NewManager(time.Now), protocol.NewChannelTypeRegistry(), nil, protocol.DefaultIngressLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.SetFrameHandler(func(protocol.InboundFrame) {}); !errors.Is(err, protocol.ErrUDPServerClosed) {
+		t.Fatalf("SetFrameHandler after Close = %v, want ErrUDPServerClosed", err)
+	}
+	if err := srv.SetStatsHandler(func(protocol.StatsSample) {}); !errors.Is(err, protocol.ErrUDPServerClosed) {
+		t.Fatalf("SetStatsHandler after Close = %v, want ErrUDPServerClosed", err)
+	}
+}
+
 func (e *udpEnv) sendC2S(seq uint64, ch protocol.ChannelHeader, payload []byte) {
 	e.t.Helper()
 	packet, err := protocol.EncodePacket(e.info.ID, seq, e.info.Encrypted, e.c2s, ch, payload)

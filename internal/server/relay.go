@@ -41,8 +41,8 @@ func newApplicationRelay(app *App) (*relay.Relay, error) {
 				return relay.MembershipSnapshot{}
 			}
 			members := make([]relay.Recipient, 0)
-			for _, authority := range version.VoiceAuthorities() {
-				if authority.ChannelID != channelID || !authority.Valid() {
+			for _, authority := range version.VoiceChannelAuthorities(channelID) {
+				if !authority.Valid() {
 					continue
 				}
 				members = append(members, relay.Recipient{UserID: authority.UserID, SessionID: authority.VoiceSessionID})

@@ -83,8 +83,10 @@ func NewLoadController(hard HardLimits, now func() time.Time) (*LoadController, 
 	return c, nil
 }
 
-// SetUpdateFunc installs a non-blocking callback invoked after each controller
-// tick. It is intended to update relay admission rates, not perform I/O.
+// SetUpdateFunc installs a non-blocking callback invoked synchronously after
+// each controller tick. The callback runs while the controller's internal
+// state lock is held, so it must not call Snapshot, Current, Tick, or perform
+// I/O; it is intended only to publish the new relay admission rates.
 func (c *LoadController) SetUpdateFunc(update func(SoftLimits)) {
 	if c == nil {
 		return

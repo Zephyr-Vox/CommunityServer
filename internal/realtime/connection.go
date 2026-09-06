@@ -721,15 +721,21 @@ func (s *VoiceAuthorityStage) Apply(manager *protocol.Manager) (VoiceAuthorityCo
 // ApplyForPublication commits the staged authority without enqueueing the
 // coordinator's asynchronous observer. The caller must include the resulting
 // authority transition in the same StatePublication request; doing both would
-// publish duplicate or stale runtime projections. allowNaturalExpiry is true
-// only when the caller already observed the expected Manager session missing.
+// publish duplicate or stale runtime projections. On success, the caller owns
+// the returned Drain and Release callbacks: it must call Drain before Release,
+// call both even when a later publication reservation fails, and call Release
+// exactly once when the enclosing publication is ready to become visible.
+// allowNaturalExpiry is true only when the caller already observed the
+// expected Manager session missing.
 func (s *VoiceAuthorityStage) ApplyForPublication(manager *protocol.Manager, allowNaturalExpiry bool) (VoiceAuthorityCommit, error) {
 	return s.apply(manager, allowNaturalExpiry, true)
 }
 
 // ApplyForPublicationWithGate commits the staged authority while the caller's
 // per-user relay gate is already held. It is the publication-safe variant used
-// by sequenced channel commands; no lock is reacquired under StatePublication.
+// by sequenced channel commands; no lock is reacquired under StatePublication
+// and the returned commit has no Release callback. The caller still owns and
+// must run any returned Drain before the enclosing publication becomes visible.
 func (s *VoiceAuthorityStage) ApplyForPublicationWithGate(manager *protocol.Manager, allowNaturalExpiry bool) (VoiceAuthorityCommit, error) {
 	return s.apply(manager, allowNaturalExpiry, false)
 }
@@ -837,7 +843,10 @@ func (c *ConnectionCoordinator) BeginVoiceDisconnectReason(expected VoiceAuthori
 
 // BeginVoiceDisconnectForPublication clears one exact authority and suppresses
 // the asynchronous observer. Application commands use it when their candidate
-// and lifecycle events are already reserved in the same StatePublication.
+// and lifecycle events are already reserved in the same StatePublication. If
+// removed is true, the returned drain must be called exactly once after the
+// caller no longer needs the publication/coordinator lock; it drains claimed
+// UDP sends and releases the relay gate acquired by this method.
 func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.SessionSendDrain, error) {
 	return c.beginVoiceDisconnectForPublication(expected, manager, reason, true)
 }
@@ -845,6 +854,8 @@ func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublication(expected Voic
 // BeginVoiceDisconnectForPublicationWithGate clears one exact authority while
 // the caller's relay gate is already held before StatePublication. It avoids a
 // publication -> relay lock inversion and returns only deferred send draining.
+// If removed is true, the returned drain must be called exactly once; the
+// caller retains ownership of the relay gate.
 func (c *ConnectionCoordinator) BeginVoiceDisconnectForPublicationWithGate(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.SessionSendDrain, error) {
 	return c.beginVoiceDisconnectForPublication(expected, manager, reason, false)
 }
@@ -900,15 +911,22 @@ func (c *ConnectionCoordinator) beginVoiceDisconnectForPublication(expected Voic
 
 // BeginVoiceRevokeForPublication clears one exact authority without the
 // observer and returns staged UDP revocation cleanup for the caller to run
-// after StatePublication releases its locks. It is used for access-loss and
-// forced teardown paths; voluntary leave deliberately uses Delete instead.
+// after StatePublication releases its locks. If removed is true, the returned
+// drain must be called exactly once after the caller no longer needs the
+// publication/coordinator lock; it also releases the relay gate acquired by
+// this method. The returned cleanup is best-effort notification work and must
+// run after the publication locks are released. This method is used for
+// access-loss and forced teardown paths; voluntary leave deliberately uses
+// Delete instead.
 func (c *ConnectionCoordinator) BeginVoiceRevokeForPublication(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.SessionSendDrain, protocol.RevocationCleanup, error) {
 	return c.beginVoiceRevokeForPublication(expected, manager, reason, true)
 }
 
 // BeginVoiceRevokeForPublicationWithGate clears one exact authority while the
 // caller's relay gate is already held before StatePublication. It is used for
-// ACL/role/channel access-loss cleanup.
+// ACL/role/channel access-loss cleanup. If removed is true, the returned drain
+// must be called exactly once; the caller retains ownership of the relay gate.
+// The returned cleanup must run after StatePublication releases its locks.
 func (c *ConnectionCoordinator) BeginVoiceRevokeForPublicationWithGate(expected VoiceAuthority, manager *protocol.Manager, reason string) (VoiceAuthority, bool, protocol.SessionSendDrain, protocol.RevocationCleanup, error) {
 	return c.beginVoiceRevokeForPublication(expected, manager, reason, false)
 }
@@ -1071,10 +1089,22 @@ func (c *ConnectionCoordinator) DisconnectUser(userID int64, reason string) {
 	c.disconnectMatching(userID, reason, func(ControlConnectionRef) bool { return true })
 }
 
+// DisconnectUserForPublication marks every opening or active control
+// connection of userID closing while assuming that the caller already holds
+// userID's relay gate. It is used by account mutations whose StatePublication
+// reservation must not reacquire a gate beneath the publication lock.
+func (c *ConnectionCoordinator) DisconnectUserForPublication(userID int64, reason string) {
+	if c == nil || userID <= 0 {
+		return
+	}
+	c.disconnectMatchingWithGate(userID, reason, func(ControlConnectionRef) bool { return true }, true)
+}
+
 // PrepareAccountTeardown removes the target user's runtime presence and voice
 // authority from candidate, then returns a lifecycle action that revokes every
 // current control connection after the database transaction commits. The caller
-// must hold the target principal mutation barrier until BeforePublish returns.
+// must hold the target principal mutation barrier and relay gate until
+// BeforePublish returns.
 func (c *ConnectionCoordinator) PrepareAccountTeardown(userID int64, reason string, candidate *StateCandidate) (AccountTeardownPlan, error) {
 	if c == nil || userID <= 0 || candidate == nil || candidate.Version() == nil {
 		return AccountTeardownPlan{}, ErrInvalidConnection
@@ -1115,7 +1145,7 @@ func (c *ConnectionCoordinator) PrepareAccountTeardown(userID int64, reason stri
 			return nil
 		},
 		BeforePublish: func(context.Context) error {
-			c.DisconnectUser(userID, reason)
+			c.DisconnectUserForPublication(userID, reason)
 			return nil
 		},
 	}, nil
@@ -1242,8 +1272,18 @@ func (c *ConnectionCoordinator) beginDisconnectLocked(user *connectionUser, ref 
 // coordinator locks have been released. Sequenced membership/presence cleanup
 // is deliberately outside this low-level lifecycle callback.
 func (c *ConnectionCoordinator) runClosePlan(plan connectionClosePlan) {
+	c.runClosePlanWithGate(plan, false)
+}
+
+// runClosePlanWithGate executes one close plan, optionally reusing a relay gate
+// held by the enclosing sequenced mutation. It never performs socket I/O while
+// holding coordinator user locks.
+func (c *ConnectionCoordinator) runClosePlanWithGate(plan connectionClosePlan, relayGateHeld bool) {
 	if plan.voiceAuthorityStop != nil && plan.voiceAuthority != nil {
-		releaseRelay := c.AcquireVoiceRelayGate(plan.voiceAuthority.UserID)
+		releaseRelay := func() {}
+		if !relayGateHeld {
+			releaseRelay = c.AcquireVoiceRelayGate(plan.voiceAuthority.UserID)
+		}
 		plan.voiceAuthorityStop(*plan.voiceAuthority, plan.reason)
 		releaseRelay()
 	}
@@ -1288,6 +1328,12 @@ func (c *ConnectionCoordinator) notifyClosed(ref ControlConnectionRef) {
 // matching records, then submits all terminal close requests without holding
 // the coordinator's user lock.
 func (c *ConnectionCoordinator) disconnectMatching(userID int64, reason string, match func(ControlConnectionRef) bool) {
+	c.disconnectMatchingWithGate(userID, reason, match, false)
+}
+
+// disconnectMatchingWithGate applies one user's conditional close transition
+// and selects whether its voice side effect may reuse an enclosing relay gate.
+func (c *ConnectionCoordinator) disconnectMatchingWithGate(userID int64, reason string, match func(ControlConnectionRef) bool, relayGateHeld bool) {
 	user := c.acquireUser(userID)
 	defer c.releaseUser(userID, user)
 	plans := make([]connectionClosePlan, 0)
@@ -1305,7 +1351,7 @@ func (c *ConnectionCoordinator) disconnectMatching(userID int64, reason string, 
 	}
 	user.mu.Unlock()
 	for _, plan := range plans {
-		c.runClosePlan(plan)
+		c.runClosePlanWithGate(plan, relayGateHeld)
 	}
 	for _, ref := range refs {
 		c.notifyClosed(ref)

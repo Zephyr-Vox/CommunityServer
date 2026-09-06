@@ -1406,6 +1406,7 @@ func (p *webSocketWritePump) run() {
 		p.releaseQueuedTerminal()
 		close(p.done)
 	}()
+	controlTurn := 0
 	for {
 		select {
 		case terminal := <-p.terminal:
@@ -1413,9 +1414,48 @@ func (p *webSocketWritePump) run() {
 			return
 		default:
 		}
-		// Drain one queued state frame before entering the fair select. This
-		// keeps latest-only diagnostics from delaying replayable state/control
-		// delivery when both lanes are ready at the same time.
+		// Give each reserved control lane one turn before state. The turn is
+		// deliberately bounded: a continuous response stream must not starve
+		// replayable state, while a continuous state stream must not starve an
+		// already accepted response or the ping/pong liveness controls.
+		controlSent := false
+		for offset := 0; offset < 3 && !controlSent; offset++ {
+			lane := (controlTurn + offset) % 3
+			switch lane {
+			case 0:
+				select {
+				case response := <-p.responses.queue:
+					if !p.writeFrame(response.frame) {
+						response.slot.release()
+						return
+					}
+					response.slot.release()
+					controlTurn = 1
+					controlSent = true
+				default:
+				}
+			case 1:
+				select {
+				case payload := <-p.pongs:
+					if !p.writeControl(websocket.PongMessage, payload) {
+						return
+					}
+					controlTurn = 2
+					controlSent = true
+				default:
+				}
+			case 2:
+				select {
+				case <-p.pings:
+					if !p.writeControl(websocket.PingMessage, nil) {
+						return
+					}
+					controlTurn = 0
+					controlSent = true
+				default:
+				}
+			}
+		}
 		if frame, ok := p.state.claim(); ok {
 			if !p.writeFrame(frame.item.Frame) {
 				p.state.release(frame)

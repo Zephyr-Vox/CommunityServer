@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -178,15 +179,17 @@ type persistentState struct {
 	bindings      map[int64][]RoleBinding
 	configs       map[Scope]PermissionConfig
 	mutes         map[int64]Mute
+	mutesByUser   map[int64][]Mute
 }
 
 type runtimeState struct {
-	visibilityEpochs map[int64]uint64
-	moderationEpoch  uint64
-	presences        map[int64]Presence
-	voiceAuthorities map[int64]VoiceAuthority
-	temporaryExpiry  map[int64]ExpirySchedule
-	muteExpiry       map[int64]ExpirySchedule
+	visibilityEpochs          map[int64]uint64
+	moderationEpoch           uint64
+	presences                 map[int64]Presence
+	voiceAuthorities          map[int64]VoiceAuthority
+	voiceAuthoritiesByChannel map[int64][]VoiceAuthority
+	temporaryExpiry           map[int64]ExpirySchedule
+	muteExpiry                map[int64]ExpirySchedule
 }
 
 // ExpirySchedule is a generation-guarded runtime deadline. Deadline zero
@@ -347,8 +350,8 @@ func (v *StateVersion) EffectiveMute(userID, channelID int64, kind string, nowMi
 	if !ok {
 		return false
 	}
-	for _, mute := range v.persistent.mutes {
-		if mute.UserID != userID || mute.Kind != kind || (mute.ExpiresAt != nil && *mute.ExpiresAt <= nowMillis) {
+	for _, mute := range v.persistent.mutesByUser[userID] {
+		if mute.Kind != kind || (mute.ExpiresAt != nil && *mute.ExpiresAt <= nowMillis) {
 			continue
 		}
 		switch mute.Scope.Type {
@@ -429,6 +432,16 @@ func (v *StateVersion) VoiceAuthorities() []VoiceAuthority {
 	return authorities
 }
 
+// VoiceChannelAuthorities returns active runtime authorities for one voice
+// channel ordered by user ID. The returned slice is independent of the
+// immutable state version and may be retained or modified by the caller.
+func (v *StateVersion) VoiceChannelAuthorities(channelID int64) []VoiceAuthority {
+	if v == nil || channelID <= 0 {
+		return nil
+	}
+	return slices.Clone(v.runtime.voiceAuthoritiesByChannel[channelID])
+}
+
 // ProjectionLoader loads the complete persisted state from one database view.
 // *store.Stores implements it through LoadStateProjection.
 type ProjectionLoader interface {
@@ -475,11 +488,12 @@ func NewStateStoreWithEpoch(ctx context.Context, loader ProjectionLoader, stream
 		checkpoint: Checkpoint{StreamEpoch: streamEpoch},
 		persistent: persistent,
 		runtime: runtimeState{
-			visibilityEpochs: make(map[int64]uint64),
-			presences:        make(map[int64]Presence),
-			voiceAuthorities: make(map[int64]VoiceAuthority),
-			temporaryExpiry:  make(map[int64]ExpirySchedule),
-			muteExpiry:       make(map[int64]ExpirySchedule),
+			visibilityEpochs:          make(map[int64]uint64),
+			presences:                 make(map[int64]Presence),
+			voiceAuthorities:          make(map[int64]VoiceAuthority),
+			voiceAuthoritiesByChannel: make(map[int64][]VoiceAuthority),
+			temporaryExpiry:           make(map[int64]ExpirySchedule),
+			muteExpiry:                make(map[int64]ExpirySchedule),
 		},
 	})
 	return state, nil
@@ -681,21 +695,64 @@ func (c *StateCandidate) SetVoiceAuthority(userID int64, authority *VoiceAuthori
 	if c == nil || c.version == nil || userID <= 0 {
 		return ErrInvalidProjection
 	}
+	if authority != nil && (authority.UserID != userID || !authority.Valid()) {
+		return ErrInvalidProjection
+	}
+	if authority != nil {
+		if _, exists := c.version.persistent.users[userID]; !exists {
+			return ErrInvalidProjection
+		}
+		if _, exists := c.version.persistent.channels[authority.ChannelID]; !exists {
+			return ErrInvalidProjection
+		}
+	}
+	if previous, exists := c.version.runtime.voiceAuthorities[userID]; exists {
+		removeVoiceAuthorityIndex(&c.version.runtime, previous)
+	}
+	delete(c.version.runtime.voiceAuthorities, userID)
 	if authority == nil {
-		delete(c.version.runtime.voiceAuthorities, userID)
 		return nil
 	}
-	if authority.UserID != userID || !authority.Valid() {
-		return ErrInvalidProjection
-	}
-	if _, exists := c.version.persistent.users[userID]; !exists {
-		return ErrInvalidProjection
-	}
-	if _, exists := c.version.persistent.channels[authority.ChannelID]; !exists {
-		return ErrInvalidProjection
+	if c.version.runtime.voiceAuthoritiesByChannel == nil {
+		c.version.runtime.voiceAuthoritiesByChannel = make(map[int64][]VoiceAuthority)
 	}
 	c.version.runtime.voiceAuthorities[userID] = *authority
+	addVoiceAuthorityIndex(&c.version.runtime, *authority)
 	return nil
+}
+
+// addVoiceAuthorityIndex inserts one authority into the immutable candidate's
+// channel projection and keeps the per-channel order deterministic.
+func addVoiceAuthorityIndex(runtime *runtimeState, authority VoiceAuthority) {
+	if runtime == nil {
+		return
+	}
+	members := append(runtime.voiceAuthoritiesByChannel[authority.ChannelID], authority)
+	sort.Slice(members, func(i, j int) bool { return members[i].UserID < members[j].UserID })
+	runtime.voiceAuthoritiesByChannel[authority.ChannelID] = members
+}
+
+// removeVoiceAuthorityIndex removes every stale copy of one user from the
+// candidate's channel projection before a replacement or clear is applied.
+func removeVoiceAuthorityIndex(runtime *runtimeState, authority VoiceAuthority) {
+	if runtime == nil {
+		return
+	}
+	members := runtime.voiceAuthoritiesByChannel[authority.ChannelID]
+	if len(members) == 0 {
+		return
+	}
+	filtered := members[:0]
+	for _, member := range members {
+		if member.UserID != authority.UserID {
+			filtered = append(filtered, member)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(runtime.voiceAuthoritiesByChannel, authority.ChannelID)
+		return
+	}
+	runtime.voiceAuthoritiesByChannel[authority.ChannelID] = filtered
 }
 
 // TransitionVoiceAuthority conditionally applies one exact coordinator tuple
@@ -753,6 +810,7 @@ func newPersistentState(projection *store.StateProjection) (persistentState, err
 		bindings:      make(map[int64][]RoleBinding),
 		configs:       make(map[Scope]PermissionConfig, len(projection.Configs)),
 		mutes:         make(map[int64]Mute, len(projection.Mutes)),
+		mutesByUser:   make(map[int64][]Mute),
 	}
 	for _, row := range projection.Users {
 		if _, exists := state.users[row.ID]; exists {
@@ -810,6 +868,7 @@ func newPersistentState(projection *store.StateProjection) (persistentState, err
 			return persistentState{}, duplicateProjection("mute", fmt.Sprint(mute.ID))
 		}
 		state.mutes[mute.ID] = mute
+		state.mutesByUser[mute.UserID] = append(state.mutesByUser[mute.UserID], mute)
 	}
 	for userID := range state.bindings {
 		sort.Slice(state.bindings[userID], func(i, j int) bool {
@@ -824,6 +883,11 @@ func newPersistentState(projection *store.StateProjection) (persistentState, err
 	for channelID := range state.channelAccess {
 		sort.Slice(state.channelAccess[channelID], func(i, j int) bool {
 			return state.channelAccess[channelID][i].ID < state.channelAccess[channelID][j].ID
+		})
+	}
+	for userID := range state.mutesByUser {
+		sort.Slice(state.mutesByUser[userID], func(i, j int) bool {
+			return state.mutesByUser[userID][i].ID < state.mutesByUser[userID][j].ID
 		})
 	}
 	return state, nil
@@ -987,12 +1051,13 @@ func scopeFromNullable(scopeType string, groupValid bool, groupID int64, channel
 // clone returns an independent copy of runtime state for an unpublished candidate.
 func (r runtimeState) clone() runtimeState {
 	cloned := runtimeState{
-		visibilityEpochs: make(map[int64]uint64, len(r.visibilityEpochs)),
-		moderationEpoch:  r.moderationEpoch,
-		presences:        make(map[int64]Presence, len(r.presences)),
-		voiceAuthorities: make(map[int64]VoiceAuthority, len(r.voiceAuthorities)),
-		temporaryExpiry:  make(map[int64]ExpirySchedule, len(r.temporaryExpiry)),
-		muteExpiry:       make(map[int64]ExpirySchedule, len(r.muteExpiry)),
+		visibilityEpochs:          make(map[int64]uint64, len(r.visibilityEpochs)),
+		moderationEpoch:           r.moderationEpoch,
+		presences:                 make(map[int64]Presence, len(r.presences)),
+		voiceAuthorities:          make(map[int64]VoiceAuthority, len(r.voiceAuthorities)),
+		voiceAuthoritiesByChannel: make(map[int64][]VoiceAuthority, len(r.voiceAuthoritiesByChannel)),
+		temporaryExpiry:           make(map[int64]ExpirySchedule, len(r.temporaryExpiry)),
+		muteExpiry:                make(map[int64]ExpirySchedule, len(r.muteExpiry)),
 	}
 	for userID, epoch := range r.visibilityEpochs {
 		cloned.visibilityEpochs[userID] = epoch
@@ -1002,6 +1067,9 @@ func (r runtimeState) clone() runtimeState {
 	}
 	for userID, authority := range r.voiceAuthorities {
 		cloned.voiceAuthorities[userID] = authority
+	}
+	for channelID, authorities := range r.voiceAuthoritiesByChannel {
+		cloned.voiceAuthoritiesByChannel[channelID] = slices.Clone(authorities)
 	}
 	for channelID, schedule := range r.temporaryExpiry {
 		cloned.temporaryExpiry[channelID] = schedule

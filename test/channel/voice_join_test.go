@@ -478,10 +478,10 @@ func TestVoiceJoinRejectsExpiryAtActivationBoundary(t *testing.T) {
 	}
 }
 
-// TestVoiceJoinTreatsCoordinatorLossAsStale verifies that an expiry/teardown
-// winning after join planning does not turn an exact authority race into a
-// process-fatal publication error.
-func TestVoiceJoinTreatsCoordinatorLossAsStale(t *testing.T) {
+// TestVoiceJoinHoldsRelayGateAcrossPublication verifies that a voice join owns
+// its source relay gate before reserving publication, so a coordinator teardown
+// cannot interleave with the staged authority transition.
+func TestVoiceJoinHoldsRelayGateAcrossPublication(t *testing.T) {
 	fixture := newFixture(t)
 	ctx := context.Background()
 	source, _, err := fixture.service.CreateChannel(ctx, fixture.adminID, channel.CreateChannelInput{
@@ -531,15 +531,25 @@ func TestVoiceJoinTreatsCoordinatorLossAsStale(t *testing.T) {
 		t.Fatal("source join did not create voice authority")
 	}
 	entered := make(chan struct{})
-	claimed := make(chan struct{}, 1)
+	teardownStarted := make(chan struct{})
+	teardownResult := make(chan struct {
+		removed bool
+		err     error
+	}, 1)
 	fixture.publication.SetHook(func(stage realtime.PublicationStage) {
 		if stage != realtime.PublicationBeforeRingAppend {
 			return
 		}
 		close(entered)
-		if _, ok, err := coordinator.BeginVoiceDisconnectReason(authority, nil, "udp_timeout"); err == nil && ok {
-			claimed <- struct{}{}
-		}
+		go func() {
+			close(teardownStarted)
+			_, removed, teardownErr := coordinator.BeginVoiceDisconnectReason(authority, nil, "udp_timeout")
+			teardownResult <- struct {
+				removed bool
+				err     error
+			}{removed: removed, err: teardownErr}
+		}()
+		<-teardownStarted
 	})
 	defer fixture.publication.SetHook(nil)
 	result := make(chan error, 1)
@@ -558,16 +568,23 @@ func TestVoiceJoinTreatsCoordinatorLossAsStale(t *testing.T) {
 	}
 	select {
 	case err := <-result:
-		if !errors.Is(err, channel.ErrVoiceStale) {
-			t.Fatalf("coordinator-race replacement error = %v, want ErrVoiceStale", err)
+		if err != nil {
+			t.Fatalf("relay-gated replacement error = %v, want success", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("coordinator-race replacement did not finish")
+		t.Fatal("relay-gated replacement did not finish")
 	}
 	select {
-	case <-claimed:
+	case teardown := <-teardownResult:
+		if teardown.err != nil || teardown.removed {
+			t.Fatalf("coordinator teardown = removed:%t err:%v, want stale old-authority removal", teardown.removed, teardown.err)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("concurrent coordinator teardown did not claim authority")
+		t.Fatal("coordinator teardown did not finish after publication")
+	}
+	current, ok := coordinator.VoiceAuthority(fixture.adminID)
+	if !ok || current.ChannelID != targetID {
+		t.Fatalf("relay-gated replacement authority = %+v, ok=%t", current, ok)
 	}
 }
 

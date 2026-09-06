@@ -239,8 +239,8 @@ func (a *App) serve(running *appRun, ln net.Listener, tlsInfo func(), timeouts H
 }
 
 // gracefulShutdown applies the currently assembled subset of the fixed staged
-// order: stop new control admission, drain hijacked WS, stop UDP/purge, drain
-// HTTP, wait workers, then close DB. Future sequencer/EventBus/timer/relay
+// order: stop command admission, close UDP/purge and relay, drain hijacked WS,
+// drain HTTP, wait workers, then close DB. Future sequencer/EventBus/timer
 // stages register at the marked boundaries without changing ownership.
 func (a *App) gracefulShutdown(srv *http.Server, supervisor *ProcessSupervisor, log *slog.Logger) error {
 	log.Info("shutting down")
@@ -269,19 +269,18 @@ func (a *App) gracefulShutdown(srv *http.Server, supervisor *ProcessSupervisor, 
 // DB so restart reconstructs runtime state from persistent facts.
 func (a *App) fatalShutdown(srv *http.Server, supervisor *ProcessSupervisor, cause error) error {
 	a.commands.stop()
+	a.connections.StopAdmission()
 	if a.voice != nil {
 		a.voice.beginStopping()
 	}
-	a.connections.StopAdmission()
+	voiceErr := error(nil)
+	if a.voice != nil {
+		voiceErr = a.stopVoice()
+	}
 	a.connections.SetCloseObserver(nil)
 	a.connections.SetVoiceAuthorityObserver(nil)
 	a.connections.DisconnectAll(4005, "server failure")
 	a.connections.ForceCloseAll()
-	relayErr := error(nil)
-	if a.voice != nil {
-		relayErr = a.voice.stopRelay(context.Background())
-	}
-	voiceErr := a.stopVoice()
 	httpErr := srv.Close()
 	supervisor.BeginShutdown()
 	fatalCtx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -293,7 +292,7 @@ func (a *App) fatalShutdown(srv *http.Server, supervisor *ProcessSupervisor, cau
 	if connectionsErr == nil && realtimeErr == nil && workersErr == nil {
 		dbErr = a.closeDatabase()
 	}
-	return errors.Join(cause, relayErr, voiceErr, httpErr, connectionsErr, workersErr, realtimeErr, dbErr)
+	return errors.Join(cause, voiceErr, httpErr, connectionsErr, workersErr, realtimeErr, dbErr)
 }
 
 // newHTTPServer builds the ordinary HTTP server with the fixed deadline and

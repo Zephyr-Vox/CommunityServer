@@ -87,13 +87,17 @@ func newVoiceDiagnostics() *voiceDiagnostics {
 }
 
 // observe records one session-scoped protocol sample and returns immediately
-// when the fixed diagnostics table is full or the sample has no session ID.
+// for unauthenticated samples, lock contention, or a full diagnostics table.
+// Diagnostics are best-effort telemetry and must never make the UDP read loop
+// wait behind the slower snapshot emitter.
 func (d *voiceDiagnostics) observe(sample protocol.StatsSample) {
-	if d == nil || sample.SessionID == [16]byte{} {
+	if d == nil || sample.SessionID == [16]byte{} || sample.UserID <= 0 || sample.Kind == protocol.StatsDroppedUnknownSession {
 		return
 	}
 	now := time.Now()
-	d.mu.Lock()
+	if !d.mu.TryLock() {
+		return
+	}
 	defer d.mu.Unlock()
 	window := d.sessions[sample.SessionID]
 	if window == nil {
@@ -122,7 +126,6 @@ func (d *voiceDiagnostics) observe(sample protocol.StatsSample) {
 			bucket.bytes += uint64(sample.Bytes)
 		}
 	case protocol.StatsDroppedMalformed,
-		protocol.StatsDroppedUnknownSession,
 		protocol.StatsDroppedGlobalIngress,
 		protocol.StatsDroppedSourceIngress,
 		protocol.StatsDroppedSourceTableFull,

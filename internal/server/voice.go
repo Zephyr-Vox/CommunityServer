@@ -129,15 +129,15 @@ func (v *voiceRuntime) Start(ctx context.Context, host string, port int, supervi
 	return nil
 }
 
-// Close stops purge production before closing the UDP listener, then waits for
-// the read loop through UDPServer.Close. It is idempotent and safe after a
-// failed partial startup.
+// Close stops purge production, closes the UDP listener, and then waits for the
+// relay workers. Closing the listener before waiting for relay workers unblocks
+// any in-flight UDP write. It is idempotent and safe after a failed partial
+// startup.
 func (v *voiceRuntime) Close() error {
 	if v == nil || v.server == nil {
 		return nil
 	}
 	v.closeOnce.Do(func() {
-		relayErr := v.stopRelay(context.Background())
 		v.closeMu.Lock()
 		v.closed = true
 		stopPurge := v.stopPurge
@@ -146,14 +146,16 @@ func (v *voiceRuntime) Close() error {
 		if stopPurge != nil {
 			stopPurge()
 		}
-		v.closeErr = errors.Join(relayErr, v.server.Close())
+		serverErr := v.server.Close()
+		relayErr := v.stopRelay(context.Background())
+		v.closeErr = errors.Join(serverErr, relayErr)
 	})
 	return v.closeErr
 }
 
 // stopRelay closes the bounded media queue and waits for all fanout workers.
-// It is separate from UDPServer.Close so shutdown can stop new media work
-// before it tears down the socket that owns active sessions.
+// It is separate from UDPServer.Close so callers can stop new media work after
+// the socket is closed and in-flight UDP writes have been unblocked.
 func (v *voiceRuntime) stopRelay(ctx context.Context) error {
 	if v == nil || v.relay == nil {
 		return nil

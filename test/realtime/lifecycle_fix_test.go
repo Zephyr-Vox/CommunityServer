@@ -204,9 +204,12 @@ func TestAccountTeardownClearsRuntimeBeforePublication(t *testing.T) {
 	if _, ok := state.Current().VoiceAuthority(1); !ok {
 		t.Fatal("preparation published runtime state before commit")
 	}
+	releaseRelay := coordinator.AcquireVoiceRelayGate(1)
 	if err := plan.BeforePublish(context.Background()); err != nil {
+		releaseRelay()
 		t.Fatal(err)
 	}
+	releaseRelay()
 	if _, ok := coordinator.VoiceAuthority(1); ok {
 		t.Fatal("connection teardown did not clear coordinator authority")
 	}

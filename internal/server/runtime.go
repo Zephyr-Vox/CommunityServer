@@ -190,32 +190,35 @@ func (a *App) cleanupFailedRun(running *appRun) error {
 	return errors.Join(voiceErr, realtimeErr, workersErr)
 }
 
-// ShutdownConnections stops WebSocket admission, requests terminal close from
-// every write pump, and waits for hijacked handlers to exit.
+// ShutdownConnections stops HTTP command admission, closes the voice data
+// plane before any coordinator callback can wait on a relay gate, then stops
+// WebSocket admission, requests terminal close from every write pump, and
+// waits for hijacked handlers to exit.
 func (a *App) ShutdownConnections(ctx context.Context) error {
 	if a == nil || a.connections == nil || ctx == nil {
 		return errors.New("server: invalid connection shutdown")
 	}
 	a.commands.stop()
-	commandsErr := a.commands.wait(ctx)
+	a.connections.StopAdmission()
+	var voiceErr error
 	if a.voice != nil {
 		a.voice.beginStopping()
+		// Close the UDP socket and relay before waiting for admitted commands or
+		// running coordinator teardown. Both paths can otherwise wait on a relay
+		// gate held by an in-flight UDP write, while only this close can unblock it.
+		voiceErr = a.voice.Close()
 	}
-	a.connections.StopAdmission()
+	commandsErr := a.commands.wait(ctx)
 	a.connections.SetCloseObserver(nil)
 	a.connections.SetVoiceAuthorityObserver(nil)
 	a.connections.DisconnectAll(4005, "server shutdown")
-	var relayErr error
-	if a.voice != nil {
-		relayErr = a.voice.stopRelay(ctx)
-	}
 	if err := a.connections.Wait(ctx); err == nil {
-		return errors.Join(commandsErr, relayErr)
+		return errors.Join(commandsErr, voiceErr)
 	} else {
 		a.connections.ForceCloseAll()
 		forceCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		return errors.Join(commandsErr, relayErr, err, a.connections.Wait(forceCtx))
+		return errors.Join(commandsErr, voiceErr, err, a.connections.Wait(forceCtx))
 	}
 }
 

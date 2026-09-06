@@ -75,6 +75,9 @@ var (
 	// ErrUDPServerStarted reports that a startup-only handler was changed after
 	// the UDP read loop was published.
 	ErrUDPServerStarted = errors.New("protocol: udp server already started")
+	// ErrUDPServerClosed reports that a startup-only handler was changed after
+	// the UDP server entered its terminal closed state.
+	ErrUDPServerClosed = errors.New("protocol: udp server closed")
 )
 
 // UDPServer owns the datagram read loop, s2c Send path and best-effort
@@ -111,12 +114,17 @@ func WithStatsHandler(handler StatsHandler) UDPOption {
 // SetFrameHandler installs the validated-media callback before Start. The
 // callback is read under a short handler lock and invoked outside protocol
 // locks; changing it after Start is rejected so startup wiring is immutable.
+// It returns ErrUDPServerStarted after Start and ErrUDPServerClosed after
+// Close.
 func (s *UDPServer) SetFrameHandler(handler FrameHandler) error {
 	if s == nil {
 		return errors.New("protocol: nil udp server")
 	}
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
+	if s.closed {
+		return ErrUDPServerClosed
+	}
 	if s.started {
 		return ErrUDPServerStarted
 	}
@@ -127,13 +135,17 @@ func (s *UDPServer) SetFrameHandler(handler FrameHandler) error {
 }
 
 // SetStatsHandler installs the non-blocking transport observability callback
-// before Start. It shares the same startup barrier as SetFrameHandler.
+// before Start. It shares the same startup barrier as SetFrameHandler and
+// returns ErrUDPServerStarted or ErrUDPServerClosed when that barrier is gone.
 func (s *UDPServer) SetStatsHandler(handler StatsHandler) error {
 	if s == nil {
 		return errors.New("protocol: nil udp server")
 	}
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
+	if s.closed {
+		return ErrUDPServerClosed
+	}
 	if s.started {
 		return ErrUDPServerStarted
 	}

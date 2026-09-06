@@ -56,6 +56,7 @@ type StateMutationRuntime struct {
 	state               *realtime.StateStore
 	sequencer           *realtime.PostCommitSequencer
 	gate                MutationGate
+	voiceRelay          VoiceRelayGateCoordinator
 	durable             *realtime.DurableIdempotency
 	registrationDurable *realtime.DurableRegistrationIdempotency
 	cursors             realtime.StateCursorIssuer
@@ -72,6 +73,13 @@ func (r *StateMutationRuntime) SetDurableIdempotency(durable *realtime.DurableId
 // persistence for registration before an authenticated principal exists.
 func (r *StateMutationRuntime) SetRegistrationDurableIdempotency(durable *realtime.DurableRegistrationIdempotency) {
 	r.registrationDurable = durable
+}
+
+// SetVoiceRelayCoordinator installs the source-gate adapter used to serialize
+// account mutations with media relay validation and fanout. It must be set
+// before account mutation requests are admitted.
+func (r *StateMutationRuntime) SetVoiceRelayCoordinator(coordinator VoiceRelayGateCoordinator) {
+	r.voiceRelay = coordinator
 }
 
 // SetStateCursorIssuer installs the process-local signer used to return the
@@ -171,7 +179,14 @@ func (r *StateMutationRuntime) Run(ctx context.Context, userIDs []int64, mutate 
 				unlock()
 				return nil, err
 			}
+			var releaseRelay func()
+			if r.voiceRelay != nil {
+				releaseRelay = r.voiceRelay.AcquireVoiceRelayGates(userIDs)
+			} else {
+				releaseRelay = func() {}
+			}
 			return func() {
+				releaseRelay()
 				release()
 				unlock()
 			}, nil
@@ -421,6 +436,13 @@ func accountDurableBody(status int, data any) ([]byte, error) {
 // domain that changes the realtime persistent projection.
 type MutationGate interface {
 	Acquire(context.Context) (func(), error)
+}
+
+// VoiceRelayGateCoordinator supplies the fixed source gates that account
+// mutations hold through their publication boundary. The interface keeps the
+// auth package independent from the concrete realtime coordinator type.
+type VoiceRelayGateCoordinator interface {
+	AcquireVoiceRelayGates([]int64) func()
 }
 
 // acquireMutation returns a no-op release when realtime assembly has not

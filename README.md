@@ -2,131 +2,65 @@
 
 **English** | [中文](README.zh-CN.md)
 
-Single-server community edition of a lightweight voice-community server, in the spirit of TeamSpeak / Discord. Built with Go 1.26, Echo v5, and SQLite (pure-Go driver).
+Single-process voice-community server built with Go 1.26, Echo v5 and SQLite.
+It provides account management, database-backed RBAC, channels, WebSocket
+realtime state and a bounded UDP voice relay.
 
-## Features
-
-- Account bootstrap: first-owner activation code, open or invite-based registration
-- Authentication: argon2id passwords, short-lived JWT access tokens, rotating refresh sessions with reuse detection
-- Database-backed RBAC: seeded built-in roles, scoped bindings, ACLs and permission configs
-- User management: list/detail, profile, password reset, kick, ban/unban, hard delete
-- Invite management: create / list / delete invite codes
-- Presence: WS lifecycle-driven online status with `presence.set`
-- Realtime protocol model: each client has its own WS control connection; one account has at most one logical UDP voice session
-- Local object storage: disk-backed files with SQLite metadata and MIME detection
-- Avatars: upload/reset with unified JPEG transcoding (any decodable image in, 256×256 JPEG out), served from a public route
-
-## Realtime Connection Model
-
-The target realtime protocol keeps control and voice state separate:
-
-- A user may keep multiple WS control connections open, one for each client. Every connection receives the server and channel state it can see.
-- An account has at most one voice membership and one logical UDP voice session. A new voice join may replace the old voice session, but it does not close the old client's WS control connection.
-- Losing UDP voice keeps the WS control connections and presence alive. The server reports `voice.disconnected` or `voice.revoked`; the client can retry the channel join or show that voice is unavailable.
-- Closing the WS that owns voice immediately stops its UDP session and removes only that voice membership. Other WS connections remain usable.
-- Presence becomes offline only after the user's last WS control connection closes.
-
-This is the target protocol model. The current HTTP API list below still reflects the routes implemented in this repository.
-
-## Quick Start
+## Start
 
 ```sh
 go run ./cmd/zephyrd
 ```
 
-The first start generates `config/zephyr.toml` and opens the SQLite database configured in `server.db_path` (default `./data/zephyr.db`). It seeds `owner`, `admin`, `member`, the root permission config, installation state, and a public announcement channel. Until the first owner activates, the startup log prints a one-time activation code:
-
-```sh
-INFO first owner activation required code: ABC234...
-```
-
-Activate the first owner. The default config serves HTTPS with an
-auto-generated self-signed certificate, so local curl calls need `-k`:
+The first start creates `config/zephyr.toml`, `./data/zephyr.db` and the local
+object store. It prints a one-time owner activation code. The default config
+uses HTTPS with an auto-generated self-signed certificate:
 
 ```sh
 curl -k -X POST https://localhost:8745/api/v0/admin/activate \
   -H 'Content-Type: application/json' \
-  -d '{"code":"ABC234...","username":"boss","password":"secret123"}'
+  -d '{"code":"ACTIVATION_CODE","username":"boss","password":"secret123"}'
 ```
 
-For plaintext local testing, set `server.tls_mode = "off"` in
-`config/zephyr.toml` and use `http://localhost:8745` instead.
+For local plaintext development, set `server.tls_mode = "off"` and use
+`http://localhost:8745`. This also selects plaintext voice sessions.
 
-Then sign in with the same credentials at `POST /api/v0/auth/login`.
+## Current capabilities
 
-Flags:
+- first-owner activation, open/invite registration and rotating auth sessions;
+- database-backed roles, bindings, ACLs and moderation;
+- groups, permanent text/announcement channels and temporary voice channels;
+- authenticated state snapshots, replayable WebSocket events and presence;
+- bounded UDP voice sessions, relay fanout, load control and diagnostics;
+- local object storage and JPEG avatar processing.
 
-```sh
-zephyrd -config config/zephyr.toml
-```
+## API entry points
+
+All control-plane routes use `/api/v0`. Discovery is public at
+`GET /api/v0/metadata`; authenticated clients use `/api/v0/auth/login`,
+`GET /api/v0/state/snapshot` and `GET /api/v0/ws`. Voice join/leave is handled
+by HTTP; UDP carries only voice media and heartbeats.
+
+JSON responses use `{"code":0,"message":"","data":...}`. `204` responses
+have no body. Sequenced mutations use idempotency keys; versioned resources use
+strong ETags.
 
 ## Configuration
 
-`config/zephyr.toml` is generated on first start (0600, it contains the JWT secret):
-
-| Key | Default | Description |
-|---|---|---|
-| `jwt_secret` | random 256-bit value as 64 hex characters | HS256 signing secret for access tokens |
-| `auth.access_token_ttl` | `15m` | access token lifetime |
-| `auth.refresh_token_ttl` | `720h` | refresh session sliding lifetime |
-| `auth.login_rate_limit` | `10` | login/activate attempts per minute per IP |
-| `auth.registration_mode` | `invite` | `open` or `invite` |
-| `server.host` | `0.0.0.0` | HTTP listen host |
-| `server.http_port` | `8745` | HTTP/REST listener port |
-| `server.voice_port` | `8746` | reserved for the future voice channel |
-| `server.db_path` | `./data/zephyr.db` | SQLite database file |
-| `server.tls_mode` | `required` | TLS mode: `off` or `required`; `required` auto-generates a self-signed certificate |
-| `storage.base_dir` | `./data/objects` | local object storage root |
-| `avatar.max_upload_size` | `10485760` | avatar upload size limit in bytes (10 MiB) |
-| `avatar.max_dimension` | `4096` | source image max side in pixels; rejects decompression bombs |
-| `avatar.target_size` | `256` | output avatar side in pixels (square) |
-| `avatar.quality` | `85` | JPEG quality, 0-100 |
-| `log.level` | `info` | minimum log level: `debug`, `info`, `warn`, `error` |
-| `log.path` | `./data/logs` | log directory (live `zephyr.log` + archives); empty = console only |
-| `log.archive_keep` | `7` | keep the newest N archives; `0` = no archives; `-1` = keep all |
-
-Console logs are human-readable colored lines on stdout. When `log.path` is set (the default), the same lines are also written to `zephyr.log` there; every 7 days the accumulated file is merged into a dated `.zip` archive (`zephyr-YYYY-MM-DD-NN.zip`) and `log.archive_keep` prunes old archives.
-
-RBAC lives in SQLite. `owner` is globally unique and always grants `*`; `admin` and `member` are seeded roles. The root permission config grants admin server/user/invite/group/channel/moderation permissions and member `channel.create_temporary`. Roles, bindings, ACLs, local permission-config snapshots and mutes use database foreign keys and scope-specific uniqueness constraints.
-
-## API Conventions
-
-Every JSON response is an envelope:
-
-```json
-{"code": 0, "message": "", "data": {...}}
-```
-
-- `code` 0 with empty `message` means success; `data` carries the DTO.
-- Endpoint-specific business codes run from 1 (per endpoint, listed in each handler's doc comment). Clients branch on `(endpoint, code)`.
-- Shared global codes: `1000` invalid request parameters (field messages in `data.fields`), `1001` malformed request, `1002` unauthorized, `1003` forbidden, `1004` not found, `1005` method not allowed, `1006` payload too large, `1007` unsupported media type, `1008` rate limited, `1009` internal.
-- `204` responses have no body. Binary object downloads are raw bytes, not envelopes.
-
-## API Overview
-
-All paths are prefixed with `/api/v0`.
-
-| Area | Endpoints |
-|---|---|
-| Auth | `GET /auth/status`, `POST /auth/register`, `POST /admin/activate`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout` |
-| Self | `GET /auth/me`, `PATCH /me`, `POST /me/avatar`, `DELETE /me/avatar`, `POST /me/password` |
-| Users | `GET /users`, `GET /users/:id`, `PATCH /users/:id`, `POST /users/:id/password`, `POST /users/:id/kick`, `POST /users/:id/ban`, `POST /users/:id/unban`, `DELETE /users/:id` |
-| RBAC | `GET /rbac/roles`, `POST /rbac/roles`, `PATCH /rbac/roles/:key`, `DELETE /rbac/roles/:key`, `GET/POST/DELETE /rbac/bindings`, `GET/PUT /rbac/config`, `POST /rbac/config/reset`, `POST /owner/transfer` |
-| Invites | `GET /admin/invites`, `POST /admin/invites`, `DELETE /admin/invites/:id` |
-| Presence | WS `presence.set`, `presence.updated` state events |
-
-Avatar endpoints: `POST /api/v0/me/avatar` accepts a multipart `file` field (any format Go can decode) and stores a uniformly transcoded JPEG; `DELETE /api/v0/me/avatar` resets to the default. The image is served publicly at `GET /avatar/:file` — note this route sits outside the `/api/v0` prefix. The `avatar` field in user DTOs carries the bare object name (e.g. `12345.jpg`); clients build the full URL by joining it with the public prefix, currently the fixed route `/avatar/` (e.g. `/avatar/12345.jpg`).
+The generated configuration contains the HTTP listener (`8745`), UDP voice
+listener (`8746`), advertised voice host, TLS mode, SQLite path, object-store
+path, registration mode, avatar limits, voice limits and log settings. Keep the
+JWT secret and TLS private key private.
 
 ## Development
 
 ```sh
-go build ./...          # compile
-go vet ./...            # static checks
-gofmt -w <files>        # format (Go tabs)
-go test -race ./...     # full suite with race detector
-sqlc generate           # regenerate data access after SQL changes
+go build ./...
+go vet ./...
+go test -race ./...
+sqlc generate
 ```
 
-Business packages contain no `_test.go`; tests live under `test/` mirroring package paths. Tests that bind real ports (graceful shutdown) require permission to open local sockets.
-
-There is no migration system yet: the schema is applied idempotently at startup, and schema changes during development require deleting the database file.
+Tests live under `test/` and mirror production packages. Detailed, local design
+notes are split by domain under `spec/`; that directory is intentionally not
+tracked as release documentation.

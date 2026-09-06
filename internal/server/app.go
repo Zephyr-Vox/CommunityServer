@@ -234,6 +234,7 @@ func New(cfg *config.App, logger *slog.Logger) (*App, error) {
 	}
 	register.SetStateMutationGate(app.mutationGate)
 	register.SetStateCommandRuntime(accountRuntime)
+	accountRuntime.SetVoiceRelayCoordinator(connections)
 	accountRuntime.SetDurableIdempotency(durableCommands)
 	accountRuntime.SetRegistrationDurableIdempotency(registrationDurableCommands)
 	if cursors, ok := app.syncStrategy.(realtime.StateCursorIssuer); ok {

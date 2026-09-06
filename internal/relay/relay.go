@@ -219,17 +219,22 @@ func (r *Relay) Start(ctx context.Context) (<-chan error, error) {
 }
 
 // Close stops admission, wakes all workers, and waits for deterministic relay
-// teardown. It is safe to call repeatedly after Start.
+// teardown. It is safe to call repeatedly after Start; concurrent Start and
+// Close calls linearize under the relay lifecycle lock.
 func (r *Relay) Close(ctx context.Context) error {
 	if r == nil || ctx == nil {
 		return ErrInvalidRelay
 	}
+	r.startMu.Lock()
 	if !r.started.Load() {
+		r.startMu.Unlock()
 		return ErrRelayNotStarted
 	}
 	r.stopOnce.Do(func() { close(r.stop) })
+	done := r.done
+	r.startMu.Unlock()
 	select {
-	case <-r.done:
+	case <-done:
 		return r.failure()
 	case <-ctx.Done():
 		return ctx.Err()

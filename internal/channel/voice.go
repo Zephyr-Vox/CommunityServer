@@ -375,7 +375,9 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 				unlock()
 				return nil, acquireErr
 			}
+			releaseRelay := s.connections.AcquireVoiceRelayGate(actorID)
 			return func() {
+				releaseRelay()
 				release()
 				unlock()
 			}, nil
@@ -622,7 +624,7 @@ func (s *Service) JoinVoice(ctx context.Context, actorID, channelID int64, contr
 						// the replacement publication cannot overtake old audio.
 						naturalExpiryDrain()
 					}
-					commit, commitErr := stage.ApplyForPublication(s.voiceManager, naturalExpiry)
+					commit, commitErr := stage.ApplyForPublicationWithGate(s.voiceManager, naturalExpiry)
 					if commitErr != nil {
 						if errors.Is(commitErr, protocol.ErrSessionPrecondition) || errors.Is(commitErr, protocol.ErrSessionExpired) || errors.Is(commitErr, realtime.ErrVoiceAuthorityPrecondition) {
 							// A runtime command has already reserved its publication. Mark
@@ -821,7 +823,9 @@ func (s *Service) LeaveVoice(ctx context.Context, actorID int64, controlConnecti
 				unlock()
 				return nil, acquireErr
 			}
+			releaseRelay := s.connections.AcquireVoiceRelayGate(actorID)
 			return func() {
+				releaseRelay()
 				release()
 				unlock()
 			}, nil
@@ -882,7 +886,7 @@ func (s *Service) LeaveVoice(ctx context.Context, actorID int64, controlConnecti
 				Candidate: candidate,
 				Events:    eventPlan,
 				CommitRuntime: func() (func(), error) {
-					_, removed, drain, disconnectErr := s.connections.BeginVoiceDisconnectForPublication(current, s.voiceManager, "left")
+					_, removed, drain, disconnectErr := s.connections.BeginVoiceDisconnectForPublicationWithGate(current, s.voiceManager, "left")
 					if disconnectErr != nil {
 						return nil, disconnectErr
 					}
