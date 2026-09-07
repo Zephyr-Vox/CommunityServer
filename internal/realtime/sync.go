@@ -518,6 +518,10 @@ func snapshotStateFor(userID int64, version *StateVersion, visibility *Visibilit
 			Presence:       snapshotPresenceFor(userID, userID, version),
 			VoiceAuthority: snapshotVoiceAuthorityFor(userID, version),
 		},
+		Users:            []SnapshotUserPresence{},
+		Roles:            []SnapshotRole{},
+		Groups:           []SnapshotGroup{},
+		Channels:         []SnapshotChannel{},
 		VoiceMemberships: []SnapshotVoiceMembership{},
 	}
 	for _, binding := range version.Bindings(userID) {

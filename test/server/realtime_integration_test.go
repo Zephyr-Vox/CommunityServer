@@ -57,7 +57,12 @@ func TestRealtimeHTTPAndWebSocketHandoff(t *testing.T) {
 		Data struct {
 			Cursor string `json:"cursor"`
 			State  struct {
-				Self struct {
+				Users            []json.RawMessage `json:"users"`
+				Roles            []json.RawMessage `json:"roles"`
+				Groups           []json.RawMessage `json:"groups"`
+				Channels         []json.RawMessage `json:"channels"`
+				VoiceMemberships []json.RawMessage `json:"voice_memberships"`
+				Self             struct {
 					User struct {
 						Username string `json:"username"`
 					} `json:"user"`
@@ -74,6 +79,9 @@ func TestRealtimeHTTPAndWebSocketHandoff(t *testing.T) {
 	}
 	if snapshotResp.StatusCode != http.StatusOK || snapshot.Code != 0 || snapshot.Data.Cursor == "" || snapshot.Data.State.Self.User.Username != "boss" || snapshot.Data.State.Self.Presence.Status != "offline" || len(snapshot.Data.State.Self.ServerPermissions) != 1 || snapshot.Data.State.Self.ServerPermissions[0] != "*" {
 		t.Fatalf("snapshot = status:%d body:%+v", snapshotResp.StatusCode, snapshot)
+	}
+	if snapshot.Data.State.Users == nil || snapshot.Data.State.Roles == nil || snapshot.Data.State.Groups == nil || snapshot.Data.State.Channels == nil || snapshot.Data.State.VoiceMemberships == nil {
+		t.Fatalf("snapshot state collections must be JSON arrays: %+v", snapshot.Data.State)
 	}
 	if cacheControl := snapshotResp.Header.Get("Cache-Control"); cacheControl != "private, no-store" {
 		t.Fatalf("snapshot Cache-Control = %q", cacheControl)
